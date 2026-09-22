@@ -151,15 +151,18 @@ jobs:
   # from a file whose name promised x64. Nothing caught it: the build, the smoke test and the
   # checksums all pass either way, because only the Mach-O header knows.
   #
-  # So the architecture is pinned per runner and named honestly.
+  # THERE IS NO INTEL macOS RUNNER ANY MORE. Verified 2026-09-22, the hard way: `macos-13`
+  # is retired and a job asking for it QUEUES FOREVER instead of failing (35 minutes before
+  # the cause was clear), and `macos-15` reports `Image Release: .../macos-15-arm64/...` —
+  # the plain label now serves Apple Silicon too.
   #
-  # PICKING THE INTEL LABEL: GitHub names its Intel image WITHOUT a suffix and its Apple
-  # Silicon one WITH `-arm64` (macos-15 is x86_64, macos-15-arm64 is arm64 — check the tool
-  # paths in actions/runner-images images/macos/<label>-Readme.md: JAVA_HOME_*_X64 vs
-  # _arm64). `macos-13` was retired and a job asking for it QUEUES FOREVER rather than
-  # failing, which cost 35 minutes on 2026-09-22. If macos-15 goes the same way, move to the
-  # next unsuffixed image; if Intel runners disappear entirely, build the x64 asset on an
-  # Apple Silicon runner with an x64 Node and `npm_config_arch=x64 npm ci`, and keep the name.
+  # So BOTH assets are produced on the Apple Silicon runner, and the x64 one is
+  # cross-assembled: the official darwin-x64 Node tarball, plus darwin-x64 prebuilt native
+  # modules (`npm_config_arch=x64`, which prebuild-install honours — better-sqlite3 12.10.0
+  # and -multiple-ciphers 12.9.0 both publish node-v127-darwin-x64). Flutter already emits a
+  # universal app binary, so only the bundled payload needed pinning. The cross-assembled
+  # payload cannot be executed here, so its smoke test is skipped and the lipo gate below is
+  # what proves it — that gate is not decoration: it caught this exact mislabelling twice.
   macos:
     needs: [prepare]
     if: ${{ inputs.android_only != true }}
@@ -167,11 +170,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-latest     # Apple Silicon
-            arch: arm64
-          - runner: macos-15         # Intel (x86_64)
-            arch: x64
-    runs-on: ${{ matrix.runner }}
+          - arch: arm64     # native on the runner
+          - arch: x64       # cross-assembled on the same runner (see below)
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
@@ -184,7 +185,21 @@ jobs:
         with: { node-version: 22 }
       - run: flutter pub get
       - run: flutter build macos --release
-      - run: bash scripts/embed_macos_node.sh
+      # Native leg: bundle the runner's own Node and run the real smoke test.
+      - if: ${{ matrix.arch == 'arm64' }}
+        run: bash scripts/embed_macos_node.sh
+      # Cross leg: fetch the darwin-x64 Node matching the runner's version (the ABI has to
+      # match the prebuilt modules), install x64 native modules, and bundle those instead.
+      - if: ${{ matrix.arch == 'x64' }}
+        run: |
+          set -eu
+          NODE_VER="$(node -p process.version)"          # e.g. v22.23.2
+          curl -fsSL -o /tmp/node-x64.tar.gz \
+            "https://nodejs.org/dist/${NODE_VER}/node-${NODE_VER}-darwin-x64.tar.gz"
+          mkdir -p /tmp/node-x64 && tar -xzf /tmp/node-x64.tar.gz -C /tmp/node-x64 --strip-components=1
+          echo "fetched $(/tmp/node-x64/bin/node --version 2>/dev/null || echo "$NODE_VER") for darwin-x64"
+          ( cd wallet/windows/sov-node && rm -rf node_modules && npm_config_arch=x64 npm ci --omit=dev )
+          SOV_NODE_BIN=/tmp/node-x64/bin/node SOV_SKIP_SMOKE=1 bash scripts/embed_macos_node.sh
       # PROVE THE ARCHITECTURE BEFORE PUBLISHING. This is the check whose absence shipped an
       # arm64 node as "x64": the bundled node and the native module must match the runner this
       # asset is named for, or the node silently cannot start on the machines that download it.
