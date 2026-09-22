@@ -198,7 +198,11 @@ jobs:
             "https://nodejs.org/dist/${NODE_VER}/node-${NODE_VER}-darwin-x64.tar.gz"
           mkdir -p /tmp/node-x64 && tar -xzf /tmp/node-x64.tar.gz -C /tmp/node-x64 --strip-components=1
           echo "fetched $(/tmp/node-x64/bin/node --version 2>/dev/null || echo "$NODE_VER") for darwin-x64"
-          ( cd wallet/windows/sov-node && rm -rf node_modules && npm_config_arch=x64 npm ci --omit=dev )
+          # npm_config_arch is exported for the whole step, NOT used on a separate npm ci:
+          # embed_macos_node.sh runs `rm -rf node_modules && npm ci` itself, so installing
+          # x64 modules beforehand just gets overwritten with the host's arm64 ones — which
+          # is exactly what happened on the first attempt, and what the gate caught.
+          export npm_config_arch=x64
           SOV_NODE_BIN=/tmp/node-x64/bin/node SOV_SKIP_SMOKE=1 bash scripts/embed_macos_node.sh
       # PROVE THE ARCHITECTURE BEFORE PUBLISHING. This is the check whose absence shipped an
       # arm64 node as "x64": the bundled node and the native module must match the runner this
