@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    This file used to name four node IP addresses, permitting cleartext to them
+    and blocking it everywhere else. Both halves of that were wrong.
+
+    1. IT BROKE DISCOVERY. Nodes are now found at runtime, from pointer mirrors
+       and the public DHT, and a candidate is verified by asking it for its pool
+       over plain HTTP on port 80 — the only port that serves it. An allow-list
+       of four addresses meant Android silently blocked that request for every
+       node NOT on the list, so any newly discovered node failed verification
+       and was thrown away. The network could never grow past the addresses
+       compiled into the app, which is precisely what the app must no longer
+       contain.
+
+    2. IT PUBLISHED THE NETWORK. Those addresses shipped inside every APK,
+       readable by anyone who unzipped it.
+
+    The original justification — plain ws:// to LiveKit — is also gone: the call
+    feature and all WebRTC/LiveKit code were removed.
+
+    WHAT THIS DOES AND DOES NOT EXPOSE
+
+    Cleartext carries exactly one thing: a node's public pool listing, which is
+    public by definition. Everything that matters — the citizen session,
+    transfers, messages — runs over WSS, and every message is Ed25519-signed
+    with a key that never leaves the device. Someone intercepting a pool fetch
+    can suggest a node of their choosing; they cannot read or forge what the
+    citizen sends, and a suggested node is still only a DIAL TARGET that must
+    pass the same verification as any other.
+
+    See docs/GENESIS_LAUNCH_SEQUENCE.md.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true"/>
+</network-security-config>

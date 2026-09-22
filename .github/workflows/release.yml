@@ -1,0 +1,437 @@
+name: SOV Node — build + release
+# Lives in the private BUILD SOURCE repo (same pattern as the sov-mac-ci repo —
+# a staged copy of lib/, macos/, windows/, linux/, android/, scripts/,
+# tools/portable_packer/, wallet/windows/sov-node/, pubspec.yaml). It builds all
+# four platforms on GitHub-hosted runners (no local Mac/VPS bandwidth needed)
+# and uploads them as a GitHub Release on the SEPARATE public `relay-releases`
+# repo — matching docs/NO_IP_LAUNCH_SETUP_MASTER.md Phase 1 (relay-releases is
+# the binaries+manifest mirror; this repo is just the build source and can stay
+# private).
+#
+# What this workflow does NOT do: threshold-sign the Distribution Manifest or
+# call pointer_store_publish. That step needs the witness-signer FROST shares
+# (PI-37), which are a live-node responsibility — putting them in GitHub
+# Secrets would recreate the exact founder/custody centralization the no-IP
+# design exists to avoid. The live SOV nodes already run this half
+# automatically: release_scheduler.js picks up a new version, builds (or
+# reuses these artifacts), release_signer.js threshold-signs the manifest, and
+# release_coordinator.ingest() fires pointer_store_publish.js the moment
+# >= threshold witness-signers have co-signed. This workflow only has to get
+# real binaries onto relay-releases; the mesh does the trusted part.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 1.2.0) — becomes the git tag and AppImage version"
+        required: true
+        type: string
+      dry_run:
+        description: "Build and verify signing, but publish NOTHING"
+        required: false
+        default: false
+        type: boolean
+      android_only:
+        description: "Build + publish ONLY the Android APK (desktop jobs skipped)."
+        required: false
+        default: false
+        type: boolean
+      replace_existing:
+        description: "Overwrite an asset that is already on the release (default: leave it untouched)"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  RELEASE_REPO: ${{ vars.RELEASE_REPO || 'sov-network/relay-releases' }}
+
+jobs:
+  # ── THE RELEASE IS CREATED FIRST, AS A DRAFT ────────────────────────────────────────
+  # Release binaries do NOT travel through Actions artifacts. The free tier's artifact
+  # quota is 500 MB, one APK is ~160 MB, and GitHub re-counts usage only every 6-12 h --
+  # on 2026-09-22 that turned three fully successful desktop builds into failed jobs.
+  # Instead: this job makes sure the release exists (a DRAFT when the tag is new, so
+  # nothing is public until every file is on it), each platform job uploads its own
+  # asset straight onto it, and `finalize` writes SHA256SUMS.txt and un-drafts.
+  # Adding a platform to a release that is already public (e.g. the desktop builds
+  # joining an Android-only v1.2.0) is the same flow: existing assets are left alone.
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      created_draft: ${{ steps.ensure.outputs.created_draft }}
+    steps:
+      - name: Ensure the release exists (draft if new); no-op on a dry run
+        id: ensure
+        if: ${{ inputs.dry_run != true }}
+        env:
+          GH_TOKEN: ${{ secrets.SOV_PTR_GITHUB_TOKEN }}
+        run: |
+          set -eu
+          TAG="v${{ inputs.version }}"
+          if gh release view "$TAG" --repo "$RELEASE_REPO" >/dev/null 2>&1; then
+            echo "release $TAG exists on $RELEASE_REPO -- assets will be added to it"
+            echo "created_draft=false" >> "$GITHUB_OUTPUT"
+          else
+            gh release create "$TAG" --repo "$RELEASE_REPO" --draft \
+              --title "SOV Node $TAG" \
+              --notes-file - <<'NOTES'
+          Automated build via GitHub Actions. Binaries only — the trusted, threshold-signed sov-manifest.json is produced and published by the live SOV node mesh, not by this workflow.
+
+          Note for anyone who installed Android v1.1.3: that build carried a different signing certificate, so Android will not update it in place. Uninstall it first, then install this APK and restore your wallet from your recovery words.
+          NOTES
+            echo "created draft release $TAG on $RELEASE_REPO"
+            echo "created_draft=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: ${{ inputs.dry_run == true }}
+        run: echo "dry run -- no release is created or touched"
+
+  windows:
+    needs: [prepare]
+    if: ${{ inputs.android_only != true }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with: { channel: stable }
+      # NODE 22, NOT 20 -- on all three desktop jobs. The locked better-sqlite3 (12.10.0) ships
+      # prebuilt binaries for Node 22 (ABI 127) and 24, but NOT Node 20, so under Node 20
+      # `npm ci` falls back to node-gyp, which cannot recognise the runner's Visual Studio 18
+      # (found by the 2026-09-21 dry runs). better-sqlite3-multiple-ciphers 12.9.0 has 127 too.
+      # The bundled runtime the app ships is this same node binary, so the ABI matches by
+      # construction. setup-node also installs the OFFICIAL self-contained binary, which is
+      # what the macOS job needs (see there).
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: flutter pub get
+      - run: flutter build windows --release
+      - name: Rebuild native sov-node deps for Windows
+        working-directory: wallet/windows/sov-node
+        run: |
+          Remove-Item -Recurse -Force node_modules -ErrorAction SilentlyContinue
+          npm ci --omit=dev
+      - name: Embed node.exe + sov-node payload next to the built app
+        shell: pwsh
+        run: |
+          $rel = "build\windows\x64\runner\Release"
+          # Must land at <rel>\node\node.exe (a subdirectory), matching both
+          # windows/CMakeLists.txt's local-build layout and what
+          # NodeController._locate() (lib/sov_node_sdk/node_controller.dart)
+          # actually looks for. A flat <rel>\node.exe is invisible to it and
+          # was only masked in dev testing by falling back to a system-PATH
+          # node — which a real citizen's machine won't have. Confirmed via a
+          # real build 2026-08-30, see NODE_REACHABILITY.md-adjacent BRAIN_SYNC tick.
+          New-Item -ItemType Directory -Force "$rel\node" | Out-Null
+          Copy-Item (Get-Command node).Source "$rel\node\node.exe" -Force
+          Remove-Item -Recurse -Force "$rel\sov-node" -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force "$rel\sov-node" | Out-Null
+          Copy-Item wallet\windows\sov-node\src "$rel\sov-node\src" -Recurse -Force
+          Copy-Item wallet\windows\sov-node\package.json "$rel\sov-node\package.json" -Force
+          Copy-Item wallet\windows\sov-node\node_modules "$rel\sov-node\node_modules" -Recurse -Force
+      - name: Portable pack (dist\SovNode.exe, load-in-place, no install)
+        run: |
+          python tools\portable_packer\pack_portable.py --name "SovNode" --exe SovNode.exe --src build\windows\x64\runner\Release --out dist\SovNode.exe
+      - name: Zip
+        run: Compress-Archive -Path dist\SovNode.exe -DestinationPath sovnode-windows-x64.zip
+      - name: Add to the release
+        if: ${{ inputs.dry_run != true }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SOV_PTR_GITHUB_TOKEN }}
+        run: bash scripts/release_upload_asset.sh "v${{ inputs.version }}" sovnode-windows-x64.zip "${{ inputs.replace_existing }}"
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.dry_run == true }}
+        continue-on-error: true   # dry-run inspection only; the artifact quota must never fail a build
+        with: { name: sovnode-windows-x64, path: sovnode-windows-x64.zip }
+
+  # TWO macOS ASSETS, ONE PER ARCHITECTURE.
+  #
+  # `macos-latest` is Apple Silicon now. v1.2.1 was built there and shipped as
+  # `sovnode-macos-x64.tar.gz` with an **arm64** node and arm64 native modules inside a
+  # universal app bundle — so on an Intel Mac the wallet ran and the node could not start,
+  # from a file whose name promised x64. Nothing caught it: the build, the smoke test and the
+  # checksums all pass either way, because only the Mach-O header knows.
+  #
+  # So the architecture is pinned per runner and named honestly. `macos-13` is the last Intel
+  # image GitHub offers; if it is retired, build the x64 asset on an Apple Silicon runner with
+  # an x64 Node and `npm_config_arch=x64 npm ci`, and keep the name.
+  macos:
+    needs: [prepare]
+    if: ${{ inputs.android_only != true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest     # Apple Silicon
+            arch: arm64
+          - runner: macos-13         # Intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with: { channel: stable }
+      # Without this the job copied Homebrew's node, which is dynamically linked against
+      # libnode.<abi>.dylib -- the bundle then aborted with "Library not loaded: @rpath/libnode"
+      # in the smoke test (2026-09-21). The official Node binary is self-contained. Node 22 for
+      # the prebuilt native modules, same reasoning as the windows job.
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: flutter pub get
+      - run: flutter build macos --release
+      - run: bash scripts/embed_macos_node.sh
+      # PROVE THE ARCHITECTURE BEFORE PUBLISHING. This is the check whose absence shipped an
+      # arm64 node as "x64": the bundled node and the native module must match the runner this
+      # asset is named for, or the node silently cannot start on the machines that download it.
+      - name: Verify the bundled node matches ${{ matrix.arch }}
+        run: |
+          set -eu
+          APP="$(find build/macos -maxdepth 4 -name '*.app' -path '*Release*' | head -1)"
+          RES="$APP/Contents/Resources"
+          want='${{ matrix.arch }}'
+          [ "$want" = "x64" ] && want=x86_64
+          for f in "$RES/node/node" \
+                   "$RES/sov-node/node_modules/better-sqlite3-multiple-ciphers/build/Release/better_sqlite3.node"; do
+            got="$(lipo -archs "$f")"
+            echo "$f -> $got"
+            case " $got " in
+              *" $want "*) ;;
+              *) echo "::error::$f is [$got], expected $want for the ${{ matrix.arch }} asset"; exit 1;;
+            esac
+          done
+          otool -L "$RES/node/node" | grep -q libnode && {
+            echo "::error::the bundled node links libnode — it is not self-contained"; exit 1; } || true
+          echo "bundled node and native module are ${{ matrix.arch }}, self-contained"
+      - name: Tar the .app
+        run: |
+          APP="$(find build/macos -maxdepth 4 -name '*.app' -path '*Release*' | head -1)"
+          tar -C "$(dirname "$APP")" -czf sovnode-macos-${{ matrix.arch }}.tar.gz "$(basename "$APP")"
+      - name: Add to the release
+        if: ${{ inputs.dry_run != true }}
+        env:
+          GH_TOKEN: ${{ secrets.SOV_PTR_GITHUB_TOKEN }}
+        run: bash scripts/release_upload_asset.sh "v${{ inputs.version }}" sovnode-macos-${{ matrix.arch }}.tar.gz "${{ inputs.replace_existing }}"
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.dry_run == true }}
+        continue-on-error: true
+        with:
+          name: sovnode-macos-${{ matrix.arch }}
+          path: sovnode-macos-${{ matrix.arch }}.tar.gz
+
+  linux:
+    needs: [prepare]
+    if: ${{ inputs.android_only != true }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with: { channel: stable }
+      - run: |
+          sudo apt-get update
+          # gstreamer: audioplayers_linux; libsecret: flutter_secure_storage_linux; ayatana-appindicator:
+          # tray_manager. Every Linux plugin's pkg_check_modules was read from the pub cache, so this
+          # is the complete set, not the next guess. Without them the job dies at CMake configure.
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libstdc++-12-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libsecret-1-dev libayatana-appindicator3-dev
+      # Node 22: prebuilt better-sqlite3, and the self-contained binary the AppImage bundles.
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: flutter pub get
+      - run: flutter config --enable-linux-desktop
+      - run: flutter build linux --release
+      - run: bash scripts/embed_linux_node.sh
+      - run: bash scripts/make_appimage.sh "${{ inputs.version }}"
+      - run: cp "dist/SovNode-${{ inputs.version }}-x86_64.AppImage" sovnode-linux-x64.AppImage
+      - name: Add to the release
+        if: ${{ inputs.dry_run != true }}
+        env:
+          GH_TOKEN: ${{ secrets.SOV_PTR_GITHUB_TOKEN }}
+        run: bash scripts/release_upload_asset.sh "v${{ inputs.version }}" sovnode-linux-x64.AppImage "${{ inputs.replace_existing }}"
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.dry_run == true }}
+        continue-on-error: true
+        with: { name: sovnode-linux-x64, path: sovnode-linux-x64.AppImage }
+
+  android:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # PINNED to the version the snap bundles (snapcraft.yaml FL_VER=3.41.4). `channel:
+      # stable` alone resolves to whatever the runner has that day, and a toolchain change
+      # moves libapp.so by 23.87% (measured) -- so an unpinned runner could never reach
+      # content agreement with any other builder, even from identical source.
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.41.4
+          channel: stable
+      - run: flutter pub get
+
+      # ── THE RELEASE KEYSTORE ──────────────────────────────────────────────────
+      # Tier 1 signs with the SAME `sov` key as every other tier (signer SHA-256
+      # 7c783a95…3d65). That is not a preference: Android refuses an update signed by
+      # a different key, so a tier that signs differently strands every install it ever
+      # produced. The already-published v1.1.3 APK is exactly that mistake — it went out
+      # on a debug certificate and can never be updated by a sov-signed release.
+      #
+      # The key is held as a repo secret and written to RUNNER_TEMP, which is destroyed
+      # with the runner. It is never committed, never an artifact, and never passed to a
+      # tier-2 builder — those return unsigned content and the key holder signs only a
+      # digest that reached quorum (docs/BUILDER_REGISTRY_DESIGN.md §5).
+      - name: Stage the release keystore
+        env:
+          KS_B64: ${{ secrets.SOV_KEYSTORE_BASE64 }}
+        run: |
+          set -eu
+          if [ -z "${KS_B64:-}" ]; then
+            echo "::error::SOV_KEYSTORE_BASE64 is not set. Tier 1 cannot sign, and"
+            echo "::error::build.gradle.kts will fail rather than fall back to a debug key."
+            exit 1
+          fi
+          printf '%s' "$KS_B64" | base64 -d > "$RUNNER_TEMP/sov-release.jks"
+          # A truncated or mis-encoded secret yields a file that exists but cannot sign;
+          # catch that here rather than as an opaque Gradle failure.
+          test -s "$RUNNER_TEMP/sov-release.jks"
+          echo "keystore staged ($(stat -c%s "$RUNNER_TEMP/sov-release.jks") bytes)"
+
+      # THE APK'S VERSION MUST COME FROM pubspec.yaml, AND MATCH THE RELEASE TAG.
+      #
+      # Found 2026-08-26: the published v1.1.3 APK reports versionName 1.0.0 and
+      # versionCode 1. The `version` input only ever fed the git tag and the AppImage
+      # filename; nothing reached the APK. So every release ships versionCode 1, and
+      # nothing -- not Android, not an auto-updater -- can tell which build is newer.
+      #
+      # This ASSERTS rather than INJECTS, deliberately. Injecting the version here (via
+      # --build-name/--build-number) would make the artifact depend on CI inputs, so two
+      # builders building the same commit could produce different versionCodes and never
+      # reach content agreement. pubspec.yaml is part of the source tree and therefore part
+      # of source_root, so every tier reads the same value by construction. Bumping it is a
+      # source change, which is what a release should be.
+      - name: Check pubspec version matches the release tag
+        run: |
+          set -eu
+          PUBSPEC=$(grep -m1 '^version:' pubspec.yaml | sed 's/^version:[[:space:]]*//')
+          NAME=${PUBSPEC%%+*}
+          CODE=${PUBSPEC##*+}
+          echo "pubspec: versionName=$NAME versionCode=$CODE ; release input=${{ inputs.version }}"
+          if [ "$NAME" != "${{ inputs.version }}" ]; then
+            echo "::error::pubspec.yaml says version $NAME but this release is ${{ inputs.version }}."
+            echo "::error::Bump pubspec.yaml to '${{ inputs.version }}+<higher build number>' and commit it."
+            echo "::error::Android refuses an update whose versionCode is not higher than the installed one."
+            exit 1
+          fi
+      # BUILD AT THE CANONICAL PATH. The project's absolute path is baked into the Dart AOT
+      # snapshot via the plugin-registrant URI, so two builders at different paths produce
+      # different artifacts from identical source (proven 2026-08-26: 3 of 543 entries
+      # differed; matched the paths and it was 543/543). A runner checks out to
+      # /home/runner/work/<repo>/<repo>, so bind it to the same root autobuild.js uses.
+      # Keep this value identical to CANONICAL_BUILD_ROOT in
+      # wallet/windows/sov-node/src/release/autobuild.js -- changing either changes every
+      # artifact's content digest network-wide.
+      - name: Build the APK at the canonical path
+        env:
+          SOV_KEYSTORE_FILE: ${{ runner.temp }}/sov-release.jks
+          SOV_KEYSTORE_PASSWORD: ${{ secrets.SOV_KEYSTORE_PASSWORD }}
+          SOV_KEY_ALIAS: ${{ secrets.SOV_KEY_ALIAS }}
+          SOV_KEY_PASSWORD: ${{ secrets.SOV_KEY_PASSWORD }}
+        run: |
+          set -eux
+          sudo mkdir -p /sov-apkbuild/proj
+          sudo mount --bind "$GITHUB_WORKSPACE" /sov-apkbuild/proj
+          cd /sov-apkbuild/proj
+          flutter build apk --release
+
+      # VERIFY THE SIGNER, do not assume it. A wrong or stale keystore secret produces a
+      # perfectly valid APK signed by the wrong key -- which installs fine in testing and
+      # then cannot update anybody. Fail the release here instead of discovering it in
+      # the field, which is precisely how v1.1.3 shipped debug-signed.
+      - name: Verify the APK is signed by the SOV key
+        run: |
+          set -eu
+          EXPECTED=7c783a951206cecaa6f720d8838e058e2c5d856bdbc943b45e486c56206a3d65
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | tail -1)
+          GOT=$("$APKSIGNER" verify --print-certs build/app/outputs/flutter-apk/app-release.apk                 | grep -m1 -i "certificate SHA-256 digest" | sed 's/.*: *//' | tr 'A-Z' 'a-z')
+          echo "signer: $GOT"
+          if [ "$GOT" != "$EXPECTED" ]; then
+            echo "::error::APK signed by $GOT, expected the SOV key $EXPECTED."
+            echo "::error::Publishing this would strand every install it reached."
+            exit 1
+          fi
+          echo "signer matches the SOV release key"
+
+      - name: Content digest (what independent builders compare)
+        run: python3 scripts/apk_content_digest.py build/app/outputs/flutter-apk/app-release.apk
+      # The next step reads build/ relative to $GITHUB_WORKSPACE and that is CORRECT:
+      # a bind mount is the same directory under two names, so output written through
+      # /sov-apkbuild/proj is the same inode as $GITHUB_WORKSPACE/build. Do not "fix" this
+      # to an absolute /sov-apkbuild path -- both work, and the relative form keeps working
+      # if the bind ever has to be dropped.
+      - run: cp build/app/outputs/flutter-apk/app-release.apk sovnode-android.apk
+      # DRY RUN: park the signed APK as a DRAFT release on THIS private repo so a person can
+      # pull it and measure it (signer, libsqlite3.so size, versionCode) without publishing.
+      # A draft on a private repo is visible only to collaborators, and release assets do
+      # not count toward the Actions artifact quota -- which is what blocked the first
+      # tier-1 dry runs (2026-09-21: "Artifact storage quota has been hit", usage only
+      # re-counted every 6-12 h). Delete the draft once measured; nothing public is created.
+      - name: Dry run only -- stash the APK as a draft release on the private build repo
+        if: ${{ inputs.dry_run == true }}
+        env:
+          GH_TOKEN: ${{ secrets.SOV_PTR_GITHUB_TOKEN }}
+        run: |
+          set -eu
+          TAG="dryrun-v${{ inputs.version }}-${GITHUB_RUN_ID}"
+          gh release create "$TAG" sovnode-android.apk \
+            --repo "${GITHUB_REPOSITORY}" --draft --prerelease \
+            --title "DRY RUN $TAG (not a release)" \
+            --notes "Tier-1 dry-run artifact for measurement only. Draft, private repo, delete after use."
+          echo "draft release: $TAG on ${GITHUB_REPOSITORY}"
+      - name: Add to the release
+        if: ${{ inputs.dry_run != true }}
+        env:
+          GH_TOKEN: ${{ secrets.SOV_PTR_GITHUB_TOKEN }}
+        run: bash scripts/release_upload_asset.sh "v${{ inputs.version }}" sovnode-android.apk "${{ inputs.replace_existing }}"
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.dry_run == true }}
+        continue-on-error: true   # the draft stash above is the dry-run deliverable
+        with: { name: sovnode-android, path: sovnode-android.apk }
+      # HISTORY. Until 2026-09-21 a long note here said "THIS JOB CANNOT CURRENTLY PRODUCE
+      # AN APK" -- true on 2026-08-26, when no keystore was wired. The keystore secrets were
+      # set on 2026-08-28; what kept tier 1 from working after that was an expired PAT, a
+      # CR/LF-corrupted SOV_KEYSTORE_BASE64 ("base64: invalid input"), and the artifact
+      # quota. All three are fixed above. Tier 1 built, signed and published v1.2.0 on
+      # 2026-09-21; the citizen install was Play-Protect-clean. The signing rules the old
+      # note argued for still hold: same `sov` key on every tier (signer 7c783a95…3d65),
+      # Flutter pinned, canonical build path (docs/BUILD_TIERS_DESIGN.md).
+
+  finalize:
+    needs: [prepare, windows, macos, linux, android]
+    runs-on: ubuntu-latest
+    # Runs when every job that was supposed to build succeeded (desktop jobs are skipped,
+    # not failed, in android_only mode). Never on a dry run: a release is visible the
+    # instant it is un-drafted and cannot be un-published from anyone who already fetched it.
+    if: >-
+      ${{ always() && inputs.dry_run != true
+          && needs.android.result == 'success'
+          && (inputs.android_only == true
+              || (needs.windows.result == 'success' && needs.macos.result == 'success' && needs.linux.result == 'success')) }}
+    env:
+      GH_TOKEN: ${{ secrets.SOV_PTR_GITHUB_TOKEN }}
+    steps:
+      - name: Regenerate SHA256SUMS.txt over every asset on the release
+        run: |
+          set -eu
+          TAG="v${{ inputs.version }}"
+          mkdir -p final && cd final
+          gh release download "$TAG" --repo "$RELEASE_REPO" --pattern '*' --skip-existing
+          rm -f SHA256SUMS.txt
+          sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+          gh release upload "$TAG" SHA256SUMS.txt --repo "$RELEASE_REPO" --clobber
+      - name: Publish (un-draft) if this run created the release
+        if: ${{ needs.prepare.outputs.created_draft == 'true' }}
+        run: gh release edit "v${{ inputs.version }}" --repo "$RELEASE_REPO" --draft=false
+      - name: What happens next (not automated here, by design)
+        run: |
+          echo "Release $RELEASE_REPO@v${{ inputs.version }} is complete, with SHA256SUMS.txt covering every asset."
+          echo "A live SOV node's release_scheduler/release_coordinator now needs to see"
+          echo "this version, get it threshold-signed by the witness signers, and ingest"
+          echo "it -- that ingest step already auto-fires pointer_store_publish.js."
+          echo "This workflow intentionally stops short of that (no signer keys here)."

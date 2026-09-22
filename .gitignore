@@ -1,0 +1,22 @@
+build/
+.dart_tool/
+.gradle/
+node_modules/
+android/local.properties
+android/key.properties
+*.jks
+*.keystore
+
+# Build-tool crash and error logs: they embed absolute paths from whoever built,
+# which is both noise and an unnecessary disclosure in a public repository.
+*.log
+hs_err_pid*.log
+.kotlin/
+android/.kotlin/
+# Generated at pack time from the local path; never a source input.
+tools/portable_packer/_build_gen.bat
+tools/portable_packer/stub_gen.*
+# Compiler output: stub.obj embedded the absolute path of the machine that built it.
+tools/portable_packer/stub.obj
+__pycache__/
+*.pyc

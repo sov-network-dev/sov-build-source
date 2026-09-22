@@ -1,0 +1,146 @@
+name: sov_node
+description: SOV Network Node — open community biometric wallet
+publish_to: 'none'
+# VERSION — read by BOTH the APK (versionName+versionCode) and the release tag.
+#
+# Bumping this IS the release. `.github/workflows/release.yml` ASSERTS that the name
+# half matches the release tag rather than injecting it, so that two builders on the
+# same commit cannot produce different versionCodes and lose content agreement.
+#
+# versionCode scheme: MAJOR*10000 + MINOR*100 + PATCH  (1.2.0 -> 10200).
+# Derived from the name, so every tier computes the same number by construction, and
+# it increases monotonically for any sane version bump. Never hand-pick it.
+#
+# History: 1.0.0+1 shipped as release v1.1.3 (2026-07-29) because the workflow's
+# `version` input only fed the git tag -- nothing reached the APK. Every build
+# therefore claimed versionCode 1, and Android cannot order two builds that agree on
+# versionCode, so no release could ever update another. See
+# docs/PUBLIC_DOWNLOAD_IS_WRONG_2026-08-26.md section 3.
+version: 1.2.2+10202
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # ── SOV Node SDK ───────────────────────────────────────────────────────────
+  flutter_secure_storage: ^9.2.2
+  sqflite: ^2.3.3+1
+  path_provider: ^2.1.4
+  path: ^1.9.0
+  crypto: ^3.0.3
+  convert: ^3.1.1
+  web_socket_channel: ^3.0.1
+  cryptography: ^2.7.0
+
+  # ── Camera & sensors ───────────────────────────────────────────────────────
+  camera: ^0.11.0
+  sensors_plus: ^4.0.2
+  wakelock_plus: ^1.1.4
+
+  # ── Custom YOLOv8 AI (svrn_model.tflite) ──────────────────────────────────
+  # Used for palm detection in the live viewfinder via detectPalmFast()
+  # Model must be retrained with hard negatives before production use
+  tflite_flutter: ^0.12.1
+
+  # ── Image processing ───────────────────────────────────────────────────────
+  image: ^4.1.0
+
+  # ── Face detection / liveness ──────────────────────────────────────────────
+  google_mlkit_face_detection: ^0.11.0
+
+  # ── Image picking ──────────────────────────────────────────────────────────
+  image_picker: ^1.1.2
+
+  # ── UI ─────────────────────────────────────────────────────────────────────
+  shared_preferences: ^2.3.4
+  share_plus: ^10.0.0
+  url_launcher: ^6.3.0
+  bip39: ^1.0.6
+  # ── Backup & recovery ──────────────────────────────────────────────────────
+  encrypt: ^5.0.0
+  file_picker: ^8.0.0
+  # ── QR code generation + scanning + deep link handling ────────────────────
+  qr_flutter: ^4.1.0
+  mobile_scanner: ^6.0.0
+  app_links: ^6.3.0
+
+  # ── Notifications ─────────────────────────────────────────────────────────
+  flutter_local_notifications: ^18.0.0
+  device_info_plus: ^11.5.0
+  package_info_plus: ^8.0.0
+  # ── Desktop: tray + close-to-tray so the full node keeps serving when the ──
+  # window is closed (protects the 21-day operator uptime streak).
+  window_manager: ^0.4.2
+  tray_manager: ^0.3.2
+
+  # ── SOV Speak media attachments ───────────────────────────────────────────
+  flutter_sound: ^9.2.13
+  video_player: ^2.9.1
+  audioplayers: ^6.0.0
+  mime: ^1.0.5
+  permission_handler: ^11.3.1
+
+  # ── S15 Voice/Video Calls (LiveKit) ───────────────────────────────────────
+  # System ringtone playback (asAlarm:true rings even on silent mode — same as
+  # a real phone call). Used by main_shell.dart _showIncomingCallBanner.
+  flutter_ringtone_player: ^4.0.0+3
+  sqflite_common_ffi: ^2.4.0+3
+
+dev_dependencies:
+  flutter_driver:
+    sdk: flutter
+  flutter_test:
+    sdk: flutter
+  # integration_test temporarily disabled for release builds — the dev-only
+  # IntegrationTestPlugin gets added to GeneratedPluginRegistrant and breaks
+  # `compileReleaseJavaWithJavac` ("package dev.flutter.plugins.integration_test
+  # does not exist"). Re-enable (uncomment + `flutter pub get`) to run
+  # integration_test/palm_live_test.dart, then disable again before shipping.
+  # integration_test:
+  #   sdk: flutter
+  test: any
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/models/svrn_model.tflite
+    - assets/models/mobilefacenet.tflite
+    - assets/models/blazeface_short.tflite
+    - assets/relay_pool.json
+    - assets/governance_defaults.json
+    - assets/academy_shots/
+    - assets/tray_icon.ico
+    - assets/voice/
+    - assets/brand/
+    # assets/test_palms/ — king's real-palm fixtures for integration_test/palm_live_test.dart.
+    # PRIVACY: never ship these in a release APK. Uncomment ONLY to run the on-device
+    # palm test, then re-comment before any release build.
+
+# NOTE ON sqlite3 — deliberately NOT pinned to vendored source here.
+#
+# The sqlite3 package (transitive via sqflite_common_ffi) downloads a precompiled
+# library from GitHub releases during the build. Compiling it from the vendored
+# amalgamation in third_party/sqlite3 instead removes that dependency — but it
+# produces a native library with zero global prevalence, which triggers a Google
+# Play Protect warning on install ("hasn't seen an app from this developer
+# before"). Measured 2026-08-25: same signing key, same 543 entries, 24/30 native
+# libs byte-identical to the clean 08-21 build; the only substantive difference was
+# libsqlite3.so, 1,716,840 -> 1,751,824 bytes.
+#
+# Citizens must not meet that dialog, so the DEFAULT build (tiers 1-2, GitHub
+# runners) uses the prebuilt library and stays clean. `autobuild.js` INJECTS the
+# hooks block below at build time for the tier-3 node self-build, which cannot
+# reach GitHub and must compile from source:
+#
+#   hooks:
+#     user_defines:
+#       sqlite3:
+#         source: source
+#         path: third_party/sqlite3/sqlite3.c
+#
+# third_party/sqlite3/ therefore stays vendored even though nothing here reads it.
+# See docs/BUILD_TIERS_DESIGN.md.

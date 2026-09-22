@@ -1,0 +1,25 @@
+# SOV release signing — TEMPLATE. Copy to android/key.properties and fill in.
+#
+# android/key.properties and *.jks are gitignored and MUST NEVER be committed.
+#
+# Preferred: do not create this file at all. Export the environment variables
+# instead, so a reconstructed key never touches disk:
+#
+#   SOV_KEYSTORE_FILE=/abs/path/sov-release.jks
+#   SOV_KEYSTORE_PASSWORD=...
+#   SOV_KEY_ALIAS=sov
+#   SOV_KEY_PASSWORD=...
+#
+# WHOSE KEY IS THIS? Not the founder's. The king becomes an ordinary citizen at
+# launch, so no gate may depend on him. This key is a NETWORK asset held by the
+# earned operator set under k-of-n threshold custody — read
+# docs/APK_SIGNING_CUSTODY.md before generating or using it.
+#
+# It is NOT a protocol trust root: SOV trust is source_root + multi-builder hash
+# attestation. This key only satisfies Android's rule that an update must carry
+# the same signature as the install it replaces.
+
+storeFile=/absolute/path/to/sov-release.jks
+storePassword=CHANGE_ME
+keyAlias=sov
+keyPassword=CHANGE_ME
