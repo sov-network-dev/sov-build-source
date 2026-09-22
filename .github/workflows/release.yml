@@ -450,9 +450,20 @@ jobs:
           rm -f SHA256SUMS.txt
           sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
           gh release upload "$TAG" SHA256SUMS.txt --repo "$RELEASE_REPO" --clobber
-      - name: Publish (un-draft) if this run created the release
-        if: ${{ needs.prepare.outputs.created_draft == 'true' }}
-        run: gh release edit "v${{ inputs.version }}" --repo "$RELEASE_REPO" --draft=false
+      # Un-draft whenever the release is STILL a draft, not only when this run created it.
+      # A release created as a draft by one run and completed by a later one (exactly what
+      # happened to v1.2.2, after the first attempt failed on the macOS asset) would
+      # otherwise sit as a finished draft forever: every asset present, nothing public.
+      - name: Publish (un-draft) if the release is still a draft
+        run: |
+          set -eu
+          TAG="v${{ inputs.version }}"
+          if [ "$(gh release view "$TAG" --repo "$RELEASE_REPO" --json isDraft --jq .isDraft)" = "true" ]; then
+            gh release edit "$TAG" --repo "$RELEASE_REPO" --draft=false
+            echo "published $TAG"
+          else
+            echo "$TAG was already public"
+          fi
       - name: What happens next (not automated here, by design)
         run: |
           echo "Release $RELEASE_REPO@v${{ inputs.version }} is complete, with SHA256SUMS.txt covering every asset."
