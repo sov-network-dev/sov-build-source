@@ -151,9 +151,15 @@ jobs:
   # from a file whose name promised x64. Nothing caught it: the build, the smoke test and the
   # checksums all pass either way, because only the Mach-O header knows.
   #
-  # So the architecture is pinned per runner and named honestly. `macos-13` is the last Intel
-  # image GitHub offers; if it is retired, build the x64 asset on an Apple Silicon runner with
-  # an x64 Node and `npm_config_arch=x64 npm ci`, and keep the name.
+  # So the architecture is pinned per runner and named honestly.
+  #
+  # PICKING THE INTEL LABEL: GitHub names its Intel image WITHOUT a suffix and its Apple
+  # Silicon one WITH `-arm64` (macos-15 is x86_64, macos-15-arm64 is arm64 — check the tool
+  # paths in actions/runner-images images/macos/<label>-Readme.md: JAVA_HOME_*_X64 vs
+  # _arm64). `macos-13` was retired and a job asking for it QUEUES FOREVER rather than
+  # failing, which cost 35 minutes on 2026-09-22. If macos-15 goes the same way, move to the
+  # next unsuffixed image; if Intel runners disappear entirely, build the x64 asset on an
+  # Apple Silicon runner with an x64 Node and `npm_config_arch=x64 npm ci`, and keep the name.
   macos:
     needs: [prepare]
     if: ${{ inputs.android_only != true }}
@@ -163,7 +169,7 @@ jobs:
         include:
           - runner: macos-latest     # Apple Silicon
             arch: arm64
-          - runner: macos-13         # Intel
+          - runner: macos-15         # Intel (x86_64)
             arch: x64
     runs-on: ${{ matrix.runner }}
     steps:
