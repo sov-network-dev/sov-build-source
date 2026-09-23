@@ -84,6 +84,10 @@ class UpdateService {
     if (Platform.isWindows) return 'windows';
     if (Platform.isMacOS) return 'macos';
     if (Platform.isAndroid) return 'android'; // was falling through to 'linux' (found 2026-09-22)
+    // iOS asks for a key the manifest deliberately does not carry: an iPhone app cannot
+    // replace itself outside the App Store, so the honest answer is "no artifact for ios"
+    // rather than offering it a Linux AppImage, which is what it used to be handed.
+    if (Platform.isIOS) return 'ios';
     return 'linux';
   }
 
