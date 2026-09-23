@@ -37,6 +37,17 @@ has: a signing certificate, a team id and a provisioning profile. Set those in X
   able to tell they are running SOV.
 - Nothing here phones home to any operator. Node discovery is peer-to-peer.
 
+## One pin you must not lower
+
+`google_mlkit_face_detection` is pinned at `^0.12.0`, and the floor is deliberate. Below it,
+the plugin asks CocoaPods for `GoogleMLKit/FaceDetection ~> 6.0.0` while `mobile_scanner` asks
+for `BarcodeScanning ~> 7.0.0`. Those resolve to different ML Kit cores, CocoaPods allows only
+one per app, and `pod install` refuses — the build stops before Xcode ever starts.
+
+Android does not have this problem (Gradle resolves each ML Kit artifact on its own), so a
+change that looks harmless on Android can break iOS alone. If you bump `mobile_scanner`, check
+that the face-detection plugin still agrees with it on the ML Kit generation.
+
 ## Two plugins do not support iOS
 
 `tray_manager` and `window_manager` are desktop-only. They do not break the build — Flutter
