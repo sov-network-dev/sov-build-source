@@ -49,7 +49,16 @@ dependencies:
   image: ^4.1.0
 
   # ── Face detection / liveness ──────────────────────────────────────────────
-  google_mlkit_face_detection: ^0.11.0
+  # 0.12.0 IS A FLOOR, NOT A PREFERENCE — DO NOT LOWER IT.
+  # On iOS, CocoaPods resolves one ML Kit core for the whole app. 0.11.x asks for
+  # GoogleMLKit/FaceDetection ~> 6.0.0 (MLKitCore = 6.0.0) while mobile_scanner below asks for
+  # GoogleMLKit/BarcodeScanning ~> 7.0.0 (MLKitCore = 7.0.0), and `pod install` refuses the app
+  # outright. Android never shows this — Gradle resolves each ML Kit artifact on its own — so the
+  # conflict only ever surfaces in the iOS compile check (2026-09-23).
+  # 0.12.0 changes NOTHING but that pod constraint: the Android artifact is the same
+  # com.google.mlkit:face-detection:16.1.7 and the Dart API is byte-identical to 0.11.1, so the
+  # face-lock dedup model is unchanged. Verified by diffing both package archives.
+  google_mlkit_face_detection: ^0.12.0
 
   # ── Image picking ──────────────────────────────────────────────────────────
   image_picker: ^1.1.2
