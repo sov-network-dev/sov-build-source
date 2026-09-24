@@ -8,10 +8,10 @@ import 'package:sqflite/sqflite.dart';
 import '../sov_node_sdk/relay_connector.dart';
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// NODE WITNESS SERVICE â€” Sovereign Network
+// NODE WITNESS SERVICE â€” SOV Network
 // Blueprint v5.2
 //
-// Every phone on the Sovereign Network is a witness node.
+// Every phone on the SOV Network is a witness node.
 // This service runs silently in the background from app launch.
 //
 // What it does:

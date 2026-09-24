@@ -1433,7 +1433,7 @@ class _EnrollmentScreenState extends State<EnrollmentScreen>
       icon: Icons.lock_outlined,
       title: 'You Own It All',
       body: 'No company controls your wallet. Your master key never '
-            'leaves your device. The Sovereign Network is yours.',
+            'leaves your device. The SOV Network is yours.',
     ),
   ];
 
@@ -2455,7 +2455,7 @@ class _EnrollmentScreenState extends State<EnrollmentScreen>
             child: Text(
               _connectionStatus.isNotEmpty
                   ? _connectionStatus
-                  : 'Connecting to the Sovereign Network...',
+                  : 'Connecting to the SOV Network...',
               key: ValueKey<String>(_connectionStatus),
               textAlign: TextAlign.center,
               style: const TextStyle(

@@ -19,7 +19,7 @@ import 'node_discovery.dart';
 import 'package:cryptography/cryptography.dart' as sov_crypto;
 
 /// ═══════════════════════════════════════════════════════════════════════════
-/// RelayConnector — Sovereign Network Relay Client
+/// RelayConnector — SOV Network Relay Client
 ///
 /// ARCHITECTURE LAW: This file is the ONLY place in the Flutter app that
 /// opens a network connection. No other file may use http, dio, or any

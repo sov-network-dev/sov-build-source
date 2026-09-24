@@ -972,14 +972,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           _row(
             icon: Icons.article_outlined,
-            title: 'Sovereign Network Blueprint',
+            title: 'SOV Network Blueprint',
             subtitle: 'v14.0',
             onTap: () => showAboutDialog(
               context: context,
               applicationName: 'SOV',
               applicationVersion: _version,
               applicationLegalese:
-                  'Sovereign Network Master Blueprint v14.0\n\n'
+                  'SOV Network Master Blueprint v14.0\n\n'
                   'A decentralised biometric-anchored sovereign identity '
                   'and value-transfer network.\n\n'
                   'Network: sovereign-mainnet-1',
