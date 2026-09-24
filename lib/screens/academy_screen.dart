@@ -83,12 +83,13 @@ class _AcademyScreenState extends State<AcademyScreen> {
 
   // Static Knowledge Bank articles — safe civic education content
   static const _knowledgeBank = [
-    (icon: Icons.info_outline_rounded,       title: 'SOV Network is an independent project',
-     body: 'SOV Network is not affiliated with, endorsed by, or connected to The Sovereign '
-           'Network (thesovereignnetwork.org), which is a separate and unrelated project. '
-           'The names are similar; the projects are not. SOV is not a blockchain: identity here '
-           'is a palm read on your own device, and no company, foundation or operator stands '
-           'behind it.'),
+    (icon: Icons.info_outline_rounded,       title: 'What SOV is, and what it is not',
+     body: 'SOV is not a blockchain. There is no chain of blocks, no mining race, and no '
+           'company, foundation or operator standing behind the network. Your identity is not '
+           'an account someone issues you and can take away: it is a palm read on your own '
+           'device, which never leaves it. One living human, one wallet, proven without a '
+           'name, an email or a phone number. Anyone can run a node, and the nodes are run by '
+           'citizens, not by us.'),
     (icon: Icons.public_rounded,             title: 'The world needed something new',
      body: 'Bitcoin proved that money does not need a bank. But Bitcoin never solved identity, communication, or justice. The SOV Network was built to go further — a single network where you own your identity, your money, your messages, and your voice in how the rules are written. Not controlled by any company. Not dependent on any government. Built to outlast them both.'),
     (icon: Icons.hub_outlined,               title: 'Not a blockchain — a Sovereign Mesh',
