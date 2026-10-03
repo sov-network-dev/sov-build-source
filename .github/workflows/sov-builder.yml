@@ -1,0 +1,177 @@
+name: SOV builder (tier 2)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ANY GITHUB ACCOUNT CAN RUN THIS. That is the point.
+#
+# King's directive 2026-08-25: "anyone like myself should be able to push a gethub
+# runner with script that automatically join the network and meaning any account will
+# be able to build too". Fork or copy this file into your own repo, run it once, and
+# your account becomes a builder the network can dispatch to. Losing any single
+# account — including the project's own — then costs a redirect, not the ability to
+# ship.
+#
+# ── YOU ARE NOT BEING TRUSTED, AND YOU ARE NOT BEING ASKED TO HOLD A SECRET ────
+# A builder NEVER receives the SOV signing key (king, 2026-08-26). You produce
+# CONTENT. Independent builders compare content digests. Only a digest that reached
+# quorum is signed, by the key holder, elsewhere. Consequences worth knowing:
+#
+#   * You cannot ship anything on your own, even if you wanted to.
+#   * Nothing here can leak a SOV secret, because none is ever sent to you.
+#   * The APK this produces is signed with your runner's throwaway debug key. It is
+#     NOT installable as a SOV release and is not meant to be — it exists so its
+#     CONTENT can be compared. META-INF is excluded from the digest precisely so your
+#     key and the release key do not cause a false disagreement.
+#
+# ── THREE THINGS MUST MATCH ACROSS BUILDERS OR HONEST BUILDS DISAGREE ──────────
+#   1. FLUTTER VERSION — pinned below. A toolchain change moves libapp.so by 23.87%
+#      (measured 2026-08-25).
+#   2. BUILD PATH — /sov-apkbuild/proj. The project's absolute path is baked into the
+#      Dart AOT snapshot via the plugin-registrant URI; two builders at different
+#      paths produce different bytes from identical source (proven 2026-08-26:
+#      3 of 543 entries differed; matched the paths and it was 543/543).
+#   3. SOURCE — the commit you build. Attested, so a mismatch is diagnosable rather
+#      than mysterious.
+#
+# The JDK deliberately does NOT need to match: classes.dex was byte-identical across
+# OpenJDK 17.0.19 and 17.0.20 (measured), so pinning it would reject honest builders
+# for no gain.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version being built (e.g. 1.2.0)"
+        required: true
+      source_root:
+        description: "Expected source_root of the tree being built (attested, not enforced)"
+        required: false
+        default: ""
+  # A node that holds no write token for your repo cannot dispatch to you. Polling is
+  # the public route: you pick releases up yourself and nobody has to hold a
+  # credential for anyone else's account.
+  schedule:
+    - cron: "37 */6 * * *"
+
+concurrency:
+  group: sov-builder-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-attest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # PINNED — must equal snapcraft.yaml's FL_VER and every other builder's.
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.41.4
+          channel: stable
+
+      - run: flutter pub get
+
+      - name: Record the toolchain actually used
+        id: tc
+        run: |
+          set -eu
+          FL=$(flutter --version | head -1)
+          DART=$(dart --version 2>&1 | head -1)
+          NDK=$(ls "$ANDROID_HOME/ndk" 2>/dev/null | tail -1 || echo none)
+          BT=$(ls "$ANDROID_HOME/build-tools" 2>/dev/null | tail -1 || echo none)
+          echo "flutter=$FL"  >> "$GITHUB_OUTPUT"
+          echo "dart=$DART"   >> "$GITHUB_OUTPUT"
+          echo "ndk=$NDK"     >> "$GITHUB_OUTPUT"
+          echo "buildtools=$BT" >> "$GITHUB_OUTPUT"
+          printf 'flutter: %s\ndart: %s\nndk: %s\nbuild-tools: %s\n' "$FL" "$DART" "$NDK" "$BT"
+
+      - name: Build at the CANONICAL path
+        env:
+          # This runner holds no SOV key, so the release build must be told explicitly
+          # that debug signing is acceptable here. build.gradle.kts otherwise fails
+          # loudly rather than silently producing a forgeable artifact -- which is the
+          # correct default and must not be changed. What we want from this build is
+          # its CONTENT, not an installable release.
+          SOV_ALLOW_DEBUG_SIGNING: "true"
+        run: |
+          set -eux
+          sudo mkdir -p /sov-apkbuild/proj
+          sudo mount --bind "$GITHUB_WORKSPACE" /sov-apkbuild/proj
+          cd /sov-apkbuild/proj
+          flutter build apk --release
+          ls -l build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Compute the content digest
+        id: digest
+        run: |
+          set -eu
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          OUT=$(python3 scripts/apk_content_digest.py "$APK")
+          echo "$OUT"
+          D=$(echo "$OUT" | awk '/^content_digest/{print $2}')
+          echo "content_digest=$D" >> "$GITHUB_OUTPUT"
+
+      - name: Config hash (what was built, beyond the source commit)
+        id: cfg
+        run: |
+          set -eu
+          # pubspec + lock capture the dependency set and the version; the tier's
+          # injected state (tier 3 pins sqlite3 to vendored source, tier 1/2 do not)
+          # is what makes tier-1 and tier-3 artifacts legitimately differ.
+          H=$(cat pubspec.yaml pubspec.lock 2>/dev/null | sha256sum | cut -d' ' -f1)
+          echo "config_hash=$H" >> "$GITHUB_OUTPUT"
+
+      - name: Emit the attestation
+        run: |
+          set -eu
+          cat > sov-attestation.json <<JSON
+          {
+            "version":        "${{ inputs.version || 'scheduled' }}",
+            "commit":         "${{ github.sha }}",
+            "source_root":    "${{ inputs.source_root }}",
+            "build_path":     "/sov-apkbuild/proj",
+            "content_digest": "${{ steps.digest.outputs.content_digest }}",
+            "config_hash":    "${{ steps.cfg.outputs.config_hash }}",
+            "toolchain": {
+              "flutter":     "${{ steps.tc.outputs.flutter }}",
+              "dart":        "${{ steps.tc.outputs.dart }}",
+              "ndk":         "${{ steps.tc.outputs.ndk }}",
+              "build_tools": "${{ steps.tc.outputs.buildtools }}"
+            },
+            "builder_repo":   "${{ github.repository }}",
+            "run_url":        "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "signed":         false
+          }
+          JSON
+          cat sov-attestation.json
+
+      # Public and readable by anyone, deliberately. An attestation nobody can check is
+      # not evidence, and there is nothing secret in it.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sov-attestation
+          path: sov-attestation.json
+
+      # SHORT RETENTION, deliberately. This runs every 6 h and the APK is ~80 MB; at the
+      # default 90-day retention that is 3.2 GB of identical unsigned content, which is
+      # exactly what exhausted the account's artifact quota on 2026-09-08 and made every
+      # run since fail at upload (build fine, then "Artifact storage quota has been hit").
+      # The attestation above is the durable record and is ~0 bytes; the content only
+      # needs to outlive the window in which a key holder would pull it to compare.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sov-content-unsigned
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 3
+
+      - name: What happens next
+        run: |
+          echo "Content digest: ${{ steps.digest.outputs.content_digest }}"
+          echo
+          echo "This artifact is NOT a SOV release. It is debug-signed and cannot be"
+          echo "installed as one. Its digest is compared against other builders'; if"
+          echo "enough DISTINCT operators agree, the key holder signs that digest."
+          echo
+          echo "If your digest disagrees with everyone else's, check toolchain and"
+          echo "build path first -- those are benign mismatches. Same inputs and a"
+          echo "different digest is the case that stops a release."

@@ -1,0 +1,7 @@
+{
+  "version": 17,
+  "generated": "2026-07-31",
+  "_PROD_NOTE": "INTENTIONALLY EMPTY. No node address is compiled into the app. Shipping the live addresses here made every published build a readable map of the network, and tied the app to machines that will not last forever. Discovery is the cached pool, then the pointer mirrors, then the public DHT - a path, never a destination. At genesis this file is empty and that is correct: there is nothing to find until the first node starts, and when it does it announces itself to the DHT where the next app launch finds it.",
+  "relays": [],
+  "_TRUST_NOTE": "There is no founder signing key. A release is legitimate because the nodes actually running the network agree on the source it was built from (source_root attestation between earned nodes), not because one keyholder signed it. The founder_pubkey_hex that used to sit here was dead metadata from the retired ceremony model and was removed so nobody rebuilds a single point of trust around it. See docs/NODE_INTEGRITY_DESIGN.md."
+}
