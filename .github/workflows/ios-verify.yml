@@ -1,0 +1,66 @@
+name: iOS — compile check (no signing)
+
+# SOV does not ship an iOS build. The iOS source is kept READY IN WAITING so that anyone
+# with an Apple Developer account can build and submit it — SOV supplies the code, someone
+# else supplies the account and the submission (docs/IOS_READY_IN_WAITING_PLAN.md).
+#
+# A codebase nobody compiles rots quietly: a plugin drops iOS support, a permission string
+# goes missing, a Dart guard stops covering iOS, and none of it shows up until the person
+# who picks this up hits it. So this job compiles the iOS app on every change that could
+# break it, WITHOUT an Apple account: `--no-codesign` needs no team, no certificate and no
+# provisioning profile. It proves the source builds; it does not produce a shippable .ipa.
+#
+# It runs on the GitHub macOS runner, which is free for this public repository.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ios/**'
+      - 'lib/**'
+      - 'pubspec.yaml'
+      - 'pubspec.lock'
+      - '.github/workflows/ios-verify.yml'
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.41.4      # pinned, as the release jobs are
+          channel: stable
+      - run: flutter pub get
+
+      # The two desktop-only plugins (tray_manager, window_manager) have no iOS
+      # implementation. That is fine for the BUILD — Flutter simply does not register them —
+      # but it is only safe because every call site is behind a desktop check. If that guard
+      # ever disappears the app would throw MissingPluginException on a real iPhone, which a
+      # compile cannot catch, so assert the guard is still there.
+      - name: The desktop-only plugins must stay behind a desktop guard
+        run: |
+          set -eu
+          guard="$(grep -c 'Platform.isWindows || Platform.isLinux || Platform.isMacOS' lib/sov_node_sdk/desktop_tray.dart || true)"
+          [ "$guard" -ge 1 ] || { echo "::error::desktop_tray.dart no longer guards on desktop platforms"; exit 1; }
+          echo "desktop guard present"
+
+      # Every iOS permission the app actually uses must carry a usage string, or iOS kills
+      # the app the moment it asks. The palm scanner is the one that matters most.
+      - name: Info.plist must declare the permissions the app uses
+        run: |
+          set -eu
+          for k in NSCameraUsageDescription NSMicrophoneUsageDescription \
+                   NSPhotoLibraryUsageDescription NSFaceIDUsageDescription; do
+            grep -q "$k" ios/Runner/Info.plist || { echo "::error::Info.plist is missing $k"; exit 1; }
+          done
+          echo "all four usage descriptions present"
+
+      # The real check. No Apple account, no certificate, no provisioning profile.
+      - run: flutter build ios --release --no-codesign
+
+      - name: What this proved
+        run: |
+          echo "The iOS source compiles against Flutter 3.41.4 with no Apple account."
+          echo "It is NOT a shippable .ipa: signing, a team id and a provisioning profile"
+          echo "are the submitter's to supply. See docs/IOS_READY_IN_WAITING_PLAN.md."
