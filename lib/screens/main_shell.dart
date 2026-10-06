@@ -390,19 +390,9 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         return;
       }
 
-      // ── S12 Monetary Issuance: SOV allocation available ──────────────────
-      if (type == 'ISSUANCE_AVAILABLE') {
-        final amountSeeds = (msg['amount_seeds'] as num?)?.toInt() ?? 0;
-        final epochIds    = (msg['epoch_ids'] as List?)?.cast<String>() ?? [];
-        if (mounted && amountSeeds > 0 && epochIds.isNotEmpty) {
-          final sovAmt = (amountSeeds / 1000000.0);
-          final sovStr = sovAmt == sovAmt.roundToDouble()
-              ? '${sovAmt.toInt()} SOV'
-              : '${sovAmt.toStringAsFixed(2)} SOV';
-          _showIssuanceBanner(sovStr, epochIds);
-        }
-        return;
-      }
+      // Issuance was RETIRED in node 1.4.89 (it could mint past the 50M cap); no node sends
+      // ISSUANCE_AVAILABLE any more, and an older node's push is ignored.
+      if (type == 'ISSUANCE_AVAILABLE') return;
 
       // ── Exchange trade chat notification ─────────────────────────────────
       if (type == 'EXCHANGE_CHAT_INCOMING') {
@@ -910,80 +900,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     });
   }
 
-  // ── S12 Issuance banner ──────────────────────────────────────────────────
-  void _showIssuanceBanner(String sovStr, List<String> epochIds) {
-    if (!mounted) return;
-    OverlayEntry? entry;
-    entry = OverlayEntry(
-      builder: (ctx) => Positioned(
-        top: MediaQuery.of(ctx).viewPadding.top + 8,
-        left: 16,
-        right: 16,
-        child: Material(
-          elevation: 8,
-          borderRadius: BorderRadius.circular(16),
-          color: const Color(0xFF1A1200),
-          child: InkWell(
-            borderRadius: BorderRadius.circular(16),
-            onTap: () async {
-              entry?.remove();
-              final res = await RelayConnector.claimIssuance(epochIds);
-              if (mounted) {
-                final claimed = (res?['amount_seeds'] as num?)?.toInt() ?? 0;
-                if (claimed > 0) {
-                  final sov = claimed / 1000000.0;
-                  final str = sov == sov.roundToDouble()
-                      ? '${sov.toInt()} SOV'
-                      : '${sov.toStringAsFixed(2)} SOV';
-                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                    content: Text('$str claimed from SOV Network'),
-                    backgroundColor: const Color(0xFF4CAF50),
-                    duration: const Duration(seconds: 3),
-                  ));
-                } else {
-                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                    content: Text(res?['error'] ?? 'Claim failed'),
-                    backgroundColor: Colors.red[700],
-                  ));
-                }
-              }
-            },
-            child: Container(
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(16),
-                border: const Border(left: BorderSide(color: Color(0xFFD4AF37), width: 4)),
-              ),
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              child: Row(
-                children: [
-                  const Icon(Icons.account_balance_rounded, color: Color(0xFFD4AF37), size: 26),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Text('SOV Allocation Ready',
-                            style: TextStyle(color: Color(0xFFD4AF37), fontWeight: FontWeight.bold, fontSize: 14)),
-                        const SizedBox(height: 2),
-                        Text('$sovStr waiting — tap to claim',
-                            style: const TextStyle(color: Colors.white70, fontSize: 13)),
-                      ],
-                    ),
-                  ),
-                  const Icon(Icons.chevron_right_rounded, color: Color(0xFFD4AF37)),
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-    Overlay.of(context).insert(entry);
-    Future.delayed(const Duration(seconds: 10), () {
-      try { entry?.remove(); } catch (_) {}
-    });
-  }
+
 
   String _truncateId(String id) {
     if (id.length <= 18) return id;

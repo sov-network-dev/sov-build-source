@@ -789,9 +789,6 @@ class NodeDB {
       ['max_poll_duration',            '10080'],
       ['tx_fee_rate',                  '0.001'],   // 0.1% — cheap-launch (king 2026-07-19); votable
       ['tx_fee_max_sov',               '1'],       // hard cap: no transfer ever costs more than 1 SOV (0 = uncapped)
-      ['sov_issuance_rate',            '0'],
-      ['issuance_epoch_hours',         '24'],
-      ['issuance_max_backlog_epochs',  '7'],
       ['justice_juror_reward',         '500000'],  // 0.5 SOV per voting juror — see governance_engine PARAM_MAP
       ['guardian_approval_threshold',  '2'],
       ['guardian_max_count',           '5'],

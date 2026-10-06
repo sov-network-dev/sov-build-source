@@ -2127,34 +2127,9 @@ class _GovernanceScreenState extends State<GovernanceScreen>
             options:  ['7', '14', '30', '60', '90', '180'],
             unit:     ' days',
           ),
-          _buildGovParamItem(
-            paramKey: 'sov_issuance_rate',
-            icon:     Icons.account_balance_rounded,
-            title:    'SOV Issuance Rate',
-            desc:     'Seeds distributed to every enrolled citizen per epoch. '
-                      '0 = no issuance (deflationary). Requires governance vote to activate. '
-                      '1 SOV = 1,000,000 seeds.',
-            options:  ['0', '100', '500', '1000', '5000'],
-            unit:     ' seeds/epoch',
-          ),
-          _buildGovParamItem(
-            paramKey: 'issuance_epoch_hours',
-            icon:     Icons.timer_outlined,
-            title:    'Issuance Epoch Length',
-            desc:     'How many hours constitute one issuance epoch. '
-                      'Citizens can claim one allocation per epoch.',
-            options:  ['1', '6', '12', '24', '168'],
-            unit:     ' hours',
-          ),
-          _buildGovParamItem(
-            paramKey: 'issuance_max_backlog_epochs',
-            icon:     Icons.history_rounded,
-            title:    'Max Issuance Backlog',
-            desc:     'Maximum number of unclaimed epochs a citizen can accumulate. '
-                      'Epochs beyond this window are forfeited.',
-            options:  ['1', '3', '7', '14', '30'],
-            unit:     ' epochs',
-          ),
+
+
+
           _buildGovParamItem(
             paramKey: 'academy_article_bond',
             icon:     Icons.school_rounded,

@@ -3509,19 +3509,6 @@ class RelayConnector {
     );
   }
 
-  // ── S12 Monetary Issuance SDK method ─────────────────────────────────────
-
-  /// Claim one or more pending UBI epoch allocations.
-  /// [epochIds] — list of epoch ID strings received from ISSUANCE_AVAILABLE.
-  /// Returns { success, amount_seeds, citizen_id } on success.
-  static Future<Map<String, dynamic>?> claimIssuance(List<String> epochIds) async {
-    return sendAndWait(
-      request: {'type': 'ISSUANCE_CLAIM', 'epoch_ids': epochIds},
-      responseType: 'ISSUANCE_CLAIM_RESULT',
-      timeout: const Duration(seconds: 15),
-    );
-  }
-
   /// Transfer SOV from one sovereign to another.
   /// [amountSeeds] — integer Seeds (1 SOV = 1,000,000 Seeds).
   /// [nonce]       — monotonically increasing counter for replay protection.

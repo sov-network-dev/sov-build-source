@@ -59,9 +59,8 @@ const PARAM_MAP = {
   // Financial
   tx_fee_rate:                   { key: 'tx_fee_rate',                  min: 0,     max: 0.05  },
   tx_fee_max_sov:                { key: 'tx_fee_max_sov',               min: 0,     max: 100000 },   // per-transfer fee ceiling in SOV (0 = uncapped)
-  sov_issuance_rate:             { key: 'sov_issuance_rate',            min: 0,     max: 1000000},
-  issuance_epoch_hours:          { key: 'issuance_epoch_hours',         min: 1,     max: 168   },
-  issuance_max_backlog_epochs:   { key: 'issuance_max_backlog_epochs',  min: 1,     max: 365   },
+  // sov_issuance_rate / issuance_epoch_hours / issuance_max_backlog_epochs: RETIRED 1.4.89 - the
+  // issuance mint could exceed the 50M cap (financial_engine.js). Not votable; rows stay, inert.
   // Exchange
   exchange_network_fee:          { key: 'exchange_network_fee',         min: 0,     max: 0.05  },
   exchange_max_order_sov:        { key: 'exchange_max_order_sov',       min: 1,     max: 10000000},
@@ -162,9 +161,6 @@ const PARAM_DEFAULTS = [
   ['sov_login',                     '0'],
   ['tx_fee_rate',                   '0.001'],   // 0.1% (king 2026-07-19)
   ['tx_fee_max_sov',                '1'],       // hard cap 1 SOV per transfer
-  ['sov_issuance_rate',             '0'],
-  ['issuance_epoch_hours',          '24'],
-  ['issuance_max_backlog_epochs',   '7'],
   ['exchange_network_fee',          '0.01'],
   ['exchange_max_order_sov',        '10000'],
   ['relay_join_min_stake',          '0'],   // king's design: no join stake (param kept but unused)

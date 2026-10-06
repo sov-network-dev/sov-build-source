@@ -15,10 +15,8 @@
 //      Two claim paths: immediate (claim key) or time-delayed (30-day wait).
 //      Network reclamation after 15 years of inactivity.
 //
-//   3. Monetary Issuance (Universal Basic Income)
-//      When governance activates sov_issuance_rate > 0, every enrolled citizen
-//      can claim N SOV seeds per epoch. Pull-based: citizen triggers claim.
-//      Cross-node dedup via sov_issuance_log (INSERT OR IGNORE pattern).
+//   3. Monetary Issuance — RETIRED 1.4.89. It credited balances with no pool debit, so a vote
+//      could have minted past the 50M cap. Claims are refused with ISSUANCE_RETIRED.
 //
 //   4. Guardian Recovery
 //      Citizens nominate trusted contacts as guardians. On device loss,
@@ -33,11 +31,6 @@ const crypto = require('crypto');
 // Maximum optimistic concurrency retries for balance operations
 const MAX_RETRIES = 3;
 
-// Issuance epoch precision: one epoch = issuance_epoch_hours of wall time
-function _epochId(epochHours) {
-  const ms = epochHours * 60 * 60 * 1000;
-  return String(Math.floor(Date.now() / ms));
-}
 
 class FinancialEngine {
 
@@ -161,9 +154,6 @@ class FinancialEngine {
 
     // Seed governance defaults for financial params
     const govDefaults = [
-      ['sov_issuance_rate',            '0'],
-      ['issuance_epoch_hours',         '24'],
-      ['issuance_max_backlog_epochs',  '7'],
       ['guardian_approval_threshold',  '2'],
       ['guardian_max_count',           '5'],
       ['guardian_recovery_window_hours','72'],
@@ -577,140 +567,22 @@ class FinancialEngine {
   //  SUBSYSTEM 3 — MONETARY ISSUANCE (UBI)
   // ═══════════════════════════════════════════════════════════════════════════
 
-  // Called when a citizen HELLOs — check if they have unclaimed epochs
-  checkIssuanceOnHello(sovereignId, ws) {
-    const issuanceRate = parseInt(this._db.getGovParam('sov_issuance_rate', '0'));
-    if (issuanceRate <= 0) return;  // Issuance not active
-
-    const epochHours  = parseInt(this._db.getGovParam('issuance_epoch_hours', '24'));
-    const maxBacklog  = parseInt(this._db.getGovParam('issuance_max_backlog_epochs', '7'));
-
-    const currentEpochId = _epochId(epochHours);
-    const currentEpoch   = parseInt(currentEpochId);
-
-    // Find unclaimed epochs (up to maxBacklog)
-    const unclaimedEpochs = [];
-    for (let i = 0; i < maxBacklog; i++) {
-      const epochId = String(currentEpoch - i);
-      const claimed = this._db._db.prepare(
-        'SELECT 1 FROM sov_issuance_log WHERE epoch_id = ? AND citizen_id = ?'
-      ).get(epochId, sovereignId);
-      if (!claimed) unclaimedEpochs.push(epochId);
-    }
-
-    if (unclaimedEpochs.length > 0) {
-      const totalSeeds = unclaimedEpochs.length * issuanceRate;
-      if (ws && ws.readyState === 1) {
-        ws.send(JSON.stringify({
-          op:           'IA',  // ISSUANCE_AVAILABLE
-          epoch_ids:    unclaimedEpochs,
-          amount_seeds: totalSeeds,
-          ts:           Date.now(),
-        }));
-      }
-    }
+  // RETIRED 1.4.89 (king, 2026-10-06). Issuance credited every claimant's balance with NOTHING
+  // debited from any pool: a citizen vote raising sov_issuance_rate above 0 would have MINTED new
+  // SOV past the fixed 50,000,000 (audit 2026-08-05, M6). The cap is the promise, so the mint is
+  // gone rather than gated - the same treatment as the referral and pioneer payouts in 1.4.72.
+  // The three issuance params are no longer seeded or votable; existing rows stay, inert.
+  // ISSUANCE_CLAIM ('IC') stays registered so an older app gets a clear refusal, not silence.
+  checkIssuanceOnHello(_sovereignId, _ws) {
+    // Nothing is ever available: never push ISSUANCE_AVAILABLE.
   }
 
-  handleIssuanceClaim(ws, msg) {
-    const { epoch_ids } = msg;
-    const citizen_id   = ws._sovereignId;
-
-    if (!Array.isArray(epoch_ids) || epoch_ids.length === 0) {
-      this._send(ws, 'ICR', { success: false, error: 'MISSING_EPOCH_IDS' });
-      return;
-    }
-
-    const issuanceRate = parseInt(this._db.getGovParam('sov_issuance_rate', '0'));
-    if (issuanceRate <= 0) {
-      this._send(ws, 'ICR', { success: false, error: 'ISSUANCE_NOT_ACTIVE' });
-      return;
-    }
-
-    const maxBacklog = parseInt(this._db.getGovParam('issuance_max_backlog_epochs', '7'));
-    const epochHours = parseInt(this._db.getGovParam('issuance_epoch_hours', '24'));
-    const now        = Date.now();
-    const currentEpoch = parseInt(_epochId(epochHours));
-
-    let totalCredited = 0;
-    const credited_epochs = [];
-
-    for (const epochId of epoch_ids.slice(0, maxBacklog)) {
-      const epochNum = parseInt(epochId);
-      // Reject future epochs and epochs beyond backlog
-      if (epochNum > currentEpoch) continue;
-      if (currentEpoch - epochNum >= maxBacklog) continue;
-
-      try {
-        this._db._db.prepare(`
-          INSERT OR IGNORE INTO sov_issuance_log
-            (epoch_id, citizen_id, amount_seeds, issued_at)
-          VALUES (?, ?, ?, ?)
-        `).run(epochId, citizen_id, issuanceRate, now);
-
-        if (this._db._db.prepare('SELECT changes() as c').get().c === 1) {
-          // Actually inserted (not duplicate)
-          totalCredited += issuanceRate;
-          credited_epochs.push(epochId);
-        }
-      } catch (_) {}
-    }
-
-    if (totalCredited > 0) {
-      // Credit balance with optimistic concurrency
-      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        const current = this._db.readDisc(citizen_id);
-        if (!current) break;
-        const ok = this._db.writeDiscGuarded(
-          citizen_id,
-          current.balance_seeds   + totalCredited,
-          current.spendable_seeds + totalCredited,
-          current.version
-        );
-        if (ok) break;
-      }
-
-      // Send live balance update
-      if (this._gateway) {
-        this._gateway.push(citizen_id, 'SV', {  // SOV_TRANSFER_RECEIVED
-          from_id:      'SOV-NETWORK',
-          amount_seeds: totalCredited,
-          memo:         `SOV issuance — ${credited_epochs.length} epoch(s)`,
-          ts:           now,
-        });
-      }
-
-      // Broadcast to peers for dedup
-      this._peerMesh.broadcast('ISSUANCE_LOG_BROADCAST', {
-        citizen_id,
-        epoch_ids:    credited_epochs,
-        amount_seeds: issuanceRate,
-        origin_node:  this._identity.nodeId,
-      });
-    }
-
-    this._send(ws, 'ICR', {
-      success:          true,
-      credited_seeds:   totalCredited,
-      credited_epochs,
-      ts:               now,
-    });
+  handleIssuanceClaim(ws, _msg) {
+    this._send(ws, 'ICR', { success: false, error: 'ISSUANCE_RETIRED' });
   }
 
-  _handleIssuanceLogBroadcast(msg) {
-    const { citizen_id, epoch_ids, amount_seeds, origin_node } = msg;
-    if (!citizen_id || !Array.isArray(epoch_ids)) return;
-    if (origin_node === this._identity.nodeId) return;
-
-    const now = Date.now();
-    for (const epochId of epoch_ids) {
-      try {
-        this._db._db.prepare(`
-          INSERT OR IGNORE INTO sov_issuance_log
-            (epoch_id, citizen_id, amount_seeds, issued_at)
-          VALUES (?, ?, ?, ?)
-        `).run(epochId, citizen_id, amount_seeds || 0, now);
-      } catch (_) {}
-    }
+  _handleIssuanceLogBroadcast(_msg) {
+    // No node issues anything any more, so there is nothing to record.
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
