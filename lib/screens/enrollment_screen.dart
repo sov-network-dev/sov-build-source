@@ -1418,9 +1418,9 @@ class _EnrollmentScreenState extends State<EnrollmentScreen>
   static const _slides = [
     _Slide(
       icon: Icons.fingerprint,
-      title: 'Your Palm Is Your Key',
-      body: 'Your palm\'s unique crease pattern is your unbreakable '
-            'digital identity. No passwords. No usernames. Just you.',
+      title: 'One Palm, One Citizen',
+      body: 'Your palm proves you are one unique person, so nobody can open a '
+            'second account. Your 12 recovery words hold your key: keep them safe.',
     ),
     _Slide(
       icon: Icons.account_balance_wallet_outlined,

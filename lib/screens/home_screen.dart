@@ -222,8 +222,9 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver {
         // SOV still escrowed until delivery confirmed. 'disputed' = justice
         // pending. All three keep SOV locked.
         if (status == 'open' || status == 'filled' || status == 'disputed') {
-          final sovAmt = (order['sov_amount'] as num?)?.toDouble() ?? 0.0;
-          exch += (sovAmt * 1000000).round();
+          // sov_amount is already in SEEDS (exchange_engine.js: "seeds being sold"), as the
+          // exchange screen reads it. Multiplying again showed 50 SOV as 50,000,000 (audit D22).
+          exch += (order['sov_amount'] as num?)?.round() ?? 0;
         }
       }
       if (mounted) setState(() => _exchangeEscrowSeeds = exch);
@@ -237,7 +238,7 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver {
           await RelayConnector.pioneerGetStatus(widget.sovereignId);
       if (resp['success'] == true && mounted) {
         final m =
-            (resp['certifications'] as Map?)?.cast<String, dynamic>() ?? {};
+            ((resp['certs'] ?? resp['certifications']) as Map?)?.cast<String, dynamic>() ?? {};
         setState(() {
           _certs = {
             'RE': m['relay_engineer']      == true,

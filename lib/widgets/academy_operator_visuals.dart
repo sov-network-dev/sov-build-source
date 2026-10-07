@@ -217,13 +217,13 @@ class _ProvidersDiagram extends StatelessWidget {
   Widget build(BuildContext context) {
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       _provider(Icons.verified_rounded, 'Oracle Cloud — Always Free',
-          'Free forever · recommended', 'No 12-month expiry. Pick shape VM.Standard.E2.1.Micro (AMD).', _green),
+          'Free tier · recommended', 'Advertised with no expiry at the time of writing. Pick shape VM.Standard.E2.1.Micro (AMD).', _green),
       _provider(Icons.cloud_rounded, 'Google Cloud — e2-micro',
           'Always-free tier · x86_64', 'Free in us-west1/central1/east1. Watch billing alerts.', _blue),
       _provider(Icons.shopping_cart_rounded, 'Amazon AWS — t3.micro',
-          'Free 12 months only', 'Fine to learn on; becomes paid after a year. Not ideal for a permanent node.', _gold),
+          'Time-limited free offer', 'Fine to learn on; becomes paid later (check current terms). Not ideal for a permanent node.', _gold),
       _provider(Icons.desktop_windows_rounded, 'Your Windows PC — at home',
-          'Free · no VPS · easiest', 'Install the SOV app, toggle Run-a-Node. See the Windows guide.', _green),
+          'Free · no VPS · easiest', 'Install the SOV app, turn on the Full Node switch. See the Windows guide.', _green),
       _note(Icons.memory_rounded,
           'Pick an x86_64 (Intel/AMD) shape — NOT ARM (Oracle Ampere / AWS Graviton). The node ships an x86_64 runtime and will not start on ARM.',
           _red),
@@ -321,7 +321,7 @@ class _AwsDiagram extends StatelessWidget {
       _step(4, 'Add rule → Custom TCP → Port 443 → Source Anywhere-IPv4 (0.0.0.0/0). Repeat for 7771 and 80.'),
       _step(5, 'Keep the SSH (22) rule; tighten its source to My IP. Save rules.'),
       _note(Icons.schedule_rounded,
-          'AWS free tier is only 12 months — great to learn on, but for a permanent node prefer Oracle Always Free (no expiry).',
+          'The AWS free offer is time-limited — great to learn on, but for a permanent node prefer Oracle Always Free (check current terms).',
           _gold),
     ]);
   }
@@ -333,7 +333,7 @@ class _OracleDiagram extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      _note(Icons.star_rounded, 'Recommended host: free forever, no 12-month expiry.', _green),
+      _note(Icons.star_rounded, 'Recommended host: Always Free tier, advertised with no expiry (check current terms).', _green),
       _head('Create the instance'),
       _step(1, 'Compute → Instances → Create. Image: Canonical Ubuntu 22.04.'),
       _step(2, 'Change shape → Specialty and previous generation → VM.Standard.E2.1.Micro (AMD, Always Free). Do NOT pick Ampere A1 — that is ARM.', accent: _red),
@@ -395,12 +395,12 @@ class _WindowsDiagram extends StatelessWidget {
       const SizedBox(height: 10),
       _head('Path A — normal home broadband'),
       _step(1, 'Install the SOV app (SovNode.exe) and sign in / restore your wallet.'),
-      _step(2, 'Open the Node tab → the "Run a Node" card. Leave Reachability = Auto.'),
-      _step(3, 'Toggle Run a Node → ON. It opens your router by UPnP, or relays through the mesh if it can\'t. When live it shows "Reachable at: …".'),
+      _step(2, 'Settings → Run a SOV Node (or tap the network chip on Home). Leave "How citizens reach this node" on Automatic.'),
+      _step(3, 'Switch the Full Node card ON. It opens your router by UPnP, or relays through the mesh if it can\'t. When live the status reads "Serving citizens".'),
       _note(Icons.bolt_rounded, 'That is the whole setup for most people. Keep the PC on — uptime is what earns.', _green),
       _head('Path B — hotspot / CGNAT / can\'t port-forward'),
       _step(1, 'Make a free Tailscale account (login.tailscale.com/start) and install Tailscale for Windows; log in once.', accent: _blue),
-      _step(2, 'In the SOV app: Node tab → set Reachability = Tailscale Funnel → toggle ON.', accent: _blue),
+      _step(2, 'In the SOV app: Settings → Run a SOV Node → "How citizens reach this node" = Tailscale Funnel → switch Full Node ON.', accent: _blue),
       _step(3, 'First time only, tap "Enable Tailscale Funnel" and click Approve in the browser. The app then serves at wss://<your-pc>.ts.net.', accent: _blue),
       _note(Icons.public_rounded,
           'Funnel gives you a stable public HTTPS address for free, over an outbound-only connection — citizens reach you on 443 with no port-forward.',

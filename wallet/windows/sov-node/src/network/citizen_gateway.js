@@ -532,66 +532,24 @@ class CitizenGateway {
         // a conservation-neutral redistribution (one wallet up, another down) — closing
         // that fully needs signed disc state / transaction-replay reconciliation, which
         // is a larger design change tracked as the remaining C2 work.
-        const _MAX_CAP = 50000000000000; // MAX_TOTAL_SUPPLY_SEEDS (50M SOV × 1e6)
-        let _capRoom;
-        try { _capRoom = _MAX_CAP - db.currentTotalSupply(); } catch (_) { _capRoom = _MAX_CAP; }
+        // 1.4.90: STATE_DELTA NEVER WRITES A BALANCE OR A NONCE. Balances are a function of
+        // ledger ops (protocol/ledger.js) — baseline + every op, applied exactly once. Copying a
+        // peer's balance is what used to resurrect spent money, erase credits, and (if it also
+        // applied the ops behind that balance) count money twice. A missing account is created
+        // at ZERO; its balance arrives as ops. A difference triggers an op pull from that peer.
+        let differs = 0;
         for (const row of (msg.rows || [])) {
-          const local = db._db.prepare(
-            'SELECT balance_seeds, version, nonce, last_tx_hash FROM sov_disc WHERE sovereign_id = ?'
-          ).get(row.sovereign_id);
-          // H4: never RESET nonce/last_tx_hash to 0/'' just because a pre-H4 peer
-          // omitted them from the delta — that would itself open a replay window.
-          // Take the peer's value only when present; otherwise keep what we hold.
-          const _n   = (row.nonce != null)        ? Number(row.nonce)        : (local ? local.nonce : 0);
-          const _lth = (row.last_tx_hash != null) ? String(row.last_tx_hash) : (local ? (local.last_tx_hash || '') : '');
+          const local = db._db.prepare('SELECT balance_seeds, nonce FROM sov_disc WHERE sovereign_id = ?').get(row.sovereign_id);
           if (!local) {
-            // V39 fix: peer has a citizen we lack — INSERT it so a node behind on
-            // enrollments can reach Merkle parity. Previously skipped, so the disc
-            // anti-entropy only updated existing rows and never inserted missing
-            // ones → permanent Merkle mismatch for any node missing a citizen.
-            const _newBal = Number(row.balance_seeds) || 0;
-            if (_newBal > _capRoom) {  // C2 mitigation: would mint past the cap
-              global.sovLog.warn(`[Mesh] STATE_DELTA REFUSED (over-cap insert) ${row.sovereign_id} bal=${row.balance_seeds} room=${_capRoom}`);
-              continue;
-            }
-            try {
-              db.ensureDiscEntry(row.sovereign_id);
-              db._db.prepare('UPDATE sov_disc SET balance_seeds = ?, version = ?, nonce = ?, last_tx_hash = ? WHERE sovereign_id = ?')
-                .run(row.balance_seeds, row.version, _n, _lth, row.sovereign_id);
-              _capRoom -= _newBal;
-              applied++;
-              global.sovLog.info(`[Mesh] STATE_DELTA: inserted ${row.sovereign_id} v${row.version} bal=${row.balance_seeds}`);
-            } catch (e) { global.sovLog.warn(`[Mesh] STATE_DELTA insert error: ${e.message}`); }
-            continue;
+            try { db.ensureDiscEntry(row.sovereign_id); applied++; } catch (_) {}
+            differs++;
+          } else if (Number(row.balance_seeds) !== Number(local.balance_seeds) || Number(row.nonce || 0) !== Number(local.nonce || 0)) {
+            differs++;
           }
-          if (row.version > local.version) {
-            const _delta = (Number(row.balance_seeds) || 0) - (Number(local.balance_seeds) || 0);
-            if (_delta > 0 && _delta > _capRoom) {  // C2 mitigation: would mint past the cap
-              global.sovLog.warn(`[Mesh] STATE_DELTA REFUSED (over-cap raise) ${row.sovereign_id} delta=${_delta} room=${_capRoom}`);
-              continue;
-            }
-            db._db.prepare(
-              'UPDATE sov_disc SET balance_seeds = ?, spendable_seeds = ?, version = ?, nonce = ?, last_tx_hash = ? WHERE sovereign_id = ? AND version < ?'
-            ).run(row.balance_seeds, row.balance_seeds, row.version, _n, _lth, row.sovereign_id, row.version);
-            if (_delta > 0) _capRoom -= _delta;
-            applied++;
-            global.sovLog.info(`[Mesh] STATE_DELTA: applied ${row.sovereign_id} v${local.version}->${row.version} bal=${row.balance_seeds}`);
-          } else if (row.version === local.version && row.balance_seeds !== local.balance_seeds) {
-            // Same-version balance fork — only ever produced by the legacy
-            // transfer-fee bug (normal ops always bump version). Higher-version-wins
-            // cannot heal it. Deterministic, NON-INFLATIONARY tie-break: the LOWER
-            // balance wins (= the fee-deducted, correct value). Each node only
-            // reduces toward the minimum, so the mesh converges to a single root and
-            // total supply can never increase. Verified-peer trust model (same as the
-            // higher-version-wins update path above).
-            if (row.balance_seeds < local.balance_seeds) {
-              db._db.prepare(
-                'UPDATE sov_disc SET balance_seeds = ?, spendable_seeds = ? WHERE sovereign_id = ? AND version = ?'
-              ).run(row.balance_seeds, row.balance_seeds, row.sovereign_id, row.version);
-              applied++;
-              global.sovLog.info(`[Mesh] FORK-HEAL ${row.sovereign_id} v${row.version} ${local.balance_seeds}->${row.balance_seeds} (min-wins) src=${(msg.node_id||'').slice(0,12)}`);
-            }
-          }
+        }
+        if (differs > 0 && db.ledger && msg.node_id) {
+          try { db.ledger._sendDigest(msg.node_id); } catch (_) {}
+          global.sovLog.info(`[Mesh] STATE_DELTA: ${differs} account(s) differ from ${(msg.node_id || '').slice(0, 12)} — pulling ledger ops (balances are never copied)`);
         }
         if (applied > 0) {
           global.sovLog.info(`[Mesh] STATE_DELTA_RESPONSE from ${(msg.node_id||'').slice(0,16)}...: ${applied} rows updated`);
@@ -1034,6 +992,11 @@ class CitizenGateway {
       MSG_TYPE.VAULT_LOCK, MSG_TYPE.VAULT_CLAIM_INIT,
       MSG_TYPE.ALLOCATION_CREATE, MSG_TYPE.ALLOCATION_CANCEL,
       MSG_TYPE.ALLOCATION_CLAIM_STAGE1, MSG_TYPE.ALLOCATION_CLAIM_STAGE2,
+      // 1.4.90: these move money too (a council vote releases a donor's funds; a juror vote can
+      // settle a verdict; opening a dispute and publishing/upvoting take a bond) — a signed
+      // session is required, as for every other money operation.
+      MSG_TYPE.ALLOCATION_COUNCIL_VOTE, MSG_TYPE.DISPUTE_OPEN, MSG_TYPE.JUSTICE_VOTE,
+      MSG_TYPE.ACADEMY_PUBLISH, MSG_TYPE.ACADEMY_UPVOTE,
     ]);
     if (_MONEY_OPS.has(msg.op) && (ws._legacyMode || !ws._verified || !ws._sovereignId)) {
       return this._send(ws, MSG_TYPE.ERROR, {
@@ -1539,7 +1502,7 @@ class CitizenGateway {
   // destroyed. The relay
   // delegates to the SAME shared core the HTTP endpoint uses (relayPool
   // .platformRegister), so logic never drifts between the two paths.
-  _handlePlatformRegister(ws, msg) {
+  async _handlePlatformRegister(ws, msg) {
     const sovereignId = ws._sovereignId || msg.registering_sovereign_id;
     if (!sovereignId || !ws._verified) {
       return this._send(ws, MSG_TYPE.PLATFORM_REGISTER_RESULT, { success: false, error: 'AUTH_REQUIRED' });
@@ -1554,7 +1517,7 @@ class CitizenGateway {
     }
     try {
       const input = { ...msg, registering_sovereign_id: sovereignId };
-      const reg = this._relayPool.platformRegister(input);
+      const reg = await this._relayPool.platformRegister(input);
       const body = reg && reg.body ? { ...reg.body } : { success: false, error: 'INTERNAL_ERROR' };
       // Wallet path: surface the PLAINTEXT callback_secret over this WSS-TLS
       // channel so the owner can paste it into their site without nacl-box

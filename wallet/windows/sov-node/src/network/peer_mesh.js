@@ -162,6 +162,7 @@ class PeerMesh {
   // anything an unverified peer sends — so an immediate catch-up message is silently lost
   // (measured on the test mesh, 2026-10-03). A handshake completes well within this delay.
   _firePeerAdmitted(nodeId) {
+    try { if (this._db && this._db.recordValidatorSeen) this._db.recordValidatorSeen(nodeId); } catch (_) {}
     const cbs = this._admittedCbs || [];
     if (!cbs.length) return;
     const t = setTimeout(() => { for (const cb of cbs) { try { cb(nodeId); } catch (_) {} } }, 5000);
@@ -201,6 +202,27 @@ class PeerMesh {
       node_id:   this._identity.nodeId,
       timestamp: Date.now(),
     });
+  }
+
+  // Ledger safety (1.4.90): how many nodes a spend majority is counted against. It must NOT
+  // shrink when a partition hides peers — otherwise each side of a split would think it is the
+  // majority and both would commit (the double-spend). So it counts every node verified within
+  // VALIDATOR_WINDOW_MS, plus this node, and never less than this node + its live peers.
+  validatorSetSize() {
+    const VALIDATOR_WINDOW_MS = 14 * 24 * 3600 * 1000;
+    const now = Date.now();
+    // Counted from sov_validator_seen, written ONLY when a peer passes admission — the
+    // registry's last_verified is a discovery grace window and would count gossiped nodes.
+    let recent = 0;
+    try { recent = this._db ? this._db.validatorsSeenSince(now - VALIDATOR_WINDOW_MS, this._identity.nodeId) : 0; } catch (_) {}
+    return Math.max(1 + recent, 1 + this.activePeers().length);
+  }
+
+  // True once this node has ever verified a peer. A node that HAS had peers but sees none now
+  // must not commit money alone (a home node back after weeks offline); only a network that has
+  // never had a second node may.
+  everHadVerifiedPeer() {
+    try { return !!(this._db && this._db.validatorsSeenSince(0, this._identity.nodeId) > 0); } catch (_) { return false; }
   }
 
   activePeers() {
@@ -970,6 +992,12 @@ class PeerMesh {
           if (ourCRoot && ourCRoot !== msg.consensus_root) xDiff = true;
         }
       } catch (_) {}
+      try {
+        if (this._db && this._db.computeEnrollmentRoot && msg.enrollment_root) {
+          const ourERoot = this._db.computeEnrollmentRoot();
+          if (ourERoot && ourERoot !== msg.enrollment_root) xDiff = true;
+        }
+      } catch (_) {}
       if (balDiff || xDiff) {
         global.sovLog.info(`State mismatch with ${msg.node_id.slice(0, 16)}... (bal=${balDiff} exch=${xDiff}) — requesting state delta`);
         // Phase 2: a light node does not hold the biometric set, so it asks for the delta
@@ -1096,6 +1124,12 @@ class PeerMesh {
       try { if (this._db && this._db.computeExchangeRoot) exchangeRoot = this._db.computeExchangeRoot(); } catch (_) {}
       let consensusRoot = '';
       try { if (this._db && this._db.computeConsensusRoot) consensusRoot = this._db.computeConsensusRoot(); } catch (_) {}
+      // 1.4.90: enrolment records get their own fingerprint. They reach a late joiner only with a
+      // state delta, which used to be triggered by the BALANCE root differing — but balances now
+      // replicate exactly as ledger ops, so that root agrees and a joiner never learned who is
+      // enrolled (caught by tools/test_mesh/scenario_admission.sh, OPERATOR_NOT_ENROLLED).
+      let enrollmentRoot = '';
+      try { if (this._db && this._db.computeEnrollmentRoot) enrollmentRoot = this._db.computeEnrollmentRoot(); } catch (_) {}
       let capability = null;
       try { if (this._db && this._db.computeCapability) capability = this._db.computeCapability(); } catch (_) {}
       // Operator awareness: log storage tier every ~10 min (once per 10 heartbeats).
@@ -1110,6 +1144,7 @@ class PeerMesh {
         merkle_root:   merkleRoot,
         exchange_root: exchangeRoot,
         consensus_root: consensusRoot,
+        enrollment_root: enrollmentRoot,
         capability,
         citizen_count: this._db ? this._db.citizenCount() : 0,
         uptime_sec:    Math.floor(process.uptime()),

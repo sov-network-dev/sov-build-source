@@ -314,8 +314,9 @@ class EnrollmentEngine {
     // the two paths would pay different amounts for the same citizen the moment the
     // param was set below the tier. deductFromPool returns what the pool could back,
     // so a depleted pool reduces the grant (or zeroes it) instead of minting.
-    const _actualCitizenReward = this._db.deductFromPool('citizen_enrollment', enrollmentRewardSeeds);
-    enrollmentRewardSeeds = _actualCitizenReward;
+    // 1.4.90: the grant is paid below as ONE ledger op (pool -> citizen), so here we only decide
+    // the amount the pool can back. A depleted pool reduces (or zeroes) the grant; nothing mints.
+    enrollmentRewardSeeds = this._grantAffordable(enrollmentRewardSeeds);
     const referralRewardSeeds = parseInt(
       this._db.getGovParam('referral_reward_seeds') || String(DEFAULT_REFERRAL_REWARD_SEEDS)
     );
@@ -360,8 +361,9 @@ class EnrollmentEngine {
       enrolledAt,
       referrerId:            referrer_id,
       palmName:              palm_name,
-      enrollmentRewardSeeds,
+      enrollmentRewardSeeds: 0,              // 1.4.90: the grant is a ledger op, below
     });
+    enrollmentRewardSeeds = this._payEnrolmentGrant(sovereignId, enrollmentRewardSeeds);
 
     // ── 6b. [FAIR-LAUNCH REFACTOR 2026-05-27] PATH A founder-bonus credit REMOVED ──
     //
@@ -626,6 +628,29 @@ class EnrollmentEngine {
 
   // ── Peer mesh handlers ─────────────────────────────────────────────────────
 
+  // How much of a grant the enrolment pool can actually back right now.
+  _grantAffordable(seeds) {
+    const pool = this._db.getPool ? this._db.getPool('citizen_enrollment') : null;
+    const left = pool ? (pool.remaining_seeds || 0) : 0;
+    return Math.max(0, Math.min(seeds | 0, left));
+  }
+
+  // Pay the enrolment grant as ONE ledger op: pool -> citizen, exactly once per citizen
+  // (deterministic op id), replicated to every node. Returns what was actually paid.
+  _payEnrolmentGrant(sovereignId, seeds) {
+    if (!(seeds > 0) || !this._db.ledger) return 0;
+    const r = this._db.ledger.commitSystemOp({
+      op_id: `enroll-grant:${sovereignId}`, kind: 'enroll_grant', ref: sovereignId,
+      moves: [{ acct: sovereignId, d: seeds }],
+      pools: [{ pool: 'citizen_enrollment', d: -seeds }],
+    });
+    if (!r.ok) {
+      global.sovLog.error(`[ENROLL] grant for ${sovereignId} not paid: ${r.error}`);
+      return 0;
+    }
+    return seeds;
+  }
+
   // Receive a new citizen enrollment from another node
   _handleEnrollmentBroadcast(msg) {
     const {
@@ -671,7 +696,8 @@ class EnrollmentEngine {
       // [PI-13] REMOVED — deductFromPool now auto-propagates as a POOL_DELTA,
       // so the origin node's deduct already reaches every peer. Keeping this
       // manual mirror would make peers deduct the enrollment reward TWICE.
-      this._db.creditBalance(sovereign_id, rewardSeeds);
+      // 1.4.90: and the CREDIT is no longer done here either — the grant is a ledger op
+      // (op id enroll-grant:<id>) that every node applies exactly once, with its pool side.
     }
 
     // FACE-LOCK: replicate the protected face template verbatim (already
@@ -979,7 +1005,7 @@ class EnrollmentEngine {
     if (_tierSeeds < enrollmentRewardSeeds) enrollmentRewardSeeds = _tierSeeds;
     // deductFromPool returns the amount actually available (≤ requested) — the wallet
     // is credited only what the pool could back, so supply is always conserved.
-    enrollmentRewardSeeds = this._db.deductFromPool('citizen_enrollment', enrollmentRewardSeeds);
+    enrollmentRewardSeeds = this._grantAffordable(enrollmentRewardSeeds);
 
     const enrolledAt = Date.now();
     this._db.enrollNewCitizen({
@@ -989,8 +1015,9 @@ class EnrollmentEngine {
       enrolledAt,
       referrerId:            referrerId,
       palmName:              palmName,
-      enrollmentRewardSeeds,
+      enrollmentRewardSeeds: 0,              // 1.4.90: the grant is a ledger op, below
     });
+    enrollmentRewardSeeds = this._payEnrolmentGrant(sovereignId, enrollmentRewardSeeds);
 
     // Referral reward
     const referralRewardSeeds = parseInt(

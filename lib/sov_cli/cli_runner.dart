@@ -39,6 +39,7 @@ import '../sov_node_sdk/message_key_manager.dart';
 import '../sov_node_sdk/secure_channels.dart' show SecureChannels;
 import '../sov_node_sdk/transaction_store.dart';
 import '../sov_node_sdk/node_discovery.dart';
+import '../sov_node_sdk/pin_manager.dart';
 import '../sov_node_sdk/relay_connector.dart' show RelayConnector;
 
 // 1 SOV == 1 000 000 seeds (integer micro-unit on the wire)
@@ -1450,6 +1451,11 @@ foreach ($id in $pids) {
     final pin = pinArg ?? _promptPin();
     if (pin == null || pin.isEmpty) return false;
 
+    // The app stores PinManager.hashPin (salted, device-bound) at enrolment, PIN setup
+    // and restore; only the old settings screen stored plain sha256(pin). Accept both,
+    // or the CLI refuses every wallet set up through the app (audit D24, 2026-10-08).
+    final sovId = prefs.getString('sovereign_id') ?? '';
+    if (await PinManager.verifyPin(pin, storedHash, sovId)) return true;
     final entered = sha256.convert(utf8.encode(pin)).toString();
     return entered == storedHash;
   }
@@ -1574,7 +1580,20 @@ COMMANDS
   msg --list   [--with <id>]          Fetch new messages, then list conversations or messages
                                         [--limit <n>] [--wait <s>, default 8] [--offline: no fetch]
   msg --listen [--seconds <n>]        Stay online and print messages as they arrive
-  node                                Relay reachability probe
+  node status|on|off                  This PC's full node: check it, start it, stop it
+                                        (off is Windows only)
+  exchange orders|mine                Open orders / your own orders and fills
+  exchange create --amount <n> --memo "<terms>"   List SOV (held in escrow)
+  exchange chat|chat-send|threads     Private trade chat  [--order <id> --to <id>]
+  exchange fill|confirm|cancel --order <id>   Fill an order / confirm payment / cancel
+  automation status                   Show the spending limits the NETWORK enforces
+  automation set --per-tx <n> --daily <n> [--allow id1,id2]
+                                        Tightening applies at once; loosening waits
+                                        48 h and can be cancelled meanwhile
+  automation allow|deny <id>          Add/remove a permitted recipient (turns limits on)
+  automation off|cancel               Remove limits (delayed) / cancel a pending loosening
+  spendlock status|enable|disable     Encrypt the signing key with your PIN (Argon2id)
+  hwlock status|enable|disable        Seal the signing key in this PC's TPM [--hello]
 
 GLOBAL FLAGS
   --pin <code>      Supply PIN non-interactively (required if wallet PIN is on)

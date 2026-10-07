@@ -1554,10 +1554,21 @@ class OperatorEngine {
         ).run(e.opId, periodId, e.relays, amount, Date.now());
         if (result.changes !== 1) continue;   // a peer beat us to it
 
-        const actualDeducted = this._db.deductFromPool ? this._db.deductFromPool('witness_operator', amount) : 0;
-        if (actualDeducted <= 0) continue;
-
-        this._db.creditBalance(e.opId, actualDeducted);
+        // 1.4.90: pool -> operator as ONE ledger op, exactly once per (operator, period),
+        // replicated to every node. If it cannot commit, the payout row is removed so the
+        // next run can retry — a recorded payout always means a paid one.
+        const pool = this._db.getPool ? this._db.getPool('witness_operator') : null;
+        const actualDeducted = Math.min(amount, pool ? (pool.remaining_seeds || 0) : 0);
+        const paid = actualDeducted > 0 && this._db.ledger && this._db.ledger.commitSystemOp({
+          op_id: `payout:${e.opId}:${periodId}`, kind: 'operator_payout', ref: `${e.opId}:${periodId}`,
+          moves: [{ acct: e.opId, d: actualDeducted }],
+          pools: [{ pool: 'witness_operator', d: -actualDeducted }],
+        });
+        if (!paid || !paid.ok) {
+          this._db._db.prepare('DELETE FROM sov_operator_payouts WHERE operator_id = ? AND period_id = ?').run(e.opId, periodId);
+          global.sovLog.error(`      [PAYOUT] ${e.opId.substring(0, 16)} period ${periodId} NOT paid: ${paid ? paid.error : 'pool empty'}`);
+          continue;
+        }
         totalPaid += actualDeducted;
         paidCount++;
         // TRANSPARENCY (king directive 2026-07-19): every fund movement must
@@ -1678,8 +1689,10 @@ class OperatorEngine {
 
   _refusePayout(msg, code) {
     global.sovLog.warn(
-      `      [PAYOUT] REFUSED broadcast ${code} — operator ${String(msg.operator_id).substring(0, 16)} ` +
-      `period ${msg.period_id} amount ${(Number(msg.amount_seeds) / 1e6).toFixed(2)} SOV`
+      `      [PAYOUT] DISAGREE ${code} — operator ${String(msg.operator_id).substring(0, 16)} ` +
+      `period ${msg.period_id} amount ${(Number(msg.amount_seeds) / 1e6).toFixed(2)} SOV. Since 1.4.90 the ` +
+      `credit itself arrives as a ledger op from the paying node and IS applied here (one ledger, not ` +
+      `per-node opinions); this line records that this node would not have paid it.`
     );
   }
 
@@ -1745,7 +1758,8 @@ class OperatorEngine {
       // pool_delta_sync.js's header names this exact hazard as a LOCKSTEP REQUIREMENT and it
       // was honoured for enrollment (enrollment_engine.js:636, "[PI-13] REMOVED") — the payout
       // path was simply missed. Enrollment's deltas are correct: one per enrolment.
-      this._db.creditBalance(msg.operator_id, amount);
+      // 1.4.90: no credit here. The payout is a ledger op (payout:<operator>:<period>) that every
+      // node applies exactly once with its pool side; this broadcast now only mirrors the record.
       // Mirror the payment-history record (same deterministic tx_id → the
       // operator sees the payout with its pool source on EVERY node).
       this._recordPayoutTx(msg.operator_id, periodId, msg.node_count || 1, amount);

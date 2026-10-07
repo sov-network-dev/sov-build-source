@@ -48,6 +48,13 @@ const log = winston.createLogger({
 
 global.sovLog = log;
 
+// 1.4.90: several money handlers are async (they wait for a spend majority). On Node 20 an
+// unhandled rejection kills the process — one bad request would take the node down. Log it
+// and keep serving: every ledger op is atomic, so a failure mid-request leaves nothing half-done.
+process.on('unhandledRejection', (reason) => {
+  log.error(`[NODE] unhandled rejection (request dropped, node continues): ${reason && reason.stack ? reason.stack : reason}`);
+});
+
 // ── Boot sequence ──────────────────────────────────────────────────────────
 async function boot() {
   fs.mkdirSync(path.join(DATA_DIR, 'logs'), { recursive: true });
@@ -278,6 +285,16 @@ global.sovLog.info(`      [VERSION] sov-relay v${process.env.SOV_RELAY_VERSION |
     global.sovLog.warn(`      Pool delta sync unavailable: ${e.message}`);
   }
 
+  // ── Ledger (1.4.90) — every balance change is a replicated op ──────────────
+  // docs/ledger/LEDGER_SAFETY_1.4.90_PLAN.md. Engines reach it as db.ledger (the
+  // relay pool only holds db). Owner debits take a majority-granted (account, nonce)
+  // slot; every op applies atomically and exactly once on every node.
+  const { Ledger } = require('./protocol/ledger');
+  const ledger = new Ledger(db, identity, peerMesh);
+  db.ledger = ledger;
+  ledger.start();
+  global.sovLog.info('      ✓ Ledger ops active (majority-granted spends, replicated ops)');
+
   // ── Fee history replication ───────────────────────────────────────────────
   // Balances already replicate; the RECORD OF HOW THEY GOT THERE did not, so a
   // citizen querying one node saw a correct balance beside an empty fee history
@@ -310,9 +327,7 @@ global.sovLog.info(`      [VERSION] sov-relay v${process.env.SOV_RELAY_VERSION |
   log.info('[7/9] Starting SOV transfer engine...');
   const { TransferEngine } = require('./protocol/transfer_engine');
   const transferEngine = new TransferEngine(identity, db, peerMesh, null);
-  log.info('      ✓ Guard 1 (nonce chain)    active');
-  log.info('      ✓ Guard 2 (spend lock)     active');
-  log.info('      ✓ Guard 3 (version gate)   active');
+  log.info('      ✓ Spends need a majority of nodes; every balance change is a replicated op');
 
   // ── Step 7b — Protocol engines ────────────────────────────────────────────
   const { EnrollmentEngine } = require('./protocol/enrollment_engine');

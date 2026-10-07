@@ -130,7 +130,7 @@ class SocialEngine {
   //  SUBSYSTEM 1 — SOV ACADEMY
   // ═══════════════════════════════════════════════════════════════════════════
 
-  handleAcademyPublish(ws, msg) {
+  async handleAcademyPublish(ws, msg) {
     const { article_id, title, body, category } = msg;
     const author_id = ws._sovereignId;
 
@@ -149,11 +149,19 @@ class SocialEngine {
       return;
     }
 
-    // Deduct article bond
-    const bondSeeds = parseInt(this._getGovParam('academy_article_bond', '5')) * 1_000_000;
-    if (bondSeeds > 0 && !this._deductBalance(author_id, bondSeeds)) {
-      this._send(ws, 'AD', { type: 'ACADEMY_PUBLISH_RESULT', success: false, error: 'INSUFFICIENT_BALANCE_FOR_BOND' });
+    if (this._db._db.prepare('SELECT 1 FROM sov_academy_articles WHERE article_id = ?').get(article_id)) {
+      this._send(ws, 'AD', { type: 'ACADEMY_PUBLISH_RESULT', success: false, error: 'ARTICLE_ID_EXISTS' });
       return;
+    }
+    // 1.4.90: the bond is an OWNER op (author -> bonds_held pool) on every node.
+    const bondSeeds = parseInt(this._getGovParam('academy_article_bond', '5')) * 1_000_000;
+    if (bondSeeds > 0) {
+      const r = await this._bond(author_id, bondSeeds, 'academy_article_bond', article_id);
+      if (!r.ok) {
+        this._send(ws, 'AD', { type: 'ACADEMY_PUBLISH_RESULT', success: false,
+          error: r.error === 'LEDGER_INSUFFICIENT' ? 'INSUFFICIENT_BALANCE_FOR_BOND' : r.error });
+        return;
+      }
     }
 
     const now = Date.now();
@@ -164,8 +172,7 @@ class SocialEngine {
         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
       `).run(article_id, author_id, title, body, category || 'general', now, now, bondSeeds);
     } catch (_) {
-      if (bondSeeds > 0) this._creditBalance(author_id, bondSeeds);
-      this._send(ws, 'AD', { type: 'ACADEMY_PUBLISH_RESULT', success: false, error: 'ARTICLE_ID_EXISTS' });
+      this._send(ws, 'AD', { type: 'ACADEMY_PUBLISH_RESULT', success: false, error: 'ARTICLE_INSERT_FAILED' });
       return;
     }
 
@@ -204,7 +211,7 @@ class SocialEngine {
     this._send(ws, 'AG', { type: 'ACADEMY_GET_RESULT', success: true, article });
   }
 
-  handleAcademyUpvote(ws, msg) {
+  async handleAcademyUpvote(ws, msg) {
     const { article_id } = msg;
     const voter_id = ws._sovereignId;
 
@@ -212,19 +219,25 @@ class SocialEngine {
 
     if (!article_id) return;
 
-    // Optional upvote bond
-    const bondSeeds = parseInt(this._getGovParam('academy_upvote_bond', '1')) * 1_000_000;
-    if (bondSeeds > 0 && !this._deductBalance(voter_id, bondSeeds)) {
-      this._send(ws, 'AU', { type: 'ACADEMY_UPVOTE_RESULT', success: false, error: 'INSUFFICIENT_BALANCE' });
+    if (this._db._db.prepare('SELECT 1 FROM sov_academy_upvotes WHERE article_id = ? AND voter_id = ?').get(article_id, voter_id)) {
+      this._send(ws, 'AU', { type: 'ACADEMY_UPVOTE_RESULT', success: false, error: 'ALREADY_UPVOTED' });
       return;
+    }
+    // 1.4.90: optional upvote bond, an OWNER op (voter -> bonds_held pool).
+    const bondSeeds = parseInt(this._getGovParam('academy_upvote_bond', '1')) * 1_000_000;
+    if (bondSeeds > 0) {
+      const r = await this._bond(voter_id, bondSeeds, 'academy_upvote_bond', `${article_id}:${voter_id}`);
+      if (!r.ok) {
+        this._send(ws, 'AU', { type: 'ACADEMY_UPVOTE_RESULT', success: false,
+          error: r.error === 'LEDGER_INSUFFICIENT' ? 'INSUFFICIENT_BALANCE' : r.error });
+        return;
+      }
     }
 
     const result = this._db._db.prepare(`
       INSERT OR IGNORE INTO sov_academy_upvotes (article_id, voter_id, voted_at) VALUES (?, ?, ?)
     `).run(article_id, voter_id, Date.now());
-
     if (result.changes === 0) {
-      if (bondSeeds > 0) this._creditBalance(voter_id, bondSeeds);
       this._send(ws, 'AU', { type: 'ACADEMY_UPVOTE_RESULT', success: false, error: 'ALREADY_UPVOTED' });
       return;
     }
@@ -561,51 +574,14 @@ class SocialEngine {
   //  HELPERS
   // ═══════════════════════════════════════════════════════════════════════════
 
-  _deductBalance(citizenId, amountSeeds) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const disc = this._db.readDisc(citizenId);
-      if (!disc || disc.spendable_seeds < amountSeeds) return false;
-      const result = this._db._db.prepare(`
-        UPDATE sov_disc
-        SET balance_seeds   = balance_seeds   - ?,
-            spendable_seeds = spendable_seeds - ?,
-            version   = version + 1,
-            updated_at = ?
-        WHERE sovereign_id = ? AND version = ? AND spendable_seeds >= ?
-      `).run(amountSeeds, amountSeeds, Date.now(), citizenId, disc.version, amountSeeds);
-      if (result.changes > 0) {
-        // The bond has to land somewhere nameable. Parked in the bonds_held
-        // pool it stays inside the 50M invariant and can be given back; left
-        // as a bare subtraction it simply left circulation for good.
-        try { this._db.addToPoolOrRecord('bonds_held', amountSeeds,
-              { source: 'academy_bond', ref: citizenId }); } catch (_) {}
-        return true;
-      }
-    }
-    return false;
-  }
-
-  _creditBalance(citizenId, amountSeeds) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const disc = this._db.readDisc(citizenId);
-      if (!disc) return false;
-      const result = this._db._db.prepare(`
-        UPDATE sov_disc
-        SET balance_seeds   = balance_seeds   + ?,
-            spendable_seeds = spendable_seeds + ?,
-            version   = version + 1,
-            updated_at = ?
-        WHERE sovereign_id = ? AND version = ?
-      `).run(amountSeeds, amountSeeds, Date.now(), citizenId, disc.version);
-      if (result.changes > 0) {
-        // Take it back out of the pool it was parked in. Drawn first and only
-        // the drawn amount is credited: crediting more than the pool holds
-        // would invent supply, which is worse than the bug this fixes.
-        try { this._db.drawFromPool('bonds_held', amountSeeds); } catch (_) {}
-        return true;
-      }
-    }
-    return false;
+  // 1.4.90: a bond is an OWNER op — citizen -> bonds_held pool, majority-granted on the citizen's
+  // slot and applied on every node (the pool side used to replicate, the wallet side did not).
+  _bond(citizenId, seeds, kind, ref) {
+    return this._db.ledger.commitOwnerOp({
+      kind, ref, owner: { acct: citizenId },
+      moves: [{ acct: citizenId, d: -seeds }],
+      pools: [{ pool: 'bonds_held', d: seeds }],
+    });
   }
 
   _getGovParam(key, fallback = '0') {

@@ -157,7 +157,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       // Shared with Home/Academy/Profile: one request, not one per screen.
       final resp = await RelayConnector.pioneerGetStatus(widget.sovereignId);
       if (resp['success'] == true && mounted) {
-        final certs = resp['certifications'] as Map? ?? {};
+        final certs = (resp['certs'] ?? resp['certifications']) as Map? ?? {};
         setState(() => _pioneerBadges = certs.length);
       }
     } catch (_) {}
@@ -668,7 +668,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     children: [
                       _lookupRow('Certified', result!['is_pioneer'] == true ? 'Yes' : 'No'),
                       _lookupRow('Rank',   result!['rank'] ?? '—'),
-                      ...(result!['certifications'] as Map? ?? {})
+                      ...((result!['certs'] ?? result!['certifications']) as Map? ?? {})
                           .entries
                           .map((e) => _lookupRow('Badge', '${e.key}  ✓')),
                     ],
@@ -884,7 +884,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _row(
             icon: Icons.dns_rounded,
             title: 'Run a SOV Node',
-            subtitle: 'Become a relay operator — earn proof-of-service rewards',
+            subtitle: 'Become a node operator — earn the operator reward for uptime',
             iconColor: _gold,
             onTap: () => Navigator.push(context,
                 MaterialPageRoute(builder: (_) => const NodeStatusScreen())),

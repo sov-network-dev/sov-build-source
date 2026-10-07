@@ -86,7 +86,7 @@ class _PlatformRegisterScreenState extends State<PlatformRegisterScreen> {
       setState(() => _error = 'Enter both your domain and the callback URL.');
       return;
     }
-    // Fee confirmation — the owner explicitly confirms the 10 SOV burn.
+    // Fee confirmation — the owner explicitly confirms the 10 SOV fee (moved to the operator pool, never burned).
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -94,8 +94,8 @@ class _PlatformRegisterScreenState extends State<PlatformRegisterScreen> {
         title: const Text('Confirm registration',
             style: TextStyle(color: _gold, fontWeight: FontWeight.bold)),
         content: Text(
-          'Registering "$domain" will deduct 10 SOV from your wallet (a one-time '
-          'network fee paid to the operator pool).\n\nOn confirm, the network builds '
+          'Registering "$domain" will deduct 10 SOV from your wallet (a yearly '
+          'network fee paid to the operator pool; renew every 365 days).\n\nOn confirm, the network builds '
           'your ready-to-install SDK and gives you a download — you just drop it into '
           'your website.',
           style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.4),
@@ -187,7 +187,7 @@ class _PlatformRegisterScreenState extends State<PlatformRegisterScreen> {
           ),
           child: const Text(
             'Let people sign in to your website with their SOV ID. Register your '
-            'domain here — it is signed by your wallet and costs a one-time fee '
+            'domain here — it is signed by your wallet and costs a yearly fee '
             'in SOV (paid to the network operator pool). No server setup or '
             'external IP is needed: registration happens entirely from your wallet.',
             style: TextStyle(color: Colors.white70, fontSize: 13, height: 1.45),

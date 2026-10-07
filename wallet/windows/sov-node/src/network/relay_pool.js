@@ -656,7 +656,7 @@ function _sealSecretToPubKey(plaintext, recipientX25519PubKeyHex) {
 //    unchanged, the money moves. Saying "burn" here invited someone to make
 //    it one. Returns { status, body }
 //    so the caller decides how to transmit (HTTP res or WSS _send).
-function _doPlatformRegister(db, identity, broadcast, input) {
+async function _doPlatformRegister(db, identity, broadcast, input) {
   if (!db) return { status: 503, body: { success: false, error: 'DB_UNAVAILABLE' } };
   _ensureSovLoginSdkTables(db);
   const { domain, return_url, registering_sovereign_id, x25519_pubkey_hex, timestamp, signature } = input || {};
@@ -686,18 +686,24 @@ function _doPlatformRegister(db, identity, broadcast, input) {
   const feeRow = db._db.prepare("SELECT param_value FROM sov_governance_params WHERE param_key = 'platform_register_fee'").get();
   const feeSov = parseFloat((feeRow && feeRow.param_value) ? feeRow.param_value : '10');
   const feeSeeds = Math.round(feeSov * 1000000);
-  let deducted = false, priorDisc = null;
-  for (let attempt = 0; attempt < 3 && !deducted; attempt++) {
-    const disc = db.readDisc(registering_sovereign_id);
-    if (!disc) return { status: 403, body: { success: false, error: 'NO_DISC_SLOT' } };
-    priorDisc = disc;
-    if ((disc.spendable_seeds || disc.balance_seeds) < feeSeeds) {
-      return { status: 402, body: { success: false, error: 'INSUFFICIENT_BALANCE', required_seeds: feeSeeds, have_seeds: (disc.spendable_seeds || disc.balance_seeds) } };
-    }
-    deducted = db.writeDiscGuarded(registering_sovereign_id, disc.balance_seeds - feeSeeds, (disc.spendable_seeds || disc.balance_seeds) - feeSeeds, disc.version);
+  const priorDisc = db.readDisc(registering_sovereign_id);
+  if (!priorDisc) return { status: 403, body: { success: false, error: 'NO_DISC_SLOT' } };
+  if (priorDisc.spendable_seeds < feeSeeds) {
+    return { status: 402, body: { success: false, error: 'INSUFFICIENT_BALANCE', required_seeds: feeSeeds, have_seeds: priorDisc.spendable_seeds } };
   }
-  if (!deducted) return { status: 503, body: { success: false, error: 'FEE_DEDUCTION_RACE' } };
-  try { if (db.addToPool) db.addToPool('witness_operator', feeSeeds); else if (db.refundPool) db.refundPool('witness_operator', feeSeeds); } catch (_) {}
+  // 1.4.90: the fee is an OWNER op — owner -> operator pool, granted by a majority of nodes on
+  // the owner's slot and applied on every node (peers used to keep the owner's balance untouched).
+  if (feeSeeds > 0) {
+    const fee = await db.ledger.commitOwnerOp({
+      kind: 'platform_fee', ref: platformId, owner: { acct: registering_sovereign_id },
+      moves: [{ acct: registering_sovereign_id, d: -feeSeeds }],
+      pools: [{ pool: 'witness_operator', d: feeSeeds }],
+    });
+    if (!fee.ok) {
+      return { status: fee.error === 'LEDGER_INSUFFICIENT' ? 402 : 503,
+               body: { success: false, error: fee.error === 'LEDGER_INSUFFICIENT' ? 'INSUFFICIENT_BALANCE' : fee.error } };
+    }
+  }
   // TRANSPARENCY (king 2026-07-19): the fee debit must appear in the payer's
   // payment history with its destination — owner → operator pool.
   const feeTxId = `platfee-${platformId}-${now}`;
@@ -840,9 +846,13 @@ function createDiscoveryServer(identity, db, relayPool, network) {
           ? db.citizenCount()
           : (walletRow.c || 0);
         const pool_total_seeds = pools.reduce((sum, p) => sum + (p.remaining_seeds || 0), 0);
-        const grand_total_seeds = wallet_total_seeds + pool_total_seeds;
+        // 1.4.90: escrow / vault / bond holdings are counted (they used to be in no total — D19),
+        // and the check is EXACT: with every balance change a replicated op, the money is either
+        // all accounted for or something is wrong.
+        const holding_total_seeds = (typeof db.totalHoldings === 'function') ? db.totalHoldings() : 0;
+        const grand_total_seeds = wallet_total_seeds + holding_total_seeds + pool_total_seeds;
         const expected_seeds = 50_000_000_000_000;
-        const within_cap = (grand_total_seeds <= expected_seeds);
+        const within_cap = (grand_total_seeds === expected_seeds);
 
         // ── The cap check ALONE cannot fail, and that was the problem ──────────────────────
         // reconcileSupplyPools() sets the enrolment pool's remaining so that
@@ -1359,14 +1369,14 @@ function createDiscoveryServer(identity, db, relayPool, network) {
       if (req.method !== 'POST') { res.writeHead(405); res.end('POST required'); return; }
       let body = '';
       req.on('data', c => body += c);
-      req.on('end', () => {
+      req.on('end', async () => {
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Access-Control-Allow-Origin', '*');
         try {
           if (!db) { res.writeHead(503); res.end(JSON.stringify({ success: false, error: 'DB_UNAVAILABLE' })); return; }
           _ensureSovLoginSdkTables(db);
           const input = JSON.parse(body || '{}');
-          const reg = _doPlatformRegister(db, identity, _broadcast, input);
+          const reg = await _doPlatformRegister(db, identity, _broadcast, input);
           res.writeHead(reg.status);
           res.end(JSON.stringify(reg.body));
           return;

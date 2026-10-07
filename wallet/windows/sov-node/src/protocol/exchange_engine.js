@@ -63,6 +63,12 @@ class ExchangeEngine {
     peerMesh.on('EXCHANGE_CHAT_FORWARD',      (msg) => this._handleChatForward(msg));
     peerMesh.on('EXCHANGE_CHAT_ACK',          (msg) => this._handleChatAck(msg));
     this._chatWaiters = new Map();   // msg_id -> resolve(status)
+    // 1.4.90: every order action runs on the order's HOME node (where its escrow is) and
+    // the citizen gets the home node's real answer — never a local guess (D27).
+    peerMesh.on('EXCHANGE_HOME_REQUEST',      (msg) => this._onHomeRequest(msg));
+    peerMesh.on('EXCHANGE_HOME_REPLY',        (msg) => this._onHomeReply(msg));
+    this._homeWaiters = new Map();   // req_id -> resolve(frame)
+    setTimeout(() => this._adoptLegacyEscrow(), 10 * 1000);
 
     // Hourly: expire old open orders
     setTimeout(() => this._cleanupExpiredOrders(), 30 * 1000);
@@ -246,7 +252,7 @@ class ExchangeEngine {
   //  LIST ORDER (seller)
   // ═══════════════════════════════════════════════════════════════════════════
 
-  handleListOrder(ws, msg) {
+  async handleListOrder(ws, msg) {
     // sov_amount MUST be in seeds (integer). Flutter SDK converts SOV float
     // (e.g. 20.0) to seeds (20_000_000) before sending. Removed the fragile
     // `< 1000` auto-convert heuristic — it silently corrupted any legitimate
@@ -294,33 +300,41 @@ class ExchangeEngine {
       return;
     }
 
-    // Lock escrow: deduct from seller's spendable balance
-    // Fallback: if ws._sovereignId is somehow null, accept msg.sovereign_id
-    const resolvedSellerId = seller_id || msg.sovereign_id || '';
-    global.sovLog.debug('[Exchange] LIST_ORDER seller=' + resolvedSellerId + ' amount=' + sov_amount + ' ws._sov=' + seller_id);
-    const disc = this._db.readDisc(resolvedSellerId);
-    global.sovLog.debug('[Exchange] disc=' + JSON.stringify(disc ? {b: disc.balance_seeds, s: disc.spendable_seeds, v: disc.version} : null));
-    const escrowed = this._deductBalance(resolvedSellerId, sov_amount);
-    global.sovLog.debug('[Exchange] deduct result=' + escrowed);
-    if (!escrowed) {
-      this._send(ws, 'XD', { success: false, error: 'INSUFFICIENT_BALANCE', type: 'EXCHANGE_ORDER_LISTED' });
+    // Duplicate order id: refuse BEFORE any money moves.
+    if (this._db._db.prepare('SELECT 1 FROM sov_exchange_orders WHERE order_id = ?').get(order_id) ||
+        this._db._db.prepare('SELECT 1 FROM sov_exchange_replicas WHERE order_id = ?').get(order_id)) {
+      this._send(ws, 'XD', { success: false, error: 'ORDER_ID_EXISTS', type: 'EXCHANGE_ORDER_LISTED' });
+      return;
+    }
+
+    // Ledger (1.4.90): listing is an OWNER op. The seller's SOV moves into this order's escrow
+    // holding only after a majority of nodes granted the seller's next (account, nonce) slot —
+    // so a listing and a transfer can never spend the same SOV, wherever each was sent.
+    const res = await this._db.ledger.commitOwnerOp({
+      kind: 'escrow_list', ref: order_id, owner: { acct: seller_id },
+      moves: [{ acct: seller_id, d: -sov_amount }],
+      holds: [{ id: 'escrow:' + order_id, d: sov_amount }],
+    });
+    if (!res.ok) {
+      this._send(ws, 'XD', { success: false, type: 'EXCHANGE_ORDER_LISTED',
+        error: res.error === 'LEDGER_INSUFFICIENT' ? 'INSUFFICIENT_BALANCE' : res.error });
       return;
     }
 
     const now       = Date.now();
     const expiresAt = now + Math.min(parseInt(expires_in_hours) || 24 * 7, 24 * 30) * 60 * 60 * 1000;
-
-    const insertResult = this._db._db.prepare(`
-        INSERT OR IGNORE INTO sov_exchange_orders
+    try {
+      this._db._db.prepare(`
+        INSERT INTO sov_exchange_orders
           (order_id, seller_id, sov_amount, price_per_sov, currency_code, status, source_node,
            created_at, updated_at, expires_at, memo, payment_method)
         VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)
       `).run(order_id, seller_id, sov_amount, price_per_sov, currency_code || 'USD',
              this._identity.nodeId, now, now, expiresAt, memo || '', payment_method);
-    if (insertResult.changes === 0) {
-      // ORDER_ID already exists — INSERT OR IGNORE silently ignored; return escrow
-      this._creditBalance(seller_id, sov_amount);
-      this._send(ws, 'XD', { success: false, error: 'ORDER_ID_EXISTS', type: 'EXCHANGE_ORDER_LISTED' });
+    } catch (e) {
+      // The escrow is already committed: give it back through the ledger, never silently.
+      this._escrowRelease({ order_id, sov_amount }, seller_id, sov_amount, 0, 'escrow_list_undo');
+      this._send(ws, 'XD', { success: false, error: 'ORDER_INSERT_FAILED', type: 'EXCHANGE_ORDER_LISTED' });
       return;
     }
 
@@ -352,7 +366,7 @@ class ExchangeEngine {
   //  FILL ORDER (buyer)
   // ═══════════════════════════════════════════════════════════════════════════
 
-  handleFillOrder(ws, msg) {
+  async handleFillOrder(ws, msg) {
     const { order_id } = msg;
     const buyer_id = ws._sovereignId;
 
@@ -360,13 +374,10 @@ class ExchangeEngine {
       this._send(ws, 'XF', { success: false, error: 'MISSING_ORDER_ID' });
       return;
     }
+    // The order's home node decides who fills it — first come, once (D27).
+    if (await this._forwardToHome(ws, 'fill', msg, 'XF')) return;
 
-    // Check local orders first, then replicas
-    let order = this._db._db.prepare('SELECT * FROM sov_exchange_orders WHERE order_id = ? AND status = ?').get(order_id, 'open');
-    const isReplica = !order;
-    if (isReplica) {
-      order = this._db._db.prepare('SELECT * FROM sov_exchange_replicas WHERE order_id = ? AND status = ?').get(order_id, 'open');
-    }
+    const order = this._db._db.prepare('SELECT * FROM sov_exchange_orders WHERE order_id = ? AND status = ?').get(order_id, 'open');
 
     if (!order) {
       this._send(ws, 'XF', { success: false, error: 'ORDER_NOT_FOUND_OR_CLOSED' });
@@ -386,28 +397,16 @@ class ExchangeEngine {
     const agreedPrice = Number(msg.agreed_price_per_sov) || 0;
     const recordPrice = (Number(order.price_per_sov) === 0 && agreedPrice > 0)
         ? agreedPrice : order.price_per_sov;
-    if (isReplica) {
-      // Update replica status locally
-      this._db._db.prepare(`
-        UPDATE sov_exchange_replicas SET status = 'filled', filled_by = ?, price_per_sov = ?, updated_at = ? WHERE order_id = ?
-      `).run(buyer_id, recordPrice, now, order_id);
+    // Local order — update directly
+    this._db._db.prepare(`
+      UPDATE sov_exchange_orders SET status = 'filled', filled_by = ?, price_per_sov = ?, updated_at = ? WHERE order_id = ? AND status = 'open'
+    `).run(buyer_id, recordPrice, now, order_id);
 
-      // Forward fill to source node
-      this._peerMesh.sendTo(order.source_node, 'EXCHANGE_FILL_FORWARD', {
-        order_id, buyer_id, filled_at: now, price_per_sov: recordPrice, node_id: this._identity.nodeId,
-      });
-    } else {
-      // Local order — update directly
-      this._db._db.prepare(`
-        UPDATE sov_exchange_orders SET status = 'filled', filled_by = ?, price_per_sov = ?, updated_at = ? WHERE order_id = ? AND status = 'open'
-      `).run(buyer_id, recordPrice, now, order_id);
-
-      // Notify seller of fill
-      this._gateway && this._gateway.push(order.seller_id, 'XN', {  // EXCHANGE_ORDER_FILLED_NOTIFY
-        order_id, buyer_id, sov_amount: order.sov_amount, ts: now,
-      });
-      this._replicateOrder({ ...order, status: 'filled', filled_by: buyer_id, price_per_sov: recordPrice, updated_at: now });
-    }
+    // Notify seller of fill
+    this._gateway && this._gateway.push(order.seller_id, 'XN', {  // EXCHANGE_ORDER_FILLED_NOTIFY
+      order_id, buyer_id, sov_amount: order.sov_amount, ts: now,
+    });
+    this._replicateOrder({ ...order, status: 'filled', filled_by: buyer_id, price_per_sov: recordPrice, updated_at: now });
 
     this._send(ws, 'XF', {
       success: true, order_id, sov_amount: order.sov_amount,
@@ -437,7 +436,8 @@ class ExchangeEngine {
   //    EXCHANGE_REFUND  (op 'XR') → buyer refund
   // ═══════════════════════════════════════════════════════════════════════════
 
-  handleConfirmDelivery(ws, msg) {
+  async handleConfirmDelivery(ws, msg) {
+    if (await this._forwardToHome(ws, 'confirm', msg, 'XC', 'EXCHANGE_DELIVERY_CONFIRMED')) return;
     const { confirmation_type } = msg;
     if (confirmation_type === 'BUYER_REQUESTS_REFUND') {
       return this._handleRefundInternal(ws, msg);
@@ -466,22 +466,15 @@ class ExchangeEngine {
     const feeSeeds = Math.floor(order.sov_amount * feePct);
     const netSeeds = order.sov_amount - feeSeeds;
 
-    // Credit buyer
-    this._creditBalance(order.filled_by, netSeeds);
-
-    // Route the network fee to the operator pool (supply-neutral) instead of
-    // silently burning it — consistent with platform_register_fee / tx_fee routing.
-    // Fail CLOSED — this previously swallowed every error with catch(_) {},
-    // so a failed credit destroyed the fee with no record at all.
-    if (feeSeeds > 0 && this._db.addToPoolOrRecord) {
-      this._db.addToPoolOrRecord('witness_operator', feeSeeds, { source: 'exchange' });
-    } else if (feeSeeds > 0 && this._db.addToPool) {
-      this._db.addToPool('witness_operator', feeSeeds);
+    // Ledger (1.4.90): escrow -> buyer (net) and fee -> operator pool as ONE op, released at
+    // most once per order (deterministic op id). The status changes only if the money moved.
+    const rel = this._escrowRelease(order, order.filled_by, netSeeds, feeSeeds, 'escrow_confirm');
+    if (!rel.ok) {
+      this._send(ws, 'XC', { type: 'EXCHANGE_DELIVERY_CONFIRMED', success: false, error: rel.error });
+      return;
     }
-
-    // Update order
     this._db._db.prepare(`
-      UPDATE sov_exchange_orders SET status = 'confirmed', updated_at = ? WHERE order_id = ?
+      UPDATE sov_exchange_orders SET status = 'confirmed', updated_at = ? WHERE order_id = ? AND status = 'filled'
     `).run(now, order_id);
 
     this._send(ws, 'XC', {
@@ -536,8 +529,12 @@ class ExchangeEngine {
     }
 
     const now = Date.now();
-    // Return escrow to seller
-    this._creditBalance(order.seller_id, order.sov_amount);
+    // Ledger (1.4.90): escrow -> seller, once.
+    const rel = this._escrowRelease(order, order.seller_id, order.sov_amount, 0, 'escrow_refund');
+    if (!rel.ok) {
+      this._send(ws, 'XR', { type: 'EXCHANGE_REFUND_PROCESSED', success: false, error: rel.error });
+      return;
+    }
     this._recordExchangeTx(`refund-${order_id}`, 'SOV-EXCHANGE-ESCROW', order.seller_id,
       order.sov_amount, `Exchange refund — escrow returned (order ${order_id})`);
 
@@ -596,7 +593,8 @@ class ExchangeEngine {
   //  DIRECT REFUND  (reached via EXCHANGE_REFUND op 'XR' — legacy path)
   // ═══════════════════════════════════════════════════════════════════════════
 
-  handleRequestRefund(ws, msg) {
+  async handleRequestRefund(ws, msg) {
+    if (await this._forwardToHome(ws, 'refund', msg, 'XR', 'EXCHANGE_REFUND_PROCESSED')) return;
     return this._handleRefundInternal(ws, msg);
   }
 
@@ -630,7 +628,8 @@ class ExchangeEngine {
     this._replicateOrder(updated);  // also broadcasts EXCHANGE_STATE_REPLICATE to peers
   }
 
-  handleCancelOrder(ws, msg) {
+  async handleCancelOrder(ws, msg) {
+    if (await this._forwardToHome(ws, 'cancel', msg, 'XX')) return;
     const { order_id } = msg;
     const seller_id    = ws._sovereignId;
 
@@ -643,8 +642,12 @@ class ExchangeEngine {
       return;
     }
 
-    // Return escrow to seller
-    this._creditBalance(seller_id, order.sov_amount);
+    // Ledger (1.4.90): escrow -> seller, once. Status changes only if the money moved.
+    const rel = this._escrowRelease(order, seller_id, order.sov_amount, 0, 'escrow_cancel');
+    if (!rel.ok) {
+      this._send(ws, 'XX', { success: false, error: rel.error });
+      return;
+    }
     this._recordExchangeTx(`cancel-${order_id}`, 'SOV-EXCHANGE-ESCROW', seller_id,
       order.sov_amount, `Exchange listing cancelled — escrow returned (order ${order_id})`);
 
@@ -1013,7 +1016,8 @@ class ExchangeEngine {
     `).all(now);
 
     for (const order of expired) {
-      this._creditBalance(order.seller_id, order.sov_amount);
+      const rel = this._escrowRelease(order, order.seller_id, order.sov_amount, 0, 'escrow_expire');
+      if (!rel.ok) { global.sovLog.error(`[Exchange] expiry release ${order.order_id} failed: ${rel.error}`); continue; }
       this._recordExchangeTx(`expire-${order.order_id}`, 'SOV-EXCHANGE-ESCROW', order.seller_id,
         order.sov_amount, `Exchange listing expired — escrow returned (order ${order.order_id})`);
       this._db._db.prepare(`
@@ -1071,39 +1075,77 @@ class ExchangeEngine {
     });
   }
 
-  _deductBalance(citizenId, amountSeeds) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const disc = this._db.readDisc(citizenId);
-      if (!disc || disc.spendable_seeds < amountSeeds) return false;
-      const result = this._db._db.prepare(`
-        UPDATE sov_disc
-        SET balance_seeds  = balance_seeds  - ?,
-            spendable_seeds = spendable_seeds - ?,
-            version = version + 1,
-            updated_at = ?
-        WHERE sovereign_id = ? AND version = ? AND spendable_seeds >= ?
-      `).run(amountSeeds, amountSeeds, Date.now(), citizenId, disc.version, amountSeeds);
-      if (result.changes > 0) return true;
-    }
-    return false;
+  // Escrow out of an order's holding: `amountSeeds` to `toAcct`, `feeSeeds` to the operator
+  // pool; the two must equal the order amount. One op id per order, so an order's escrow is
+  // released at most once, whichever path (confirm/refund/cancel/expire) gets there first.
+  _escrowRelease(order, toAcct, amountSeeds, feeSeeds, kind) {
+    return this._db.ledger.commitSystemOp({
+      op_id: `escrow-release:${order.order_id}`, kind, ref: order.order_id,
+      holds: [{ id: 'escrow:' + order.order_id, d: -(amountSeeds + feeSeeds) }],
+      moves: [{ acct: toAcct, d: amountSeeds }],
+      pools: feeSeeds > 0 ? [{ pool: 'witness_operator', d: feeSeeds }] : [],
+    });
   }
 
-  _creditBalance(citizenId, amountSeeds) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const disc = this._db.readDisc(citizenId);
-      if (!disc) return false;
-      const result = this._db._db.prepare(`
-        UPDATE sov_disc
-        SET balance_seeds   = balance_seeds   + ?,
-            spendable_seeds = spendable_seeds + ?,
-            version = version + 1,
-            updated_at = ?
-        WHERE sovereign_id = ? AND version = ?
-      `).run(amountSeeds, amountSeeds, Date.now(), citizenId, disc.version);
-      if (result.changes > 0) return true;
+  // Orders listed before 1.4.90 hold escrow that is in no account (the seller was debited,
+  // nothing was credited — audit D19). Give each such order its escrow holding, once.
+  _adoptLegacyEscrow() {
+    if (!this._db.ledger) return;
+    const rows = this._db._db.prepare(
+      "SELECT order_id, sov_amount FROM sov_exchange_orders WHERE status IN ('open','filled','disputed')").all();
+    for (const o of rows) {
+      if (this._db.holdingBalance('escrow:' + o.order_id) > 0) continue;
+      const r = this._db.ledger.commitSystemOp({
+        op_id: `escrow-adopt:${o.order_id}`, kind: 'escrow_adopt', ref: o.order_id,
+        holds: [{ id: 'escrow:' + o.order_id, d: o.sov_amount }],
+      });
+      global.sovLog.warn(`[Exchange] adopted pre-1.4.90 escrow of order ${o.order_id}: ${r.ok ? 'ok' : r.error}`);
     }
-    return false;
   }
+
+  // If this node is not the order's home, run the action THERE and hand the citizen the
+  // home node's own answer. Returns true when the request was handled (forwarded or refused).
+  async _forwardToHome(ws, action, msg, errOp, errType) {
+    const orderId = msg && msg.order_id;
+    if (!orderId) return false;
+    if (this._db._db.prepare('SELECT 1 FROM sov_exchange_orders WHERE order_id = ?').get(orderId)) return false;
+    const rep = this._db._db.prepare('SELECT source_node FROM sov_exchange_replicas WHERE order_id = ?').get(orderId);
+    const fail = (error) => this._send(ws, errOp, { success: false, error, ...(errType ? { type: errType } : {}) });
+    if (!rep || !rep.source_node || rep.source_node === this._identity.nodeId) return false;
+    if (msg._forwarded) { fail('ORDER_NOT_FOUND_OR_CLOSED'); return true; }
+    const req_id = require('crypto').randomBytes(8).toString('hex');
+    const frame = await new Promise((resolve) => {
+      this._homeWaiters.set(req_id, resolve);
+      const t = setTimeout(() => { if (this._homeWaiters.delete(req_id)) resolve(null); }, 8000);
+      if (t.unref) t.unref();
+      const sent = this._peerMesh.sendTo(rep.source_node, 'EXCHANGE_HOME_REQUEST', {
+        req_id, action, actor: ws._sovereignId, msg: { ...msg, _forwarded: true }, from_node: this._identity.nodeId,
+      });
+      if (!sent && this._homeWaiters.delete(req_id)) resolve(null);
+    });
+    if (!frame) { fail('ORDER_HOME_UNREACHABLE'); return true; }
+    if (ws && ws.readyState === 1) ws.send(frame);
+    return true;
+  }
+
+  async _onHomeRequest(msg) {
+    if (!msg || !msg.req_id || !msg.from_node || !msg.actor) return;
+    const run = { fill: 'handleFillOrder', confirm: 'handleConfirmDelivery',
+                  refund: 'handleRequestRefund', cancel: 'handleCancelOrder' }[msg.action];
+    if (!run) return;
+    const frames = [];
+    const proxy = { _sovereignId: msg.actor, readyState: 1, send: (f) => frames.push(f) };
+    try { await this[run](proxy, msg.msg || {}); } catch (e) { global.sovLog.warn(`[Exchange] home ${msg.action}: ${e.message}`); }
+    this._peerMesh.sendTo(msg.from_node, 'EXCHANGE_HOME_REPLY', { req_id: msg.req_id, frame: frames[0] || null });
+  }
+
+  _onHomeReply(msg) {
+    const resolve = msg && this._homeWaiters.get(msg.req_id);
+    if (resolve) { this._homeWaiters.delete(msg.req_id); resolve(msg.frame); }
+  }
+
+  // 1.4.90: no direct balance helpers — every exchange money move is a ledger op (_escrowRelease,
+  // and the listing in handleListOrder).
 
   _getGovParam(key, fallback = '0') {
     const row = this._db._db.prepare(

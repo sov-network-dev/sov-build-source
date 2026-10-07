@@ -3,62 +3,27 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Handles all SOV transfers between citizens.
 //
-// Security model — 3 guards that must ALL pass:
+// Since 1.4.90 a transfer is ONE ledger op (protocol/ledger.js, storage/db.js ledgerApply):
+//   sender −(amount + fee), recipient +amount, fee → witness_operator pool.
 //
-//   Guard 1 — Nonce chain (anti-replay)
-//     Every transfer has a nonce that must be exactly last_nonce + 1.
-//     A captured and replayed transaction has a stale nonce → rejected.
-//     The nonce is gossiped to all peer nodes on confirmation.
+//   1. Validate fields; verify the citizen's signature over this transfer.
+//   2. Automated-wallet caps, payment-request check.
+//   3. Nonce must be the sender's next (anti-replay); balance must cover amount + fee.
+//   4. ledger.commitOwnerOp: a MAJORITY of the node set must grant this exact op for
+//      (sender, nonce). Every node grants at most one op per slot, so two spends of the
+//      same money can never both commit, whichever nodes they reach. Silence is a no.
+//   5. The op is applied atomically here, broadcast, and kept; peers apply it atomically
+//      (never a credit without its debit) and fetch any op they missed by digest/pull.
 //
-//   Guard 2 — Spend lock (anti double-spend)
-//     Before processing, node claims a (sender, nonce) lock and asks peers
-//     to deny the same lock. If any peer denies → abort.
-//     Deterministic tiebreaker (smaller tx_id wins) prevents deadlock.
-//
-//   Guard 3 — Optimistic concurrency (race condition)
-//     Balance UPDATE uses WHERE version = N. If another transfer updated
-//     the balance between our read and write, the version changed → retry.
-//     Maximum 3 retries before rejecting.
-//
-// Peer-enforce confirmation rule:
-//   When BOTH sender and recipient are connected to THIS node AND at least one
-//   peer node is active, the origin node completes the full confirmation
-//   (deduct, credit, record tx) but defers notifying both parties until at
-//   least one peer sends TX_CONFIRM_ACK — meaning the tx is safely replicated
-//   on another node before citizens are told it succeeded.
-//   Fallback: if no ACK arrives within PEER_CONFIRM_TIMEOUT_MS (2s), the
-//   origin notifies parties anyway so UX is never permanently blocked.
-//   This prevents the "both citizens on one node, node crashes before sync"
-//   data-loss scenario.
-//
-// Transfer flow:
-//   1. Validate fields, then verify the citizen's signature over this transfer
-//   2. Check Guard 1 (nonce)
-//   3. Claim spend lock
-//   4. Request Guard 2 quorum from peers
-//   5. Deduct sender balance (Guard 3 — version gate)
-//   6. Credit recipient balance
-//   7. Record transaction + update nonce + release lock
-//   8. Broadcast TX_CONFIRMED_RELAY to peers (immediately — start sync)
-//   9a. If same-node transfer + active peers: defer notifications, wait for
-//       TX_CONFIRM_ACK from any peer (2s fallback)
-//   9b. Otherwise: notify sender + recipient immediately
-//  10. TX_CONFIRM_ACK received → fire deferred notifications
+// Before 1.4.90 a "spend lock" approved on silence and with zero peers, and a relayed
+// transfer credited the recipient even when the sender could not be debited — see
+// docs/ledger/ for the record. Do not reintroduce either.
 // ─────────────────────────────────────────────────────────────────────────────
 
 'use strict';
 
 const crypto = require('crypto');
 const { MSG_TYPE } = require('../network/citizen_gateway');
-
-// Quorum: wait up to 500ms for peer responses before deciding
-const QUORUM_TIMEOUT_MS = 500;
-
-// Maximum optimistic concurrency retries
-const MAX_VERSION_RETRIES = 3;
-
-// Peer-enforce: wait up to 2s for a peer TX_CONFIRM_ACK before self-notifying
-const PEER_CONFIRM_TIMEOUT_MS = 2000;
 
 class TransferEngine {
 
@@ -68,21 +33,16 @@ class TransferEngine {
     this._peerMesh  = peerMesh;
     this._gateway   = gatewayRef; // set after gateway starts
 
-    // Pending spend lock quorum responses
-    this._lockWaiters = new Map(); // tx_id → { resolve, deny, timer }
-
-    // Deferred notification map — same-node transfers waiting for peer ACK
-    // tx_hash → { notifySender, notifyRecipient, timer }
-    this._pendingNotifications = new Map();
-
     // Register peer message handlers
-    peerMesh.on('SPEND_LOCK_CLAIM',  (msg) => this._handlePeerLockClaim(msg));
-    peerMesh.on('SPEND_LOCK_DENY',   (msg) => this._handlePeerLockDeny(msg));
-    peerMesh.on('SPEND_LOCK_GRANT',  (msg) => this._handlePeerLockGrant(msg));
-    peerMesh.on('TX_CONFIRMED_RELAY',(msg) => this._handleTxConfirmedRelay(msg));
-    peerMesh.on('TX_CONFIRM_ACK',    (msg) => this._handleTxConfirmAck(msg));
-    peerMesh.on('NONCE_UPDATE',      (msg) => this._handleNonceUpdate(msg));
     peerMesh.on('AUTOMATION_POLICY_SYNC', (msg) => this._handleAutomationPolicySync(msg));
+
+    // Ledger (1.4.90): peers check a transfer op is exactly the citizen's signed transfer
+    // before granting its slot or applying it; and each node tells a recipient connected
+    // HERE when the op applies here.
+    if (db.ledger) {
+      db.ledger.setValidator('transfer', (op) => this._validateTransferOp(op));
+      db.ledger.onApplied((op, local) => { if (!local && op.kind === 'transfer') this._notifyRecipient(op.transfer); });
+    }
   }
 
   setGateway(gateway) {
@@ -143,7 +103,9 @@ class TransferEngine {
     // they can check for themselves instead of trusting whoever relayed it.
     const sigCheck = this._verifyTransferSignature(ws, msg);
     const sigMode  = this._getGovParam
-      ? String(this._getGovParam('tx_signature_enforce', 'reject'))  // C5 fix 2026-08-05: secure-by-default (prod gov already 'reject'); fresh nodes now enforce too
+      // Secure by default for a node with NO governance row. A node that HAS the row uses it,
+      // and the live fleet's row read 'log' (measured 2026-09-30 and 2026-10-08).
+      ? String(this._getGovParam('tx_signature_enforce', 'reject'))
       : 'log';
 
     if (!sigCheck.valid) {
@@ -222,7 +184,12 @@ class TransferEngine {
       }
     }
 
-    // ── Guard 1: Nonce chain ──────────────────────────────────────────────────
+    // ── Ledger op (1.4.90) — docs/ledger/LEDGER_SAFETY_1.4.90_PLAN.md ─────────
+    // The whole transfer is ONE op: sender −(amount+fee), recipient +amount, fee →
+    // operator pool. It commits only after a MAJORITY of nodes granted this exact op
+    // for (sender, nonce); every node grants at most one op per slot, so two spends of
+    // the same money cannot both commit, whichever nodes they were sent to. Peers apply
+    // the op atomically (no credit without its debit) and fetch any op they missed.
     const senderDisc = this._db.readDisc(from_id);
     if (!senderDisc) {
       gateway.push(ws._sovereignId, MSG_TYPE.SOV_TRANSFER_RESULT, {
@@ -230,7 +197,6 @@ class TransferEngine {
       });
       return;
     }
-
     const expectedNonce = senderDisc.nonce + 1;
     if (tx_nonce !== expectedNonce) {
       gateway.push(ws._sovereignId, MSG_TYPE.SOV_TRANSFER_RESULT, {
@@ -241,509 +207,102 @@ class TransferEngine {
       return;
     }
 
-    // ── Guard 2: Spend lock quorum ─────────────────────────────────────────
-    const lockAcquired = this._db.acquireSpendLock(from_id, tx_nonce, tx_id);
-    if (!lockAcquired) {
-      gateway.push(ws._sovereignId, MSG_TYPE.SOV_TRANSFER_RESULT, {
-        tx_id, success: false, error: 'SPEND_LOCK_HELD',
-      });
-      return;
-    }
-
-    // Ask peers to grant the lock (or deny if they already have it)
-    const quorumGranted = await this._requestSpendLockQuorum(tx_id, from_id, tx_nonce);
-    if (!quorumGranted) {
-      this._db.releaseSpendLock(from_id, tx_nonce);
-      gateway.push(ws._sovereignId, MSG_TYPE.SOV_TRANSFER_RESULT, {
-        tx_id, success: false, error: 'SPEND_LOCK_DENIED_BY_PEER',
-      });
-      return;
-    }
-
-    // ── Transfer fee (SOV_OPERATOR_ECONOMY_SPEC — king-approved 2026-07-19) ──
-    // fee = min(amount × tx_fee_rate, tx_fee_max_sov). The rate is a % (0.1%
-    // default) so small everyday payments cost fractions of a cent — cheaper
-    // than Bitcoin at every size; the CAP guarantees no transfer ever costs
-    // more than tx_fee_max_sov (1 SOV default) so large settlements stay viable.
-    // Both are governance parameters — citizens can vote either (including to 0).
-    // Cap 0 = uncapped (pure percentage).
-    const feeRate    = parseFloat(this._db.getGovParam('tx_fee_rate', '0.001'));
-    let   feeSeeeds  = Math.ceil(amount_seeds * feeRate);
-    const feeMaxSov  = parseFloat(this._db.getGovParam('tx_fee_max_sov', '1'));
+    // Fee = min(amount × tx_fee_rate, tx_fee_max_sov) — both citizen-votable; cap 0 = uncapped.
+    const feeRate     = parseFloat(this._db.getGovParam('tx_fee_rate', '0.001'));
+    let   feeSeeds    = Math.ceil(amount_seeds * feeRate);
+    const feeMaxSov   = parseFloat(this._db.getGovParam('tx_fee_max_sov', '1'));
     const feeCapSeeds = Math.floor(feeMaxSov * 1_000_000);
-    if (feeCapSeeds > 0 && feeSeeeds > feeCapSeeds) feeSeeeds = feeCapSeeds;
-    const totalCost  = amount_seeds + feeSeeeds;
+    if (feeCapSeeds > 0 && feeSeeds > feeCapSeeds) feeSeeds = feeCapSeeds;
+    const totalCost   = amount_seeds + feeSeeds;
 
     if (senderDisc.spendable_seeds < totalCost) {
-      this._db.releaseSpendLock(from_id, tx_nonce);
       gateway.push(ws._sovereignId, MSG_TYPE.SOV_TRANSFER_RESULT, {
         tx_id, success: false, error: 'INSUFFICIENT_BALANCE',
-        balance_seeds:    senderDisc.spendable_seeds,
-        required_seeds:   totalCost,
+        balance_seeds: senderDisc.spendable_seeds, required_seeds: totalCost,
       });
       return;
     }
 
-    // ── Guard 3: Optimistic concurrency deduction ──────────────────────────
-    let deducted = false;
-    for (let attempt = 0; attempt < MAX_VERSION_RETRIES; attempt++) {
-      const fresh = this._db.readDisc(from_id);
-      if (!fresh || fresh.spendable_seeds < totalCost) break;
-
-      deducted = this._db.writeDiscGuarded(
-        from_id,
-        fresh.balance_seeds - totalCost,
-        fresh.spendable_seeds - totalCost,
-        fresh.version
-      );
-      if (deducted) break;
-      // Version changed — another tx updated balance concurrently; retry
-    }
-
-    if (!deducted) {
-      this._db.releaseSpendLock(from_id, tx_nonce);
-      gateway.push(ws._sovereignId, MSG_TYPE.SOV_TRANSFER_RESULT, {
-        tx_id, success: false, error: 'CONCURRENT_MODIFICATION',
-      });
-      return;
-    }
-
-    // ── Credit recipient ──────────────────────────────────────────────────
-    this._db.ensureDiscEntry(to_id);
-    let credited = false;
-    for (let attempt = 0; attempt < MAX_VERSION_RETRIES; attempt++) {
-      const recipDisc = this._db.readDisc(to_id);
-      credited = this._db.writeDiscGuarded(
-        to_id,
-        recipDisc.balance_seeds + amount_seeds,
-        recipDisc.spendable_seeds + amount_seeds,
-        recipDisc.version
-      );
-      if (credited) break;
-    }
-
-    // ── Route transaction fee → witness_operator pool (Blueprint v14.0) ───
-    // Fee was deducted from sender (above). Now credit it into the operator
-    // pool so the pool grows with network activity instead of just sitting
-    // at the 10M genesis allocation. This is how operators sustain themselves
-    // beyond the initial pool: every transfer contributes to ongoing income.
-    //
-    // The pool itself does NOT distribute to operators automatically yet —
-    // that mechanism is a v1.3 governance proposal (per-tx + uptime split).
-    // For now, the pool simply accumulates fees + initial allocation as a
-    // reserve waiting to be governance-distributed.
-    //
-    if (feeSeeeds > 0 && credited) {
-      // Fail CLOSED: a fee that cannot reach the pool is recorded as owed, never
-      // burned. The old catch swallowed the error and the seeds disappeared,
-      // which made "collected fees == pool credits" impossible to audit.
-      if (this._db.addToPoolOrRecord) {
-        this._db.addToPoolOrRecord('witness_operator', feeSeeeds,
-          { source: 'transfer', ref: tx_id || null });
-      } else if (this._db.addToPool) {
-        this._db.addToPool('witness_operator', feeSeeeds);
-      }
-    }
-
-    if (!credited) {
-      // This should be rare — rollback the deduction
-      const fresh = this._db.readDisc(from_id);
-      for (let attempt = 0; attempt < MAX_VERSION_RETRIES; attempt++) {
-        const ok = this._db.writeDiscGuarded(
-          from_id,
-          fresh.balance_seeds + totalCost,
-          fresh.spendable_seeds + totalCost,
-          fresh.version
-        );
-        if (ok) break;
-      }
-      this._db.releaseSpendLock(from_id, tx_nonce);
-      gateway.push(ws._sovereignId, MSG_TYPE.SOV_TRANSFER_RESULT, {
-        tx_id, success: false, error: 'CREDIT_FAILED',
-      });
-      return;
-    }
-
-    // ── Compute transaction hash ───────────────────────────────────────────
     const txHash = crypto.createHash('sha256')
       .update(`${tx_id}:${from_id}:${to_id}:${amount_seeds}:${tx_nonce}:${timestamp}`)
       .digest('hex');
     const confirmedAt = Date.now();
 
-    // ── Record confirmed transaction ───────────────────────────────────────
-    this._db.insertTransaction({
-      tx_id, tx_hash: txHash, from_id, to_id, amount_seeds,
-      memo: memo || '', status: 'confirmed', confirmed_at: confirmedAt,
-      created_at: timestamp || confirmedAt,
+    const res = await this._db.ledger.commitOwnerOp({
+      kind:    'transfer',
+      op_id:   `tx:${from_id}:${tx_id}`,          // scoped per sender: another citizen's tx_id can't collide
+      owner:   { acct: from_id, nonce: tx_nonce },
+      moves:   [{ acct: from_id, d: -totalCost }, { acct: to_id, d: amount_seeds }],
+      pools:   feeSeeds > 0 ? [{ pool: 'witness_operator', d: feeSeeds }] : [],
+      tx_record: { tx_id, tx_hash: txHash, from_id, to_id, amount_seeds, memo: memo || '',
+                   confirmed_at: confirmedAt, created_at: timestamp || confirmedAt },
+      transfer: { tx_id, tx_hash: txHash, from_id, to_id, amount_seeds, fee_seeds: feeSeeds,
+                  memo: memo || '', confirmed_at: confirmedAt },
+      signed_tx: msg,
     });
+    if (!res.ok) {
+      gateway.push(ws._sovereignId, MSG_TYPE.SOV_TRANSFER_RESULT, {
+        tx_id, success: false, error: res.error,
+        ...(res.expected_nonce != null ? { expected_nonce: res.expected_nonce } : {}),
+      });
+      return;
+    }
 
     // Record automated-wallet spend for the rolling 24h daily-cap window.
     if (autoPol && autoPol.enabled) {
       try { this._db.recordAutomationSpend(from_id, amount_seeds); } catch (_) {}
     }
-
-    // Update sender nonce
-    this._db._db.prepare(
-      'UPDATE sov_disc SET nonce = ? WHERE sovereign_id = ?'
-    ).run(tx_nonce, from_id);
-
-    // Release spend lock
-    this._db.releaseSpendLock(from_id, tx_nonce);
-
-    // ── Notify parties ─────────────────────────────────────────────────────
-
-    // Read sender's new balance to return it in the response
-    const newSenderDisc = this._db.readDisc(from_id);
-    const newBalanceSender = newSenderDisc ? newSenderDisc.balance_seeds : 0;
-
-    // Build notification closures so we can fire them now or defer them
-    const notifySender = () => {
-      gateway.push(from_id, MSG_TYPE.SOV_TRANSFER_RESULT, {
-        tx_id,
-        tx_hash:            txHash,
-        success:            true,
-        confirmed_at:       confirmedAt,
-        fee_seeds:          feeSeeeds,
-        new_balance_sender: newBalanceSender,
-      });
-    };
-
-    // IMPORTANT: 'amount' (float SOV) is required by Flutter's _handleTransferReceived.
-    // Flutter reads msg['amount'], converts to seeds, and guards against amountSeeds <= 0.
-    // Without the 'amount' field the guard exits silently and the recipient sees nothing.
-    const notifyRecipient = () => {
-      const recipientNotified = gateway.push(to_id, MSG_TYPE.SOV_TRANSFER_RECEIVED, {
-        tx_id,
-        tx_hash:       txHash,
-        from_id,
-        amount:        amount_seeds / 1_000_000,   // float SOV — Flutter primary field
-        amount_seeds,                               // seeds — for precision / backward compat
-        memo:          memo || '',
-        confirmed_at:  confirmedAt,
-      });
-
-      // If recipient is on a different node, forward via peer mesh
-      if (!recipientNotified) {
-        const presence = this._db.getCitizenPresence(to_id);
-        if (presence && presence.node_id !== this._identity.nodeId) {
-          this._peerMesh.sendTo(presence.node_id, 'CITIZEN_MESSAGE_FORWARD', {
-            to: to_id,
-            type: MSG_TYPE.SOV_TRANSFER_RECEIVED,
-            payload: {
-              tx_id, tx_hash: txHash, from_id,
-              amount:      amount_seeds / 1_000_000,
-              amount_seeds,
-              memo: memo || '', confirmed_at: confirmedAt,
-            },
-          });
-        } else {
-          // Recipient offline — queue
-          this._db.queuePendingMessage(to_id, MSG_TYPE.SOV_TRANSFER_RECEIVED, {
-            tx_id, tx_hash: txHash, from_id,
-            amount:      amount_seeds / 1_000_000,
-            amount_seeds,
-            memo: memo || '', confirmed_at: confirmedAt,
-          });
-        }
-      }
-    };
-
-    // ── Mark payment request paid (if this transfer fulfilled one) ────────
     if (payment_request_id && this._financialEngine) {
       this._financialEngine.markPaymentRequestPaid(payment_request_id, from_id);
     }
 
-    // ── Broadcast confirmed tx to peers FIRST (start replication immediately) ─
-    // C5b fix: carry the citizen's original SIGNED transfer envelope so every peer
-    // can independently verify the signature against the sender's enrolled key
-    // before applying balance changes (see _handleTxConfirmedRelay).
-    this._peerMesh.broadcast('TX_CONFIRMED_RELAY', {
-      tx_id, tx_hash: txHash, from_id, to_id, amount_seeds, fee_seeds: feeSeeeds,
-      memo: memo || '', confirmed_at: confirmedAt, nonce: tx_nonce,
-      signed_tx: msg,
+    const newSenderDisc = this._db.readDisc(from_id);
+    gateway.push(from_id, MSG_TYPE.SOV_TRANSFER_RESULT, {
+      tx_id, tx_hash: txHash, success: true, confirmed_at: confirmedAt,
+      fee_seeds: feeSeeds, new_balance_sender: newSenderDisc ? newSenderDisc.balance_seeds : 0,
     });
-
-    // Broadcast nonce update so peers reject replays
-    this._peerMesh.broadcast('NONCE_UPDATE', {
-      sovereign_id: from_id, nonce: tx_nonce, tx_id,
-    });
-
-    // ── Peer-enforce confirmation rule ─────────────────────────────────────
-    // When BOTH citizens are connected to THIS node AND peers exist, defer
-    // notifying parties until at least one peer ACKs the sync. This ensures
-    // the tx is on at least 2 nodes before citizens are told it succeeded.
-    // Fallback timer fires after PEER_CONFIRM_TIMEOUT_MS regardless.
-    //
-    // When either citizen is NOT on this node (or no peers), notify immediately
-    // — they won't get the notification any other way.
-    const bothLocal   = gateway.isConnected(from_id) && gateway.isConnected(to_id);
-    const hasPeers    = this._peerMesh.activePeers().length > 0;
-    const peerEnforce = bothLocal && hasPeers;
-
-    if (peerEnforce) {
-      // Defer — wait for a peer TX_CONFIRM_ACK (or 2s fallback)
-      global.sovLog && global.sovLog.debug(
-        `[TRANSFER] peer-enforce active for ${txHash.slice(0,12)} — awaiting peer ACK`
-      );
-      const timer = setTimeout(() => {
-        if (this._pendingNotifications.has(txHash)) {
-          this._pendingNotifications.delete(txHash);
-          global.sovLog && global.sovLog.debug(
-            `[TRANSFER] peer-enforce fallback fired for ${txHash.slice(0,12)} — notifying parties`
-          );
-          notifySender();
-          notifyRecipient();
-        }
-      }, PEER_CONFIRM_TIMEOUT_MS);
-
-      this._pendingNotifications.set(txHash, { notifySender, notifyRecipient, timer });
-    } else {
-      // Notify immediately — cross-node transfer or isolated node
-      notifySender();
-      notifyRecipient();
-    }
+    this._notifyRecipient(res.op.transfer);
   }
 
-  // ── Spend lock quorum ─────────────────────────────────────────────────────
-
-  _requestSpendLockQuorum(txId, fromId, nonce) {
-    return new Promise((resolve) => {
-      const peers     = this._peerMesh.activePeers();
-      if (peers.length === 0) {
-        // No peers — we are the sole authority
-        resolve(true);
-        return;
-      }
-
-      let granted  = 0;
-      let denied   = 0;
-      let responded = 0;
-
-      const waiter = {
-        resolve: () => resolve(true),
-        deny:    () => resolve(false),
-        timer:   setTimeout(() => {
-          // Timeout — majority not heard from. Accept if no denials.
-          this._lockWaiters.delete(txId);
-          resolve(denied === 0);
-        }, QUORUM_TIMEOUT_MS),
-      };
-      this._lockWaiters.set(txId, { waiter, denied: () => denied++, granted: () => granted++ });
-
-      this._peerMesh.broadcast('SPEND_LOCK_CLAIM', {
-        tx_id: txId,
-        from_id: fromId,
-        nonce,
-        node_id: this._identity.nodeId,
-      });
+  // Tell the recipient, if they are on THIS node (each node does this when the op applies
+  // there, so a recipient on another node hears it from their own node).
+  _notifyRecipient(t) {
+    if (!t || !this._gateway) return;
+    // IMPORTANT: 'amount' (float SOV) is required by Flutter's _handleTransferReceived.
+    this._gateway.deliverOrQueue(t.to_id, MSG_TYPE.SOV_TRANSFER_RECEIVED, {
+      tx_id: t.tx_id, tx_hash: t.tx_hash, from_id: t.from_id,
+      amount: t.amount_seeds / 1_000_000, amount_seeds: t.amount_seeds,
+      memo: t.memo || '', confirmed_at: t.confirmed_at,
     });
   }
 
-  _handlePeerLockClaim(msg) {
-    const { tx_id, from_id, nonce, node_id } = msg;
-    // Try to acquire the same lock locally
-    const acquired = this._db.acquireSpendLock(from_id, nonce, tx_id);
-
-    if (acquired) {
-      this._peerMesh.sendTo(node_id, 'SPEND_LOCK_GRANT', {
-        tx_id, granted_by: this._identity.nodeId,
-      });
-    } else {
-      // Tiebreaker — smaller tx_id wins
-      const existingLock = this._db._db.prepare(
-        'SELECT tx_id FROM sov_spend_locks WHERE lock_key = ?'
-      ).get(`${from_id}:${nonce}`);
-
-      if (existingLock && existingLock.tx_id < tx_id) {
-        // Our tx takes priority
-        this._peerMesh.sendTo(node_id, 'SPEND_LOCK_DENY', {
-          tx_id, denied_by: this._identity.nodeId,
-        });
+  // Peer-side check of a transfer op before it is granted a slot or applied: the op must
+  // be exactly the citizen's signed transfer (from/to/amount/nonce), and in 'reject' mode
+  // the signature must verify under the citizen's enrolled key.
+  _validateTransferOp(op) {
+    const t = op.transfer, env = op.signed_tx;
+    if (!t || !op.owner || op.owner.acct !== t.from_id) return 'MALFORMED_TRANSFER_OP';
+    const m = op.moves || [];
+    if (m.length !== 2 || m[0].acct !== t.from_id || m[1].acct !== t.to_id ||
+        m[1].d !== t.amount_seeds || m[0].d !== -(t.amount_seeds + (t.fee_seeds | 0))) return 'TRANSFER_OP_MOVES_MISMATCH';
+    const mode = this._getGovParam ? String(this._getGovParam('tx_signature_enforce', 'reject')) : 'reject';
+    let ok = false, reason = 'NO_SIGNED_ENVELOPE';
+    if (env && typeof env === 'object') {
+      const f = env.from_sovereign_id || env.from_id, to = env.to_sovereign_id || env.to_id;
+      const n = env.tx_nonce != null ? env.tx_nonce : env.nonce;
+      if (f !== t.from_id || to !== t.to_id || Number(env.amount_seeds) !== Number(t.amount_seeds) || Number(n) !== Number(op.owner.nonce)) {
+        reason = 'ENVELOPE_FIELD_MISMATCH';
       } else {
-        // Their tx takes priority — release ours, grant theirs
-        this._db.releaseSpendLock(from_id, nonce);
-        this._db.acquireSpendLock(from_id, nonce, tx_id);
-        this._peerMesh.sendTo(node_id, 'SPEND_LOCK_GRANT', {
-          tx_id, granted_by: this._identity.nodeId,
-        });
+        const enr = this._db.getEnrollment(t.from_id);
+        if (!enr || !enr.public_key_hex) reason = 'SENDER_NOT_ENROLLED_LOCALLY';
+        else { const v = this._verifyTransferSig(t.from_id, enr.public_key_hex, env); ok = v.valid; reason = v.reason; }
       }
     }
-  }
-
-  _handlePeerLockGrant(msg) {
-    const waiterEntry = this._lockWaiters.get(msg.tx_id);
-    if (waiterEntry) waiterEntry.granted();
-  }
-
-  _handlePeerLockDeny(msg) {
-    const waiterEntry = this._lockWaiters.get(msg.tx_id);
-    if (waiterEntry) {
-      waiterEntry.denied();
-      // Immediately resolve false on any denial
-      this._lockWaiters.delete(msg.tx_id);
-      clearTimeout(waiterEntry.waiter.timer);
-      waiterEntry.waiter.deny();
+    if (!ok) {
+      global.sovLog.warn(`[TX-SIG] peer check tx=${String(t.tx_id).slice(0, 16)} reason=${reason} mode=${mode}`);
+      if (mode === 'reject') return 'UNVERIFIED_SIGNATURE:' + reason;
     }
-  }
-
-  // ── Cross-node sync ────────────────────────────────────────────────────────
-
-  _handleTxConfirmedRelay(msg) {
-    // Peer confirmed a transaction — sync our ledger and notify recipient if connected here.
-    //
-    // This runs on every peer node that was NOT the confirming node.
-    // It must:
-    //   1. Apply the balance changes to the local disc copy (all nodes hold ALL balances)
-    //   2. Queue SOV_TRANSFER_RECEIVED for the recipient if they're offline here
-    //   3. Deliver SOV_TRANSFER_RECEIVED immediately if the recipient is already connected
-    //   4. Send TX_CONFIRM_ACK back to origin so it can fire deferred notifications
-    //
-    const { tx_id, tx_hash, from_id, to_id, amount_seeds, fee_seeds, confirmed_at, nonce } = msg;
-    const memo = msg.memo || '';
-
-    // Idempotency check — if we already have this tx, skip balance update
-    // (avoids double-crediting when originating node broadcasts back to itself)
-    if (this._db.hasTransaction(tx_hash)) {
-      this._handleNonceUpdate({ sovereign_id: from_id, nonce });
-      // Still ACK — the origin may be waiting for deferred notifications
-      this._peerMesh.broadcast('TX_CONFIRM_ACK', { tx_hash });
-      return;
-    }
-
-    // ── C5b FIX (2026-08-05): verify the citizen's signature on the relayed
-    // transfer against their ENROLLED key BEFORE applying any balance change.
-    // Without this, any mesh node could broadcast a forged TX_CONFIRMED_RELAY and
-    // every peer would debit/credit blindly. The signed envelope must also describe
-    // THIS transfer (from/to/amount/nonce) so a valid signature can't be replayed
-    // over different fields. In 'reject' mode an unverified relay is refused.
-    const _sigMode = this._getGovParam
-      ? String(this._getGovParam('tx_signature_enforce', 'reject')) : 'reject';
-    const _env = msg.signed_tx;
-    let _sigOk = false, _sigReason = 'NO_SIGNED_ENVELOPE';
-    if (_env && typeof _env === 'object') {
-      const _envFrom  = _env.from_sovereign_id || _env.from_id;
-      const _envTo    = _env.to_sovereign_id   || _env.to_id;
-      const _envNonce = (_env.tx_nonce != null) ? _env.tx_nonce : _env.nonce;
-      const _match = _envFrom === from_id && _envTo === to_id &&
-        Number(_env.amount_seeds) === Number(amount_seeds) && Number(_envNonce) === Number(nonce);
-      if (!_match) {
-        _sigReason = 'ENVELOPE_FIELD_MISMATCH';
-      } else {
-        const _enr = this._db.getEnrollment(from_id);
-        if (!_enr || !_enr.public_key_hex) {
-          _sigReason = 'SENDER_NOT_ENROLLED_LOCALLY';
-        } else {
-          const _v = this._verifyTransferSig(from_id, _enr.public_key_hex, _env);
-          _sigOk = _v.valid; _sigReason = _v.reason;
-        }
-      }
-    }
-    if (!_sigOk) {
-      global.sovLog.warn(
-        `[TX-RELAY] unverified relay tx=${String(tx_id).slice(0, 16)} from=${String(from_id).slice(0, 16)} ` +
-        `reason=${_sigReason} mode=${_sigMode}`);
-      if (_sigMode === 'reject') {
-        // Refuse to apply an unverified balance change from a peer. The correct
-        // ledger reaches us either from a fixed origin (with signed_tx) or via the
-        // normal convergence path — never from an unproven peer assertion.
-        return;
-      }
-    }
-
-    // Insert transaction record
-    try {
-      this._db.insertTransaction({
-        tx_id, tx_hash, from_id, to_id, amount_seeds,
-        memo, status: 'confirmed', confirmed_at,
-        created_at: confirmed_at,
-      });
-    } catch (_) {}
-
-    // ── Apply balance changes to our local disc copy ──────────────────────
-    // Deduct from sender
-    for (let attempt = 0; attempt < MAX_VERSION_RETRIES; attempt++) {
-      const fresh = this._db.readDisc(from_id);
-      if (!fresh || fresh.balance_seeds < (amount_seeds + (fee_seeds || 0))) break;
-      const ok = this._db.writeDiscGuarded(
-        from_id,
-        fresh.balance_seeds - (amount_seeds + (fee_seeds || 0)),
-        Math.max(0, fresh.spendable_seeds - (amount_seeds + (fee_seeds || 0))),
-        fresh.version
-      );
-      if (ok) break;
-    }
-
-    // Credit recipient
-    this._db.ensureDiscEntry(to_id);
-    for (let attempt = 0; attempt < MAX_VERSION_RETRIES; attempt++) {
-      const recipDisc = this._db.readDisc(to_id);
-      if (!recipDisc) break;
-      const ok = this._db.writeDiscGuarded(
-        to_id,
-        recipDisc.balance_seeds + amount_seeds,
-        recipDisc.spendable_seeds + amount_seeds,
-        recipDisc.version
-      );
-      if (ok) break;
-    }
-
-    // H2 FIX (2026-08-05): DO NOT re-credit the fee to the pool here. The
-    // originating node already ran addToPool('witness_operator', fee) once
-    // (handleTransfer), which broadcasts a POOL_DELTA that every peer applies — so
-    // the fee is already replicated to this node's pool. The old line below added it
-    // a SECOND time on every peer, inflating the operator reserve by ~N× the real
-    // fees (measured 0.4 SOV pool growth for a 0.1 SOV fee on 3 nodes) → operator
-    // over-payout. Mirrors the PI-13 enrollment-reward de-duplication.
-    // (removed) if (fee_seeds > 0 && this._db.addToPool) this._db.addToPool('witness_operator', fee_seeds);
-
-    // ── Notify recipient on this node ─────────────────────────────────────
-    const transferPayload = {
-      tx_id, tx_hash, from_id,
-      amount:      amount_seeds / 1_000_000,   // float SOV — Flutter primary field
-      amount_seeds,
-      memo, confirmed_at,
-    };
-    if (this._gateway) {
-      // deliverOrQueue: sends immediately if connected, queues for reconnect if offline
-      this._gateway.deliverOrQueue(to_id, MSG_TYPE.SOV_TRANSFER_RECEIVED, transferPayload);
-    }
-
-    // Update nonce
-    this._handleNonceUpdate({ sovereign_id: from_id, nonce });
-
-    // ── ACK back to origin node so it can fire deferred notifications ─────
-    // This is the signal the peer-enforce rule waits for: the tx is safely
-    // replicated on this node — the origin can now tell both parties.
-    this._peerMesh.broadcast('TX_CONFIRM_ACK', { tx_hash });
-  }
-
-  // ── Peer-enforce: handle ACK from a peer ──────────────────────────────────
-
-  _handleTxConfirmAck(msg) {
-    const { tx_hash } = msg;
-    const pending = this._pendingNotifications.get(tx_hash);
-    if (!pending) return; // Already fired (fallback timer beat us) or not a deferred tx
-
-    // Cancel the fallback timer and fire notifications now
-    clearTimeout(pending.timer);
-    this._pendingNotifications.delete(tx_hash);
-
-    global.sovLog && global.sovLog.debug(
-      `[TRANSFER] peer ACK received for ${tx_hash.slice(0,12)} — notifying parties`
-    );
-
-    pending.notifySender();
-    pending.notifyRecipient();
-  }
-
-  _handleNonceUpdate(msg) {
-    const { sovereign_id, nonce } = msg;
-    const disc = this._db.readDisc(sovereign_id);
-    if (disc && nonce > disc.nonce) {
-      this._db._db.prepare(
-        'UPDATE sov_disc SET nonce = ? WHERE sovereign_id = ? AND nonce < ?'
-      ).run(nonce, sovereign_id, nonce);
-    }
+    return null;
   }
 
   // ══════════════════════════════════════════════════════════════════════════

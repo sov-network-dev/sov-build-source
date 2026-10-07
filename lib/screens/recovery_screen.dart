@@ -773,7 +773,7 @@ class _RecoveryScreenState extends State<RecoveryScreen>
                   icon: Icons.group_rounded,
                   title: 'Guardian Recovery',
                   subtitle:
-                      'Contact 2 of your 3 guardians. They approve your recovery '
+                      'Contact your guardians: 2 approvals are needed. They approve your recovery '
                       'request using their wallets. Use as last resort.',
                   badge: 'Last Resort',
                   badgeColor: Colors.orange,
@@ -1919,7 +1919,7 @@ class _RecoveryScreenState extends State<RecoveryScreen>
                   fontWeight: FontWeight.bold)),
           const SizedBox(height: 16),
           const Text(
-            'Share this Recovery Code with 2 of your 3 guardians. '
+            'Share this Recovery Code with your guardians: 2 must approve. '
             'Ask them to approve your recovery request from their app.',
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.white54, fontSize: 14, height: 1.5),

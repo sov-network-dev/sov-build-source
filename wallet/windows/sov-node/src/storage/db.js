@@ -365,10 +365,14 @@ class NodeDB {
       const _av = this._db.pragma('auto_vacuum', { simple: true });
       if (_av !== 2) { this._db.exec('VACUUM'); }
     } catch (_) {}
-    this._db.pragma('synchronous = NORMAL');  // Safe + fast (not paranoid)
+    // FULL, not NORMAL (1.4.90): a spend grant must survive power loss, not just a process
+    // crash — a node that forgets a grant after a reboot could grant a conflicting payment
+    // for the same (account, nonce), which is the one thing the ledger rule forbids.
+    this._db.pragma('synchronous = FULL');
     this._db.pragma('foreign_keys = ON');
     this._db.pragma('cache_size = -32000');   // 32MB cache
     this._initSchema();
+    this._initLedgerTables();
     this._initSupplyPools();
     global.sovLog.info(`      Node database: ${DB_FILE} (AES-256 encrypted)`);
   }
@@ -1378,6 +1382,351 @@ class NodeDB {
     return row ? row.x25519_pub_hex : null;
   }
 
+  // ── LEDGER (1.4.90) — docs/ledger/LEDGER_SAFETY_1.4.90_PLAN.md ─────────────
+  // Every balance change is an OP: { op_id, origin_node, seq, kind, ref,
+  //   owner: {acct, nonce} | null,   — set when a citizen spends their own funds
+  //   moves: [{acct, d}],            — wallet deltas (seeds)
+  //   holds: [{id, d}],              — escrow / vault / bond holdings
+  //   pools: [{pool, d}] }           — pool side, applied by EVERY node with the op (ledger ops
+  //                                    emit no POOL_DELTA: two nodes committing the same system
+  //                                    op id must not charge a pool twice)
+  // An op is applied atomically and at most once on every node (op_id unique), never
+  // partially: no credit without its debit. Origin checks conservation:
+  //   Σ moves + Σ holds + Σ pools = 0  — a code path that would mint cannot commit.
+  // Owner ops also take a majority-granted (acct, nonce) slot; every node grants at
+  // most one op_id per slot, so two spends of the same money can never both commit.
+
+  _initLedgerTables() {
+    this._db.exec(`
+      CREATE TABLE IF NOT EXISTS sov_ledger_ops (
+        op_id        TEXT PRIMARY KEY,
+        origin_node  TEXT    NOT NULL,
+        seq          INTEGER NOT NULL,
+        kind         TEXT    NOT NULL,
+        owner_acct   TEXT,
+        owner_nonce  INTEGER,
+        op_json      TEXT    NOT NULL,
+        applied_at   INTEGER NOT NULL,
+        UNIQUE (origin_node, seq)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_ledger_owner_slot
+        ON sov_ledger_ops (owner_acct, owner_nonce) WHERE owner_acct IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS sov_holdings (
+        holding_id    TEXT PRIMARY KEY,          -- 'escrow:<order>', 'vault:<id>', 'bond:<case>' ...
+        balance_seeds INTEGER NOT NULL DEFAULT 0,
+        updated_at    INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS sov_spend_votes (
+        from_id     TEXT    NOT NULL,
+        nonce       INTEGER NOT NULL,
+        origin_node TEXT    NOT NULL,            -- the node this grant was given TO
+        op_id       TEXT    NOT NULL,
+        released    INTEGER NOT NULL DEFAULT 0,  -- 1 = released by its origin, or slot committed
+        voted_at    INTEGER NOT NULL,
+        PRIMARY KEY (from_id, nonce, origin_node)
+      );
+      CREATE TABLE IF NOT EXISTS sov_ledger_aborted (
+        from_id     TEXT    NOT NULL,
+        nonce       INTEGER NOT NULL,
+        op_id       TEXT    NOT NULL,
+        origin_node TEXT    NOT NULL,
+        aborted_at  INTEGER NOT NULL,
+        PRIMARY KEY (from_id, nonce, op_id)
+      );
+      CREATE TABLE IF NOT EXISTS sov_ledger_hold (
+        op_id   TEXT PRIMARY KEY,
+        op_json TEXT    NOT NULL,
+        reason  TEXT    NOT NULL,
+        held_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS sov_ledger_alias (
+        origin_node TEXT    NOT NULL,              -- a second origin committed an op id we already hold
+        seq         INTEGER NOT NULL,
+        op_id       TEXT    NOT NULL,
+        PRIMARY KEY (origin_node, seq)
+      );
+      CREATE TABLE IF NOT EXISTS sov_ledger_meta (
+        k TEXT PRIMARY KEY,
+        v TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS sov_validator_seen (
+        node_id     TEXT PRIMARY KEY,
+        admitted_at INTEGER NOT NULL      -- last time this peer PASSED admission (not mere gossip)
+      );
+    `);
+  }
+
+  recordValidatorSeen(nodeId) {
+    this._db.prepare('INSERT INTO sov_validator_seen (node_id, admitted_at) VALUES (?, ?) ON CONFLICT(node_id) DO UPDATE SET admitted_at = excluded.admitted_at')
+      .run(nodeId, Date.now());
+  }
+
+  validatorsSeenSince(sinceMs, selfId) {
+    return this._db.prepare('SELECT COUNT(*) AS c FROM sov_validator_seen WHERE admitted_at >= ? AND node_id != ?').get(sinceMs, selfId || '').c;
+  }
+
+  ledgerHasOp(opId) {
+    return !!this._db.prepare('SELECT 1 FROM sov_ledger_ops WHERE op_id = ?').get(opId);
+  }
+
+  ledgerSlot(acct, nonce) {
+    return this._db.prepare('SELECT op_id FROM sov_ledger_ops WHERE owner_acct = ? AND owner_nonce = ?').get(acct, nonce);
+  }
+
+  holdingBalance(id) {
+    const r = this._db.prepare('SELECT balance_seeds FROM sov_holdings WHERE holding_id = ?').get(id);
+    return r ? r.balance_seeds : 0;
+  }
+
+  totalHoldings() {
+    // Called by the supply check, which also runs during schema set-up — before the ledger
+    // tables exist on a brand-new database. No table yet = no holdings yet.
+    try { return this._db.prepare('SELECT COALESCE(SUM(balance_seeds), 0) AS t FROM sov_holdings').get().t || 0; }
+    catch (_) { return 0; }
+  }
+
+  // ── Slot voting (owner ops) ──
+  ledgerVote(acct, nonce, opId, originNode) {
+    const tx = this._db.transaction(() => {
+      const committed = this.ledgerSlot(acct, nonce);
+      if (committed) {
+        return committed.op_id === opId ? { granted: true, already_committed: true }
+                                        : { granted: false, reason: 'SLOT_COMMITTED', committed_nonce: nonce };
+      }
+      const disc = this.readDisc(acct);
+      if (!disc) return { granted: false, reason: 'UNKNOWN_ACCOUNT', committed_nonce: -1 };
+      if (disc.nonce !== nonce - 1) {
+        return { granted: false, reason: disc.nonce >= nonce ? 'NONCE_USED' : 'NONCE_BEHIND', committed_nonce: disc.nonce };
+      }
+      if (this._db.prepare('SELECT 1 FROM sov_ledger_aborted WHERE from_id = ? AND nonce = ? AND op_id = ?').get(acct, nonce, opId)) {
+        return { granted: false, reason: 'OP_ABORTED', committed_nonce: disc.nonce };
+      }
+      const other = this._db.prepare(
+        'SELECT op_id FROM sov_spend_votes WHERE from_id = ? AND nonce = ? AND released = 0 AND op_id != ? LIMIT 1'
+      ).get(acct, nonce, opId);
+      if (other) return { granted: false, reason: 'SLOT_GRANTED_TO_OTHER_OP', committed_nonce: disc.nonce };
+      this._db.prepare(`
+        INSERT INTO sov_spend_votes (from_id, nonce, origin_node, op_id, released, voted_at) VALUES (?, ?, ?, ?, 0, ?)
+        ON CONFLICT(from_id, nonce, origin_node) DO UPDATE SET op_id = excluded.op_id, released = 0, voted_at = excluded.voted_at
+      `).run(acct, nonce, originNode, opId, Date.now());
+      return { granted: true };
+    });
+    return tx();
+  }
+
+  // Only the origin that collected grants may release them, after durably marking the op
+  // aborted (an aborted op can never be committed afterwards).
+  ledgerAbort(acct, nonce, opId, originNode) {
+    const tx = this._db.transaction(() => {
+      if (this.ledgerHasOp(opId)) return false;
+      this._db.prepare('INSERT OR IGNORE INTO sov_ledger_aborted (from_id, nonce, op_id, origin_node, aborted_at) VALUES (?,?,?,?,?)')
+        .run(acct, nonce, opId, originNode, Date.now());
+      this.ledgerRelease(acct, nonce, opId, originNode);
+      return true;
+    });
+    return tx();
+  }
+
+  ledgerIsAborted(opId) {
+    return !!this._db.prepare('SELECT 1 FROM sov_ledger_aborted WHERE op_id = ?').get(opId);
+  }
+
+  ledgerRelease(acct, nonce, opId, originNode) {
+    this._db.prepare('UPDATE sov_spend_votes SET released = 1 WHERE from_id = ? AND nonce = ? AND op_id = ? AND origin_node = ?')
+      .run(acct, nonce, opId, originNode);
+  }
+
+  ledgerOwnUncommittedVotes(originNode) {
+    return this._db.prepare(`
+      SELECT v.from_id, v.nonce, v.op_id FROM sov_spend_votes v
+      WHERE v.origin_node = ? AND v.released = 0
+        AND NOT EXISTS (SELECT 1 FROM sov_ledger_ops o WHERE o.op_id = v.op_id)
+    `).all(originNode);
+  }
+
+  ledgerRecentAborts(originNode, sinceMs) {
+    return this._db.prepare('SELECT from_id, nonce, op_id FROM sov_ledger_aborted WHERE origin_node = ? AND aborted_at >= ?')
+      .all(originNode, sinceMs);
+  }
+
+  // ── Apply ──
+  // Returns 'applied' | 'duplicate' | 'conflict' | 'stale' | 'gap' | 'insufficient' | 'unknown_account' | 'error'.
+  // `asOrigin` = this node is committing it: it also applies the pool side (which reaches peers
+  // through POOL_DELTA) and checks the pools can cover it.
+  ledgerApply(op, asOrigin = false) {
+    const moves = op.moves || [], holds = op.holds || [], pools = op.pools || [];
+    const sum = [...moves, ...holds, ...pools].reduce((s, m) => s + Math.trunc(m.d || 0), 0);
+    // The ONE op allowed to be unbalanced: adopting a pre-1.4.90 order's escrow, which the
+    // seller already paid but which sat in no account (D19). Exactly one holding, created once.
+    const adopt = op.kind === 'escrow_adopt' || op.kind === 'holding_adopt';
+    if (adopt && (moves.length || pools.length || holds.length !== 1 || !(holds[0].d > 0) ||
+                  !/^(escrow|vault|bond):/.test(String(holds[0].id)))) {
+      global.sovLog && global.sovLog.error(`[LEDGER] REFUSED malformed escrow_adopt ${op.op_id}`);
+      return 'error';
+    }
+    if (adopt && this.holdingBalance(holds[0].id) !== 0) return 'duplicate';
+    // A BASELINE op states an account's pre-1.4.90 balance and nonce (recorded once, at the
+    // upgrade, by every node that already held them). A node that did not hold them — a later
+    // joiner — ADDS the balance (sync never writes balances, so any money there came from ops,
+    // which are deltas on top of the baseline) and raises the nonce to it.
+    const baseline = op.kind === 'baseline';
+    if (baseline && (moves.length !== 1 || !(moves[0].d >= 0) || holds.length || pools.length ||
+                     !Number.isInteger(op.baseline_nonce))) {
+      global.sovLog && global.sovLog.error(`[LEDGER] REFUSED malformed baseline ${op.op_id}`);
+      return 'error';
+    }
+    if (!adopt && !baseline && sum !== 0) {
+      global.sovLog && global.sovLog.error(`[LEDGER] REFUSED op ${op.op_id} (${op.kind}): not conserved, sum = ${sum} seeds`);
+      return 'error';
+    }
+    const now = Date.now();
+    const tx = this._db.transaction(() => {
+      if (this.ledgerHasOp(op.op_id)) {
+        // Same op committed by a second origin (a system op both nodes decided): apply nothing,
+        // but remember its (origin, seq) so the digest stops asking for it.
+        if (op.origin_node && op.seq != null) {
+          this._db.prepare('INSERT OR IGNORE INTO sov_ledger_alias (origin_node, seq, op_id) VALUES (?, ?, ?)')
+            .run(op.origin_node, op.seq, op.op_id);
+        }
+        return 'duplicate';
+      }
+      if (op.owner) {
+        if (this.ledgerSlot(op.owner.acct, op.owner.nonce)) return 'conflict';
+        const od = this.readDisc(op.owner.acct);
+        if (!od) return 'unknown_account';
+        if (od.nonce >= op.owner.nonce) return 'stale';
+        if (od.nonce < op.owner.nonce - 1) return 'gap';
+      }
+      for (const m of moves) {
+        if (m.d < 0) {
+          const d = this.readDisc(m.acct);
+          if (!d) return 'unknown_account';
+          if (d.balance_seeds < -m.d || d.spendable_seeds < -m.d) return 'insufficient';
+        }
+      }
+      for (const h of holds) {
+        if (h.d < 0 && this.holdingBalance(h.id) < -h.d) return 'insufficient';
+      }
+      for (const p of pools) {
+        if (p.d < 0) {
+          const row = this._db.prepare('SELECT remaining_seeds FROM sov_supply_pools WHERE pool_id = ?').get(p.pool);
+          if (!row || row.remaining_seeds < -p.d) return 'insufficient';
+        }
+      }
+      if (baseline) {
+        const acct = moves[0].acct;
+        this.ensureDiscEntry(acct);
+        this._db.prepare(`
+          UPDATE sov_disc SET balance_seeds = balance_seeds + ?, spendable_seeds = spendable_seeds + ?,
+                 nonce = MAX(nonce, ?), version = version + 1, updated_at = ? WHERE sovereign_id = ?
+        `).run(moves[0].d, moves[0].d, op.baseline_nonce, now, acct);
+        this._db.prepare(`INSERT INTO sov_ledger_ops (op_id, origin_node, seq, kind, owner_acct, owner_nonce, op_json, applied_at)
+                          VALUES (?, ?, ?, 'baseline', NULL, NULL, ?, ?)`).run(op.op_id, op.origin_node, op.seq, JSON.stringify(op), now);
+        return 'applied';
+      }
+      for (const m of moves) {
+        if (!m.d) continue;
+        if (m.d > 0) this.ensureDiscEntry(m.acct);
+        const r = this._db.prepare(`
+          UPDATE sov_disc SET balance_seeds = balance_seeds + ?, spendable_seeds = spendable_seeds + ?,
+                 version = version + 1, updated_at = ? WHERE sovereign_id = ?
+        `).run(m.d, m.d, now, m.acct);
+        if (r.changes !== 1) throw new Error('LEDGER_MOVE_NO_ROW ' + m.acct);
+      }
+      if (op.owner) {
+        const r = this._db.prepare('UPDATE sov_disc SET nonce = ? WHERE sovereign_id = ? AND nonce = ?')
+          .run(op.owner.nonce, op.owner.acct, op.owner.nonce - 1);
+        if (r.changes !== 1) throw new Error('LEDGER_NONCE_RACE');
+        this._db.prepare('UPDATE sov_spend_votes SET released = 1 WHERE from_id = ? AND nonce <= ?').run(op.owner.acct, op.owner.nonce);
+      }
+      for (const h of holds) {
+        if (!h.d) continue;
+        this._db.prepare(`
+          INSERT INTO sov_holdings (holding_id, balance_seeds, updated_at) VALUES (?, ?, ?)
+          ON CONFLICT(holding_id) DO UPDATE SET balance_seeds = balance_seeds + excluded.balance_seeds, updated_at = excluded.updated_at
+        `).run(h.id, h.d, now);
+      }
+      for (const p of pools) {
+        if (!p.d) continue;
+        const r = p.d < 0
+          ? this._db.prepare('UPDATE sov_supply_pools SET remaining_seeds = remaining_seeds - ?, distributed_seeds = distributed_seeds + ?, updated_at = ? WHERE pool_id = ?')
+              .run(-p.d, -p.d, now, p.pool)
+          : this._db.prepare('UPDATE sov_supply_pools SET remaining_seeds = remaining_seeds + ?, updated_at = ? WHERE pool_id = ?')
+              .run(p.d, now, p.pool);
+        if (r.changes !== 1) throw new Error('LEDGER_UNKNOWN_POOL ' + p.pool);
+        if (p.d > 0) { try { this.recordPoolInflow(p.pool, p.d); } catch (_) {} }   // fee history, as addToPool did
+      }
+      if (op.tx_record) {          // transfer history row (display only)
+        const t = op.tx_record;
+        this._db.prepare(`
+          INSERT OR IGNORE INTO sov_transactions (tx_id, tx_hash, from_id, to_id, amount_seeds, memo, status, confirmed_at, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, 'confirmed', ?, ?)
+        `).run(t.tx_id, t.tx_hash, t.from_id, t.to_id, t.amount_seeds, t.memo || '', t.confirmed_at, t.created_at);
+      }
+      this._db.prepare(`
+        INSERT INTO sov_ledger_ops (op_id, origin_node, seq, kind, owner_acct, owner_nonce, op_json, applied_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(op.op_id, op.origin_node, op.seq, op.kind, op.owner ? op.owner.acct : null,
+             op.owner ? op.owner.nonce : null, JSON.stringify(op), now);
+      this._db.prepare('DELETE FROM sov_ledger_hold WHERE op_id = ?').run(op.op_id);
+      return 'applied';
+    });
+    try { return tx(); }
+    catch (e) { global.sovLog && global.sovLog.error(`[LEDGER] apply ${op.op_id} failed, nothing changed: ${e.message}`); return 'error'; }
+  }
+
+  // At this node's first 1.4.90 start: record one BASELINE op per existing account, stating the
+  // balance and nonce it already holds — recorded as applied, nothing changes here. Nodes that
+  // join later pull these and build the same balances from them. Returns how many were recorded.
+  ledgerRecordBaseline(originNode) {
+    if (this._db.prepare("SELECT 1 FROM sov_ledger_meta WHERE k = 'baseline_done'").get()) return 0;
+    let n = 0;
+    const tx = this._db.transaction(() => {
+      let seq = this.ledgerNextSeq(originNode);
+      for (const r of this._db.prepare('SELECT sovereign_id, balance_seeds, nonce FROM sov_disc WHERE balance_seeds > 0 OR nonce > 0').all()) {
+        const opId = 'baseline:' + r.sovereign_id;
+        if (this.ledgerHasOp(opId)) continue;
+        const op = { op_id: opId, kind: 'baseline', origin_node: originNode, seq,
+                     moves: [{ acct: r.sovereign_id, d: r.balance_seeds }], baseline_nonce: r.nonce | 0,
+                     committed_at: Date.now() };
+        this._db.prepare(`INSERT INTO sov_ledger_ops (op_id, origin_node, seq, kind, owner_acct, owner_nonce, op_json, applied_at)
+                          VALUES (?, ?, ?, 'baseline', NULL, NULL, ?, ?)`).run(opId, originNode, seq, JSON.stringify(op), Date.now());
+        seq++; n++;
+      }
+      this._db.prepare("INSERT OR REPLACE INTO sov_ledger_meta (k, v) VALUES ('baseline_done', ?)").run(String(Date.now()));
+    });
+    tx();
+    return n;
+  }
+
+  ledgerNextSeq(originNode) {
+    return this._db.prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS s FROM sov_ledger_ops WHERE origin_node = ?').get(originNode).s;
+  }
+
+  ledgerHold(op, reason) {
+    this._db.prepare(`
+      INSERT INTO sov_ledger_hold (op_id, op_json, reason, held_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(op_id) DO UPDATE SET reason = excluded.reason
+    `).run(op.op_id, JSON.stringify(op), reason, Date.now());
+  }
+
+  ledgerHeld() {
+    return this._db.prepare('SELECT op_json FROM sov_ledger_hold ORDER BY held_at').all().map(r => JSON.parse(r.op_json));
+  }
+
+  ledgerDigest() {               // { origin_node: highest seq held (applied, or recognised as a duplicate) }
+    const out = {};
+    for (const r of this._db.prepare(`SELECT origin_node, MAX(seq) AS s FROM (
+        SELECT origin_node, seq FROM sov_ledger_ops UNION ALL SELECT origin_node, seq FROM sov_ledger_alias
+      ) GROUP BY origin_node`).all()) out[r.origin_node] = r.s;
+    return out;
+  }
+
+  ledgerOpsAfter(originNode, afterSeq, limit = 500) {
+    return this._db.prepare('SELECT op_json FROM sov_ledger_ops WHERE origin_node = ? AND seq > ? ORDER BY seq ASC LIMIT ?')
+      .all(originNode, afterSeq, limit).map(r => JSON.parse(r.op_json));
+  }
+
   // ── Spend lock operations (double-spend prevention) ────────────────────────
 
   acquireSpendLock(fromId, nonce, txId, ttlMs = 5000) {
@@ -1596,6 +1945,15 @@ class NodeDB {
         } catch (_) {}
       }
       return h.digest('hex');
+    } catch (_) { return ''; }
+  }
+
+  // Fingerprint of who is enrolled (id + key). Heartbeats compare it so a node missing an
+  // enrolment record asks for the state delta that carries it (1.4.90, see peer_mesh.js).
+  computeEnrollmentRoot() {
+    try {
+      const rows = this._db.prepare('SELECT sovereign_id, public_key_hex FROM sov_enrollments ORDER BY sovereign_id').all();
+      return require('crypto').createHash('sha256').update(rows.map(r => r.sovereign_id + ':' + r.public_key_hex).join('|')).digest('hex');
     } catch (_) { return ''; }
   }
 
@@ -2127,7 +2485,8 @@ class NodeDB {
     try {
       const CAP = 50_000_000 * 1_000_000; // 50M SOV, in seeds
       const w = this._db.prepare('SELECT COALESCE(SUM(balance_seeds),0) s FROM sov_disc').get();
-      const walletTotal = w.s || 0;
+      // 1.4.90: escrow / vault / bond holdings are real money too — counted, not "drift" (D19).
+      const walletTotal = (w.s || 0) + this.totalHoldings();
       const pools = this.allPools();
       const enr = pools.find(p => p.pool_id === 'citizen_enrollment');
       if (!enr) return 0; // no residual pool to balance against
@@ -2160,10 +2519,10 @@ class NodeDB {
       }
       if (now - pend.since < SUPPLY_SETTLE_MS) return 0;
       this._supplyPending = null;
-      const newDistributed = enr.allocated_seeds - target;
-      this._db.prepare(
-        'UPDATE sov_supply_pools SET remaining_seeds = ?, distributed_seeds = ?, updated_at = ? WHERE pool_id = ?'
-      ).run(target, newDistributed, Date.now(), 'citizen_enrollment');
+      // 1.4.90: REPORT, NEVER REWRITE. This used to set the enrolment pool so the books balanced,
+      // which absorbed a double-spend mint into the pool and kept the public total at exactly 50M.
+      // Now every balance change is a replicated op, so a stable discrepancy is a real fault: it is
+      // recorded (and flips /economy/snapshot ok to false) and logged as an ERROR — and left visible.
 
       // ── The correction is RECORDED, not just logged ────────────────────────────────────
       // This function silently absorbed a real money bug for 13 days. The operator payout
@@ -2190,11 +2549,10 @@ class NodeDB {
       }
 
       const SOV = 1e6;
-      // WARN, not INFO. This is an accounting correction to real money, not routine chatter.
-      global.sovLog && global.sovLog.warn(
-        `[SUPPLY] CORRECTION: citizen_enrollment adjusted by ${(delta / SOV).toFixed(4)} SOV ` +
-        `(wallets=${(walletTotal / SOV).toFixed(2)}, remaining→${(target / SOV).toFixed(2)}). ` +
-        `The books now balance, but something caused this — see sov_supply_corrections.`
+      global.sovLog && global.sovLog.error(
+        `[SUPPLY] DISCREPANCY (not corrected): the enrolment pool would need ${(delta / SOV).toFixed(4)} SOV ` +
+        `to balance (wallets+holdings=${(walletTotal / SOV).toFixed(2)}). Recorded in sov_supply_corrections; ` +
+        `find the op that caused it — the books are deliberately left showing it.`
       );
       return delta;
     } catch (e) {

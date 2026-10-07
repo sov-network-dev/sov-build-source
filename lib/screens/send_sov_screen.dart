@@ -635,9 +635,16 @@ class _SendSovScreenState extends State<SendSovScreen> {
           return;
         }
         // ── Standard error display ────────────────────────────────────────────
+        // Node 1.4.90: a payment needs a majority of nodes to agree before it is final.
         final errMsg  = errCode == 'RECIPIENT_NOT_FOUND'
             ? 'Recipient is not an enrolled citizen on this network.\nNo SOV has been deducted.'
-            : errCode;
+            : errCode.startsWith('QUORUM_UNAVAILABLE')
+                ? 'The network could not confirm this payment right now (not enough nodes reachable).\n'
+                  'No SOV has been deducted. Please try again in a moment.'
+                : errCode.startsWith('QUORUM_DENIED') || errCode == 'SLOT_GRANTED_TO_OTHER_OP'
+                    ? 'Another payment from your wallet is being confirmed at the same moment.\n'
+                      'No SOV has been deducted by this one. Check your balance, then try again.'
+                    : errCode;
         if (mounted) setState(() { _error = errMsg; _sending = false; });
       }
     } catch (e) {

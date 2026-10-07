@@ -2783,6 +2783,8 @@ class RelayConnector {
   /// any such value as not-yet-enrolled ('').
   static String _stripAppId(String id) => id.startsWith('AS-2026') ? '' : id;
 
+  static const _selfSignedTypes = {'PLATFORM_REGISTER', 'SOV_LOGIN_RESPOND'};
+
   static Future<bool> send(Map<String, dynamic> message) async {
     if (!_connected) return false;
     try {
@@ -2799,12 +2801,17 @@ class RelayConnector {
       if (sovereignId.isEmpty) {
         sovereignId = _stripAppId((await KeyManager.getSovereignId()) ?? '');
       }
+      // These requests carry their OWN signature over their OWN timestamp, which the
+      // node verifies. Envelope-signing them overwrote both fields, so the node always
+      // answered INVALID_SIGNATURE: no platform could ever be registered from the wallet
+      // (audit D26, 2026-10-08). Leave their fields alone.
+      final selfSigned = _selfSignedTypes.contains(message['type']);
       message['node_id']   = sovereignId;
-      message['timestamp'] = _nowMs();
+      if (!selfSigned) message['timestamp'] = _nowMs();
       _addOpCode(message); // dictionary protocol — adds 2-char 'op' alongside 'type'
 
       // Sign the message — fail-safe: unsigned messages accepted for exempt types
-      try {
+      if (!selfSigned) try {
         // Sign as the SAME id this message claims in node_id. Signing as the raw
         // Keystore id while claiming the prefs id produces a signature the node
         // cannot verify - see KeyManager.signMessage's asSovereignId.

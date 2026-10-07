@@ -267,7 +267,7 @@ class AllocationEngine {
 
   // ── ALLOCATION_CLAIM_STAGE1 (direct claim — claim key + release date) ──────
 
-  handleClaimStage1(ws, msg) {
+  async handleClaimStage1(ws, msg) {
     const { allocation_id, claim_key_hash } = msg;
     const claimantId = ws._sovereignId || msg.claimant_id || msg.claimant_sovereign_id || msg.sovereign_id;
     const RESP = 'ALLOCATION_CLAIMED';
@@ -304,24 +304,11 @@ class AllocationEngine {
         return this._send(ws, { type: RESP, success: false, error: 'Insufficient donor balance' });
       }
 
-      // Deduct from donor (writeDiscGuarded with retry)
-      let deducted = false;
-      for (let i = 0; i < 3; i++) {
-        const fresh = this._db.readDisc(alloc.citizen_sovereign_id);
-        if (!fresh || fresh.balance_seeds < alloc.amount_seeds) break;
-        const ok = this._db.writeDiscGuarded(
-          alloc.citizen_sovereign_id,
-          fresh.balance_seeds   - alloc.amount_seeds,
-          Math.max(0, fresh.spendable_seeds - alloc.amount_seeds),
-          fresh.version
-        );
-        if (ok) { deducted = true; break; }
-      }
-      if (!deducted) return this._send(ws, { type: RESP, success: false, error: 'Failed to deduct donor balance' });
-
-      // Credit claimant (ensure disc entry exists)
-      this._db.ensureDiscEntry(claimantId);
-      this._db.creditBalance(claimantId, alloc.amount_seeds);
+      // 1.4.90: donor -> claimant as ONE op on the DONOR's slot (it spends the donor's money, so
+      // it is serialised with the donor's own spends by a majority of nodes), at most once per
+      // allocation, applied on every node. It used to change this node's ledger only.
+      const moved = await this._payAllocation(alloc, claimantId, 'alloc_claim');
+      if (!moved.ok) return this._send(ws, { type: RESP, success: false, error: moved.error });
 
       this._db._db.prepare(
         "UPDATE sov_allocations SET status='claimed', claimed_by=?, claimed_at=? WHERE id=?"
@@ -524,29 +511,23 @@ class AllocationEngine {
 
   // ── Internal: execute approved council claim ──────────────────────────────
 
-  _executeCouncilApproval(councilId, allocationId, claimantId) {
+  // donor -> claimant, one op on the donor's slot, at most once per allocation.
+  _payAllocation(alloc, claimantId, kind) {
+    return this._db.ledger.commitOwnerOp({
+      op_id: `alloc:${alloc.id}`, kind, ref: String(alloc.id), owner: { acct: alloc.citizen_sovereign_id },
+      moves: [{ acct: alloc.citizen_sovereign_id, d: -alloc.amount_seeds }, { acct: claimantId, d: alloc.amount_seeds }],
+    }).then((r) => r.ok ? r : { ok: false, error: r.error === 'LEDGER_INSUFFICIENT' ? 'Insufficient donor balance' : r.error });
+  }
+
+  async _executeCouncilApproval(councilId, allocationId, claimantId) {
     const alloc = this._db._db.prepare('SELECT * FROM sov_allocations WHERE id=?').get(allocationId);
     if (!alloc || alloc.status === 'claimed') return;
 
     const donorDisc = this._db.readDisc(alloc.citizen_sovereign_id);
     if (!donorDisc || donorDisc.balance_seeds < alloc.amount_seeds) return;
 
-    let deducted = false;
-    for (let i = 0; i < 3; i++) {
-      const fresh = this._db.readDisc(alloc.citizen_sovereign_id);
-      if (!fresh || fresh.balance_seeds < alloc.amount_seeds) break;
-      const ok = this._db.writeDiscGuarded(
-        alloc.citizen_sovereign_id,
-        fresh.balance_seeds   - alloc.amount_seeds,
-        Math.max(0, fresh.spendable_seeds - alloc.amount_seeds),
-        fresh.version
-      );
-      if (ok) { deducted = true; break; }
-    }
-    if (!deducted) return;
-
-    this._db.ensureDiscEntry(claimantId);
-    this._db.creditBalance(claimantId, alloc.amount_seeds);
+    const moved = await this._payAllocation(alloc, claimantId, 'alloc_council');
+    if (!moved.ok) { global.sovLog && global.sovLog.error(`[Alloc] council ${councilId}: not paid: ${moved.error}`); return; }
 
     const nowSec = Math.floor(Date.now() / 1000);
     this._db._db.prepare(

@@ -326,7 +326,7 @@ class FinancialEngine {
   //  SUBSYSTEM 2 — SOV VAULT (Deadman Switch)
   // ═══════════════════════════════════════════════════════════════════════════
 
-  handleVaultLock(ws, msg) {
+  async handleVaultLock(ws, msg) {
     const { vault_id, amount_seeds, claim_key_hash } = msg;
     const owner_id = ws._sovereignId;
 
@@ -347,55 +347,39 @@ class FinancialEngine {
       return;
     }
 
-    // SECURITY FIX (C1, 2026-08-05): the locked amount must leave BOTH balance and
-    // spendable — the money moves out of the wallet and into the vault. The old code
-    // deducted only spendable and left balance intact, so a later claim (which credits
-    // balance+spendable) minted the amount a second time. Lock+claim-your-own-vault was
-    // a free, uncapped self-mint. A vault is a TRANSFER, not a reservation.
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      const current = this._db.readDisc(owner_id);
-      if (!current || current.spendable_seeds < amount_seeds || current.balance_seeds < amount_seeds) break;
-
-      const ok = this._db.writeDiscGuarded(
-        owner_id,
-        current.balance_seeds   - amount_seeds,      // balance reduced (money leaves wallet)
-        current.spendable_seeds - amount_seeds,      // spendable reduced
-        current.version
-      );
-      if (!ok) continue;  // Version race — retry
-
-      // Create vault record
-      const now = Date.now();
-      // Reclamation grace period — king 2026-06-04: 20 years (was 15). Governable
-      // via the vault_reclaim_years param (§4b); falls back to 20 if unseeded.
-      let reclaimYears = 20;
-      try { reclaimYears = parseInt(this._db.getGovParam('vault_reclaim_years', '20')) || 20; } catch (_) {}
-      const RECLAIM_MS = reclaimYears * 365.25 * 24 * 60 * 60 * 1000;
-      try {
-        this._db._db.prepare(`
-          INSERT OR IGNORE INTO sov_vaults
-            (vault_id, owner_id, amount_seeds, claim_key_hash, status, locked_at, reclaim_at)
-          VALUES (?, ?, ?, ?, 'locked', ?, ?)
-        `).run(vault_id, owner_id, amount_seeds, claim_key_hash, now, now + RECLAIM_MS);
-      } catch (_) {
-        // vault_id already exists — revert BOTH balance and spendable (C1 fix)
-        this._db.writeDiscGuarded(owner_id, current.balance_seeds + amount_seeds, current.spendable_seeds + amount_seeds, current.version + 1);
-        this._send(ws, 'VLC', { success: false, error: 'VAULT_ID_EXISTS' });
-        return;
-      }
-
-      // Broadcast vault creation to peers
-      this._peerMesh.broadcast('VAULT_BROADCAST', {
-        vault_id, owner_id, amount_seeds, claim_key_hash,
-        locked_at: now, reclaim_at: now + RECLAIM_MS,
-        origin_node: this._identity.nodeId,
-      });
-
-      this._send(ws, 'VLC', { success: true, vault_id, amount_seeds, ts: now });
+    if (this._db._db.prepare('SELECT 1 FROM sov_vaults WHERE vault_id = ?').get(vault_id)) {
+      this._send(ws, 'VLC', { success: false, error: 'VAULT_ID_EXISTS' });
       return;
     }
-
-    this._send(ws, 'VLC', { success: false, error: 'BALANCE_UPDATE_FAILED' });
+    // 1.4.90: locking is an OWNER op — the SOV moves from the wallet into this vault's holding
+    // only after a majority of nodes granted the owner's next slot (no double-spend against a
+    // transfer), applied atomically on every node. Before, peers never debited the owner at all.
+    const res = await this._db.ledger.commitOwnerOp({
+      kind: 'vault_lock', ref: vault_id, owner: { acct: owner_id },
+      moves: [{ acct: owner_id, d: -amount_seeds }],
+      holds: [{ id: 'vault:' + vault_id, d: amount_seeds }],
+    });
+    if (!res.ok) {
+      this._send(ws, 'VLC', { success: false, error: res.error === 'LEDGER_INSUFFICIENT' ? 'INSUFFICIENT_BALANCE' : res.error });
+      return;
+    }
+    const now = Date.now();
+    // Reclamation grace period — king 2026-06-04: 20 years (was 15). Governable
+    // via the vault_reclaim_years param (§4b); falls back to 20 if unseeded.
+    let reclaimYears = 20;
+    try { reclaimYears = parseInt(this._db.getGovParam('vault_reclaim_years', '20')) || 20; } catch (_) {}
+    const RECLAIM_MS = reclaimYears * 365.25 * 24 * 60 * 60 * 1000;
+    this._db._db.prepare(`
+      INSERT OR IGNORE INTO sov_vaults
+        (vault_id, owner_id, amount_seeds, claim_key_hash, status, locked_at, reclaim_at)
+      VALUES (?, ?, ?, ?, 'locked', ?, ?)
+    `).run(vault_id, owner_id, amount_seeds, claim_key_hash, now, now + RECLAIM_MS);
+    this._peerMesh.broadcast('VAULT_BROADCAST', {
+      vault_id, owner_id, amount_seeds, claim_key_hash,
+      locked_at: now, reclaim_at: now + RECLAIM_MS,
+      origin_node: this._identity.nodeId,
+    });
+    this._send(ws, 'VLC', { success: true, vault_id, amount_seeds, ts: now });
   }
 
   handleVaultClaimInit(ws, msg) {
@@ -483,62 +467,37 @@ class FinancialEngine {
   }
 
   _executeVaultClaim(vault, claimantId, claimId, now) {
-    // Reversible-stewardship RESTORE (king 2026-06-04): if this vault was stewarded to
-    // the operator pool during reclamation, its funds live in the pool — pull them back
-    // BEFORE crediting the claimant. A claim (returning owner OR verified heir) ALWAYS
-    // outranks the stewardship, so no honest fund is ever permanently lost.
-    try {
-      const led = this._db._db.prepare(
-        "SELECT * FROM sov_reclamation_ledger WHERE vault_id = ? AND restorable = 1"
-      ).get(vault.vault_id);
-      if (led) {
-        if (this._db.drawFromPool) this._db.drawFromPool(led.stewarded_to || 'witness_operator', led.amount_seeds);
-        else if (this._db.deductFromPool) this._db.deductFromPool(led.stewarded_to || 'witness_operator', led.amount_seeds);
-        this._db._db.prepare(
-          "UPDATE sov_reclamation_ledger SET restorable = 0, restored_at = ?, restored_to = ? WHERE vault_id = ?"
-        ).run(now, claimantId, vault.vault_id);
-        global.sovLog.info(`      [FINANCE] Vault ${vault.vault_id} RESTORED from ${led.stewarded_to} pool to ${claimantId} — stewardship reversed (no fund lost).`);
-      }
-    } catch (e) { global.sovLog.warn('[FINANCE] steward-restore: ' + e.message); }
-
-    // Mark vault as claimed
-    this._db._db.prepare(
-      "UPDATE sov_vaults SET status = 'claimed' WHERE vault_id = ?"
-    ).run(vault.vault_id);
-
-    // Credit claimant's balance
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      const current = this._db.readDisc(claimantId);
-      if (!current) {
-        this._db.ensureDiscEntry(claimantId);
-        continue;
-      }
-      const ok = this._db.writeDiscGuarded(
-        claimantId,
-        current.balance_seeds   + vault.amount_seeds,
-        current.spendable_seeds + vault.amount_seeds,
-        current.version
-      );
-      if (ok) {
-        if (this._gateway) {
-          this._gateway.push(claimantId, 'VCR', {  // VAULT_CLAIM_RESULT
-            success:      true,
-            vault_id:     vault.vault_id,
-            claim_id:     claimId,
-            amount_seeds: vault.amount_seeds,
-            ts:           now,
-          });
-        }
-        // Notify peers
-        this._peerMesh.broadcast('VAULT_CLAIM_BROADCAST', {
-          vault_id:    vault.vault_id,
-          claimant_id: claimantId,
-          amount_seeds: vault.amount_seeds,
-          origin_node: this._identity.nodeId,
-        });
-        return;
-      }
+    // 1.4.90: the claim is ONE ledger op, at most once per vault (deterministic id). The money
+    // comes from the vault's holding — or, if the vault was stewarded after its grace period,
+    // back out of the operator pool (stewardship is reversible: no honest fund is ever lost).
+    let led = null;
+    try { led = this._db._db.prepare("SELECT * FROM sov_reclamation_ledger WHERE vault_id = ? AND restorable = 1").get(vault.vault_id); } catch (_) {}
+    const src = led ? { pools: [{ pool: led.stewarded_to || 'witness_operator', d: -vault.amount_seeds }] }
+                    : { holds: [{ id: 'vault:' + vault.vault_id, d: -vault.amount_seeds }] };
+    const r = this._db.ledger.commitSystemOp({
+      op_id: `vault-claim:${vault.vault_id}`, kind: 'vault_claim', ref: vault.vault_id,
+      moves: [{ acct: claimantId, d: vault.amount_seeds }], ...src,
+    });
+    if (!r.ok) {
+      global.sovLog.error(`[FINANCE] vault ${vault.vault_id} claim not paid: ${r.error}`);
+      if (this._gateway) this._gateway.push(claimantId, 'VCR', { success: false, vault_id: vault.vault_id, claim_id: claimId, error: r.error, ts: now });
+      return;
     }
+    if (led) {
+      this._db._db.prepare("UPDATE sov_reclamation_ledger SET restorable = 0, restored_at = ?, restored_to = ? WHERE vault_id = ?")
+        .run(now, claimantId, vault.vault_id);
+      global.sovLog.info(`      [FINANCE] Vault ${vault.vault_id} RESTORED from ${led.stewarded_to} pool to ${claimantId}.`);
+    }
+    this._db._db.prepare("UPDATE sov_vaults SET status = 'claimed' WHERE vault_id = ?").run(vault.vault_id);
+    if (this._gateway) {
+      this._gateway.push(claimantId, 'VCR', {  // VAULT_CLAIM_RESULT
+        success: true, vault_id: vault.vault_id, claim_id: claimId, amount_seeds: vault.amount_seeds, ts: now,
+      });
+    }
+    this._peerMesh.broadcast('VAULT_CLAIM_BROADCAST', {
+      vault_id: vault.vault_id, claimant_id: claimantId, amount_seeds: vault.amount_seeds,
+      origin_node: this._identity.nodeId,
+    });
   }
 
   _handleVaultBroadcast(msg) {
@@ -944,8 +903,14 @@ class FinancialEngine {
       `).run(vault.vault_id, vault.owner_id, vault.amount_seeds, now);
       if (r.changes > 0) {
         this._db._db.prepare("UPDATE sov_vaults SET status = 'stewarded' WHERE vault_id = ? AND status = 'locked'").run(vault.vault_id);
-        if (this._db.addToPool) this._db.addToPool('witness_operator', vault.amount_seeds);
-        else if (this._db.refundPool) this._db.refundPool('witness_operator', vault.amount_seeds);
+        // 1.4.90: vault holding -> operator pool as ONE op with a deterministic id, so the pool is
+        // credited once network-wide however many nodes reach this (it was once per node).
+        const r2 = this._db.ledger && this._db.ledger.commitSystemOp({
+          op_id: `vault-steward:${vault.vault_id}`, kind: 'vault_steward', ref: vault.vault_id,
+          holds: [{ id: 'vault:' + vault.vault_id, d: -vault.amount_seeds }],
+          pools: [{ pool: 'witness_operator', d: vault.amount_seeds }],
+        });
+        if (r2 && !r2.ok && r2.error !== 'LEDGER_DUPLICATE') global.sovLog.error(`[FINANCE] steward ${vault.vault_id}: ${r2.error}`);
         global.sovLog.info(
           `      [FINANCE] Vault ${vault.vault_id} STEWARDED (reversible) to witness_operator after the ${reclaimYears || '20'}yr grace — ${vault.amount_seeds} seeds; restorable to owner/heir forever.`
         );

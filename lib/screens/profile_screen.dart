@@ -167,7 +167,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
       final resp = await RelayConnector.pioneerGetStatus(widget.sovereignId);
       if (resp['success'] == true && mounted) {
         final m =
-            (resp['certifications'] as Map?)?.cast<String, dynamic>() ?? {};
+            ((resp['certs'] ?? resp['certifications']) as Map?)?.cast<String, dynamic>() ?? {};
         setState(() {
           _certs = {
             'RE': m['relay_engineer']      == true,
@@ -425,7 +425,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 _buildRow(
                   icon:    Icons.shield_outlined,
                   title:   'Guardian Setup',
-                  sub:     'Nominate 3 trusted citizens',
+                  sub:     'Nominate up to 5 trusted citizens',
                   onTap:   () => Navigator.push(
                     context,
                     MaterialPageRoute(

@@ -132,7 +132,7 @@ class JusticeEngine {
   //  DISPUTE OPEN
   // ═══════════════════════════════════════════════════════════════════════════
 
-  handleDisputeOpen(ws, msg) {
+  async handleDisputeOpen(ws, msg) {
     const { case_id, defendant_id, evidence_hash, amount_seeds, memo, track } = msg;
     const plaintiff_id = ws._sovereignId;
 
@@ -148,12 +148,23 @@ class JusticeEngine {
       return;
     }
 
-    // Deduct dispute bond from plaintiff
+    if (this._db._db.prepare('SELECT 1 FROM sov_disputes WHERE case_id = ?').get(case_id)) {
+      this._send(ws, 'DD', { type: 'JUSTICE_DISPUTE_OPENED', success: false, error: 'CASE_ID_EXISTS' });
+      return;
+    }
+    // 1.4.90: the bond is an OWNER op — plaintiff -> this case's bond holding, granted by a
+    // majority of nodes on the plaintiff's slot and applied on every node (peers used to keep
+    // the plaintiff's balance untouched).
     const bondSeeds = parseInt(this._getGovParam('dispute_bond_amount', '10')) * 1_000_000;
     if (bondSeeds > 0) {
-      const deducted = this._deductBond(plaintiff_id, bondSeeds);
-      if (!deducted) {
-        this._send(ws, 'DD', { type: 'JUSTICE_DISPUTE_OPENED', success: false, error: 'INSUFFICIENT_BALANCE_FOR_BOND' });
+      const res = await this._db.ledger.commitOwnerOp({
+        kind: 'dispute_bond', ref: case_id, owner: { acct: plaintiff_id },
+        moves: [{ acct: plaintiff_id, d: -bondSeeds }],
+        holds: [{ id: 'bond:' + case_id, d: bondSeeds }],
+      });
+      if (!res.ok) {
+        this._send(ws, 'DD', { type: 'JUSTICE_DISPUTE_OPENED', success: false,
+          error: res.error === 'LEDGER_INSUFFICIENT' ? 'INSUFFICIENT_BALANCE_FOR_BOND' : res.error });
         return;
       }
     }
@@ -438,52 +449,56 @@ class JusticeEngine {
     // fees are taken from a real balance and only to the extent it holds them. The
     // 50,000,000 invariant therefore cannot move, and a botched change halts
     // instead of quietly inflating.
+    // 1.4.90: the whole verdict is ONE ledger op per case (deterministic id): applied atomically
+    // and exactly once on every node. Nodes other than this one used to see none of it.
     const jurorFee = parseInt(this._getGovParam('justice_juror_reward', '500000'), 10) || 0;
     const jurors   = this._db._db.prepare(
       "SELECT juror_id FROM sov_case_jurors WHERE case_id = ? AND status = 'voted'"
     ).all(caseId);
     let   unpaid   = 0;
+    const bond     = Math.max(0, parseInt(dispute.bond_held || 0, 10));
+    const bondHeld = this._db.holdingBalance('bond:' + caseId) >= bond ? bond : 0;   // legacy cases: adopted at boot
+    const moves = [], holds = [];
+    let debitsDefendant = false;
 
     if (verdict === 'convicted') {
-      // Return the bond, move the disputed amount, and charge the guilty party
-      // for the jury's time.
-      if (dispute.bond_held > 0) this._creditBalance(dispute.plaintiff_id, dispute.bond_held);
-
+      // Return the bond, move the disputed amount, and charge the guilty party for the jury's time.
+      if (bondHeld > 0) { holds.push({ id: 'bond:' + caseId, d: -bondHeld }); moves.push({ acct: dispute.plaintiff_id, d: bondHeld }); }
       const owed = Math.max(0, parseInt(dispute.amount_seeds || 0, 10));
-      if (owed > 0) {
-        const disc = this._db.readDisc(dispute.defendant_id);
-        const take = Math.min(owed, (disc && disc.spendable_seeds) || 0);
-        let   paid = 0;
-        if (take > 0 && this._deductBond(dispute.defendant_id, take)) {
-          if (this._creditBalance(dispute.plaintiff_id, take)) {
-            paid = take;
-          } else {
-            // Credit failed: put it straight back. Money never evaporates here.
-            this._creditBalance(dispute.defendant_id, take);
-          }
-        }
-        unpaid = owed - paid;
+      const disc = this._db.readDisc(dispute.defendant_id);
+      let available = (disc && disc.spendable_seeds) || 0;
+      const take = Math.min(owed, available);
+      if (take > 0) { moves.push({ acct: dispute.defendant_id, d: -take }, { acct: dispute.plaintiff_id, d: take }); available -= take; debitsDefendant = true; }
+      unpaid = owed - take;
+      let feesPaid = 0;
+      for (const j of jurors) {
+        if (!jurorFee || available < jurorFee) break;          // a jury is paid for work done, never from nothing
+        moves.push({ acct: dispute.defendant_id, d: -jurorFee }, { acct: j.juror_id, d: jurorFee });
+        available -= jurorFee; feesPaid += jurorFee; debitsDefendant = true;
       }
-      this._payJurors(jurors, jurorFee, dispute.defendant_id, caseId);
+      if (feesPaid > 0) global.sovLog.info(`[JUSTICE] case ${caseId}: ${feesPaid} seeds paid in juror fees`);
 
     } else if (verdict === 'dismissed') {
-      // The claim was thrown out. The bond is the whole deterrent, so it is
-      // FORFEIT: the jury is paid out of it first, and the remainder compensates
-      // the defendant for having been dragged through a case they won.
-      const pot       = Math.max(0, parseInt(dispute.bond_held || 0, 10));
-      const perJuror  = jurors.length > 0
-        ? Math.min(jurorFee, Math.floor(pot / jurors.length))
-        : 0;
-      let   handedOut = 0;
-      for (const j of jurors) {
-        if (perJuror > 0 && this._creditBalance(j.juror_id, perJuror)) handedOut += perJuror;
-      }
-      const remainder = pot - handedOut;
-      if (remainder > 0) this._creditBalance(dispute.defendant_id, remainder);
-      if (handedOut > 0) {
-        global.sovLog.info(
-          `[JUSTICE] case ${caseId}: ${handedOut} seeds of forfeited bond paid to ${jurors.length} juror(s)`);
-      }
+      // The claim was thrown out. The bond is FORFEIT: the jury is paid out of it first, and the
+      // remainder compensates the defendant for having been dragged through a case they won.
+      const pot      = bondHeld;
+      const perJuror = jurors.length > 0 ? Math.min(jurorFee, Math.floor(pot / jurors.length)) : 0;
+      let handedOut = 0;
+      if (pot > 0) holds.push({ id: 'bond:' + caseId, d: -pot });
+      for (const j of jurors) { if (perJuror > 0) { moves.push({ acct: j.juror_id, d: perJuror }); handedOut += perJuror; } }
+      if (pot - handedOut > 0) moves.push({ acct: dispute.defendant_id, d: pot - handedOut });
+      if (handedOut > 0) global.sovLog.info(`[JUSTICE] case ${caseId}: ${handedOut} seeds of forfeited bond paid to ${jurors.length} juror(s)`);
+    }
+
+    if (moves.length || holds.length) {
+      const op = { op_id: `verdict:${caseId}`, kind: 'verdict', ref: caseId, moves, holds };
+      // Taking money from the defendant's wallet takes the defendant's slot, like any spend of it.
+      const done = debitsDefendant
+        ? this._db.ledger.commitOwnerOp({ ...op, owner: { acct: dispute.defendant_id } })
+        : Promise.resolve(this._db.ledger.commitSystemOp(op));
+      done.then((r) => {
+        if (!r.ok) global.sovLog.error(`[JUSTICE] case ${caseId}: verdict money NOT moved: ${r.error}`);
+      });
     }
 
     if (unpaid > 0) {
@@ -644,62 +659,8 @@ class JusticeEngine {
     return invited;
   }
 
-  _deductBond(citizenId, amountSeeds) {
-    const disc = this._db.readDisc(citizenId);
-    if (!disc || disc.spendable_seeds < amountSeeds) return false;
-
-    let success = false;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const result = this._db._db.prepare(`
-        UPDATE sov_disc
-        SET balance_seeds = balance_seeds - ?,
-            spendable_seeds = spendable_seeds - ?,
-            version = version + 1,
-            updated_at = ?
-        WHERE sovereign_id = ? AND version = ? AND spendable_seeds >= ?
-      `).run(amountSeeds, amountSeeds, Date.now(), citizenId, disc.version, amountSeeds);
-      if (result.changes > 0) { success = true; break; }
-    }
-    return success;
-  }
-
-  _creditBalance(citizenId, amountSeeds) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const current = this._db.readDisc(citizenId);
-      if (!current) return false;
-      const result = this._db._db.prepare(`
-        UPDATE sov_disc
-        SET balance_seeds = balance_seeds + ?,
-            spendable_seeds = spendable_seeds + ?,
-            version = version + 1,
-            updated_at = ?
-        WHERE sovereign_id = ? AND version = ?
-      `).run(amountSeeds, amountSeeds, Date.now(), citizenId, current.version);
-      if (result.changes > 0) return true;
-    }
-    return false;
-  }
-
-  // Pay each juror who actually VOTED, funded by `payerId`, never minted. Stops
-  // the moment the payer runs dry: a jury is paid for work done, but not out of
-  // thin air. A failed credit is refunded to the payer in the same breath, so a
-  // half-completed payment cannot lose seeds.
-  _payJurors(jurors, feeSeeds, payerId, caseId) {
-    if (!feeSeeds || !jurors || jurors.length === 0) return 0;
-    let paid = 0;
-    for (const j of jurors) {
-      if (!this._deductBond(payerId, feeSeeds)) break;          // payer exhausted
-      if (this._creditBalance(j.juror_id, feeSeeds)) {
-        paid += feeSeeds;
-      } else {
-        this._creditBalance(payerId, feeSeeds);                 // put it back
-      }
-    }
-    if (paid > 0) {
-      global.sovLog.info(`[JUSTICE] case ${caseId}: ${paid} seeds paid in juror fees`);
-    }
-    return paid;
-  }
+  // 1.4.90: no direct balance helpers here — every money move in a case is a ledger op
+  // (protocol/ledger.js), so a verdict cannot change one node's ledger and not the others.
 
   _notifyParties(dispute, payload) {
     if (!this._gateway) return;

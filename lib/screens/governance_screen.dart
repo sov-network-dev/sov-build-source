@@ -1570,8 +1570,8 @@ class _GovernanceScreenState extends State<GovernanceScreen>
           ),
           child: const Text(
             'A 10 SOV bond is deducted when you file. '
-            'Randomly selected jurors review within 72 hours. '
-            'Uphold: claim + bond returned. Dismiss: bond burned.',
+            'Randomly selected jurors (3 to 7) have 48 hours to respond. '
+            'Uphold: claim + bond returned. Dismiss: the bond pays the jurors and the defendant.',
             style: TextStyle(color: Colors.white54, fontSize: 11, height: 1.5),
           ),
         ),
@@ -2134,7 +2134,7 @@ class _GovernanceScreenState extends State<GovernanceScreen>
             paramKey: 'academy_article_bond',
             icon:     Icons.school_rounded,
             title:    'Academy Article Bond',
-            desc:     'SOV burned when a citizen publishes an article to the '
+            desc:     'SOV held as a bond when a citizen publishes an article to the '
                       'Academy. Discourages spam while keeping publishing '
                       'accessible to all enrolled citizens.',
             options:  ['1', '5', '10', '25', '50'],
@@ -2154,7 +2154,7 @@ class _GovernanceScreenState extends State<GovernanceScreen>
             paramKey: 'academy_upvote_bond',
             icon:     Icons.thumb_up_rounded,
             title:    'Article Upvote Bond',
-            desc:     'SOV burned when upvoting an Academy article. '
+            desc:     'SOV held as a bond when upvoting an Academy article. '
                       'Set to 0 to allow free upvotes. A small bond '
                       'discourages coordinated vote manipulation.',
             options:  ['0', '1', '2', '5'],
