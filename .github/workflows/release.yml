@@ -91,8 +91,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      # PINNED 3.41.4 like the android job (2026-10-08): `channel: stable` floated to a newer
+      # Flutter that refuses pdfrx_engine 0.4.5, so all four desktop jobs failed on unchanged code.
       - uses: subosito/flutter-action@v2
-        with: { channel: stable }
+        with:
+          flutter-version: 3.41.4
+          channel: stable
       # NODE 22, NOT 20 -- on all three desktop jobs. The locked better-sqlite3 (12.10.0) ships
       # prebuilt binaries for Node 22 (ABI 127) and 24, but NOT Node 20, so under Node 20
       # `npm ci` falls back to node-gyp, which cannot recognise the runner's Visual Studio 18
@@ -175,8 +179,12 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      # PINNED 3.41.4 like the android job (2026-10-08): `channel: stable` floated to a newer
+      # Flutter that refuses pdfrx_engine 0.4.5, so all four desktop jobs failed on unchanged code.
       - uses: subosito/flutter-action@v2
-        with: { channel: stable }
+        with:
+          flutter-version: 3.41.4
+          channel: stable
       # Without this the job copied Homebrew's node, which is dynamically linked against
       # libnode.<abi>.dylib -- the bundle then aborted with "Library not loaded: @rpath/libnode"
       # in the smoke test (2026-09-21). The official Node binary is self-contained. Node 22 for
@@ -248,8 +256,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # PINNED 3.41.4 like the android job (2026-10-08): `channel: stable` floated to a newer
+      # Flutter that refuses pdfrx_engine 0.4.5, so all four desktop jobs failed on unchanged code.
       - uses: subosito/flutter-action@v2
-        with: { channel: stable }
+        with:
+          flutter-version: 3.41.4
+          channel: stable
       - run: |
           sudo apt-get update
           # gstreamer: audioplayers_linux; libsecret: flutter_secure_storage_linux; ayatana-appindicator:
