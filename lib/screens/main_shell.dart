@@ -28,6 +28,7 @@ import '../sov_node_sdk/conversation_utils.dart';
 import '../sov_node_sdk/transaction_store.dart';
 import '../sov_node_sdk/sov_notification_service.dart';
 import '../sov_node_sdk/message_events.dart';
+import '../sov_node_sdk/media_transfer.dart';
 import '../sov_node_sdk/outbox_manager.dart';
 import 'home_screen.dart';
 import 'academy_screen.dart';
@@ -70,6 +71,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     super.initState();
     MainShell._instance = this;
     WidgetsBinding.instance.addObserver(this);
+    MediaTransfer.init();   // resend media kept on this device when its recipient comes online
     _init();
   }
 
@@ -464,6 +466,37 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       // namespace and don't represent a real social contact).
       if (exchangeOId.isEmpty) {
         try { await ContactsDb.ensureContact(fromId); } catch (_) {}
+      }
+
+      // ── SOV Speak media (photo / voice note / video / file): chunked, end to end ──
+      // Each chunk is its own v2 envelope; MediaTransfer decrypts and assembles them and
+      // saves the finished message. Nothing is stored until the file is complete (D34).
+      if (exchangeOId.isEmpty && MediaTransfer.isMediaType(contentType)) {
+        final m = await MediaTransfer.acceptChunk(msg, mySovId);
+        if (m == null) return;
+        final label = const {'image': '📷 Photo', 'audio': '🎤 Voice note', 'video': '🎬 Video'}[m.contentType] ?? '📎 File';
+        try {
+          await ContactsDb.recordInteraction(
+            sovereignId: fromId,
+            nickname:    PalmNameEngine.deriveName([], sovereignId: fromId),
+          );
+          await ContactsDb.upsertConversation(
+            id: m.conversationId, participantId: fromId, preview: label, lastMessageAt: m.sentAt);
+          if (SovLinkScreen.activeConversationId != fromId) {
+            await ContactsDb.incrementUnread(m.conversationId);
+          }
+          MessageEvents.notifyConversationChanged();
+        } catch (_) {}
+        if (!mounted) return;
+        if (_currentIndex != 1) setState(() => _unreadCount++);
+        final mediaSender = () {
+          final nick = PalmNameEngine.deriveName([], sovereignId: fromId);
+          return (nick.isNotEmpty && nick != fromId) ? nick : _truncateId(fromId);
+        }();
+        await SovNotificationService.showMessageReceived(
+          senderName: mediaSender, preview: label, fromId: fromId);
+        _showMessageBanner(mediaSender, label, fromId);
+        return;
       }
 
       // ── Exchange trade message — store under xchg_ namespace, skip SOV Speak ──

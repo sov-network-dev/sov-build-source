@@ -212,6 +212,10 @@ class MediaHandler {
     if (mimeType.contains('webp')) return '.webp';
     if (mimeType.contains('aac'))  return '.aac';
     if (mimeType.contains('mp3'))  return '.mp3';
+    if (mimeType.contains('mpeg') && mimeType.startsWith('audio')) return '.mp3';
+    if (mimeType.contains('m4a') || mimeType.contains('mp4a')) return '.m4a';
+    if (mimeType.contains('wav'))  return '.wav';
+    if (mimeType.contains('webm')) return '.webm';
     if (mimeType.contains('ogg'))  return '.ogg';
     if (mimeType.contains('mp4'))  return '.mp4';
     if (mimeType.contains('pdf'))  return '.pdf';

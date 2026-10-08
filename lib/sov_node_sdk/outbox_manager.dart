@@ -204,6 +204,10 @@ class OutboxManager {
     await _addWatch(toSovereignId);
   }
 
+  /// Ask the node to tell us when [sovereignId] comes online (used by MediaTransfer for
+  /// media kept on this device until the recipient is reachable).
+  static Future<void> watch(String sovereignId) => _addWatch(sovereignId);
+
   static Future<void> _addWatch(String sovereignId) async {
     if (_watchedRecipients.contains(sovereignId)) return;
     _watchedRecipients.add(sovereignId);

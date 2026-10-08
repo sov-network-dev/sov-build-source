@@ -31,6 +31,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../sov_node_sdk/relay_connector.dart';
 import '../sov_node_sdk/contacts_db.dart';
 import '../sov_node_sdk/conversation_utils.dart';
@@ -38,6 +41,7 @@ import '../sov_node_sdk/outbox_manager.dart';
 import '../sov_node_sdk/draft_manager.dart';
 import '../sov_node_sdk/draft_keys.dart';
 import '../sov_node_sdk/media_handler.dart';
+import '../sov_node_sdk/media_transfer.dart';
 import '../sov_node_sdk/message_events.dart';
 import '../sov_node_sdk/message_key_manager.dart';
 import '../sov_node_sdk/message_encryptor.dart';
@@ -111,6 +115,7 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
   StreamSubscription<Map<String, dynamic>>? _readReceiptSub;
   StreamSubscription<Map<String, dynamic>>? _reactionSub;   // [S9]
   StreamSubscription<String>?              _onlineSub;
+  StreamSubscription<LocalMessage>?        _mediaSub;
 
   // â”€â”€ Lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -148,6 +153,7 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
     _readReceiptSub?.cancel();
     _reactionSub?.cancel();
     _onlineSub?.cancel();
+    _mediaSub?.cancel();
     _composeCtrl.dispose();
     _composeFocus.dispose();
     _scrollController.dispose();
@@ -210,13 +216,28 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
 
   void _setupListeners() {
     _incomingSub    = RelayConnector.incomingMessages.listen(_onIncoming);
+    _mediaSub       = MediaTransfer.assembled.listen(_onMediaAssembled);
     _readReceiptSub = RelayConnector.readReceipts.listen(_onReadReceipt);
     _reactionSub    = RelayConnector.reactionUpdates.listen(_onReactionUpdate); // [S9]
     _onlineSub      = OutboxManager.citizenOnlineStream.listen(_onCitizenOnline);
   }
 
   void _onIncoming(Map<String, dynamic> msg) {
-    if (msg['type'] == 'MESSAGE_INCOMING') _handleIncomingMessage(msg);
+    if (msg['type'] != 'MESSAGE_INCOMING') return;
+    // Media arrives as encrypted chunks; MediaTransfer assembles them (see _onMediaAssembled).
+    if (MediaTransfer.isMediaType(msg['message_type'] as String? ?? 'text')) return;
+    _handleIncomingMessage(msg);
+  }
+
+  void _onMediaAssembled(LocalMessage m) {
+    if (m.fromSovereignId != widget.participantId || !mounted) return;
+    if (_threadMessages.any((x) => x.id == m.id)) return;
+    setState(() => _threadMessages = [..._threadMessages, m]);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) {
+        _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
+      }
+    });
   }
 
   /// Handle MESSAGE_INCOMING for THIS conversation only.
@@ -765,58 +786,47 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
   // â”€â”€ Media send â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Future<void> _sendMedia(MediaResult media) async {
-    final sizeLabel = MediaHandler.formatSize(media.sizeBytes);
-
-    if (!MediaHandler.isRelayRoutable(media.sizeBytes)) {
-      if (!mounted) return;
-      final proceed = await showDialog<bool>(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          backgroundColor: _navy,
-          title: const Text('Large File',
-              style: TextStyle(color: _gold, fontWeight: FontWeight.bold)),
-          content: Text(
-            'This file is $sizeLabel. '
-            'Files over 25 MB are stored locally and sent directly to the '
-            'recipient when they come online.',
-            style: const TextStyle(color: Colors.white70, height: 1.5),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Cancel',
-                  style: TextStyle(color: Colors.white54)),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              style: ElevatedButton.styleFrom(
-                  backgroundColor: _gold, foregroundColor: Colors.black),
-              child: const Text('Send Anyway',
-                  style: TextStyle(fontWeight: FontWeight.bold)),
-            ),
-          ],
-        ),
-      );
-      if (proceed != true) return;
+    if (media.sizeBytes > MediaTransfer.maxBytes) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('This file is ${MediaHandler.formatSize(media.sizeBytes)}. '
+              'Files up to ${MediaHandler.formatSize(MediaTransfer.maxBytes)} can be sent.'),
+          backgroundColor: const Color(0xFF7B1A1A),
+          behavior: SnackBarBehavior.floating,
+        ));
+      }
+      return;
     }
-
+    // A file picked with "File" is still shown as what it IS: audio plays in the player,
+    // video in the video player, a picture as a picture (owner, 2026-10-08).
+    var ct = media.contentType;
+    if (ct == 'file') {
+      final m = media.mimeType.toLowerCase();
+      if (m.startsWith('audio/')) {
+        ct = 'audio';
+      } else if (m.startsWith('video/')) {
+        ct = 'video';
+      } else if (m.startsWith('image/')) {
+        ct = 'image';
+      }
+    }
     await _sendMessageContent(
-      messageId:       _generateId(),
-      contentType:     media.contentType,
-      localFilePath:   media.file.path,
-      mimeType:        media.mimeType,
-      sizeBytes:       media.sizeBytes,
-      thumbnailBase64: media.thumbnailBase64,
+      messageId:     _generateId(),
+      contentType:   ct,
+      localFilePath: media.file.path,
+      mimeType:      media.mimeType,
+      sizeBytes:     media.sizeBytes,
     );
   }
 
+  /// Photo, voice note, video or file: sent END TO END in encrypted chunks by MediaTransfer
+  /// (audit D34 — the old path sent the file as plain JSON, which every node refuses).
   Future<void> _sendMessageContent({
     required String messageId,
     required String contentType,
     required String localFilePath,
     String? mimeType,
     int sizeBytes = 0,
-    String? thumbnailBase64,
   }) async {
     if (_isRecipientBlocked) {
       if (mounted) {
@@ -828,59 +838,18 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
       }
       return;
     }
-
     setState(() => _sending = true);
-
-    // try/finally guarantees _sending is always reset â€” even if a DB call
-    // throws mid-flight or the async lambda's Future was discarded by the
-    // VoidCallback caller higher up the stack.
     try {
       final now    = DateTime.now().millisecondsSinceEpoch;
       final convId = _conversationId();
-
-      final isRoutable = MediaHandler.isRelayRoutable(sizeBytes);
-      String relayBase64 = '';
-      if (isRoutable) {
-        try {
-          relayBase64 = await MediaHandler.fileToBase64(File(localFilePath));
-        } catch (e) {
-          debugPrint('[SOVLINK] Media encode error: $e');
-        }
-
-        // Guard: if encoding failed for a routable file we must NOT send a
-        // data-less message.  Show an error and bail â€” do not add a broken
-        // message to the thread.
-        if (relayBase64.isEmpty) {
-          debugPrint('[SOVLINK] relayBase64 empty after encode â€” aborting send');
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-              content: Text(
-                  'Could not read media file. Please try again.'),
-              backgroundColor: Color(0xFF7B1A1A),
-              behavior: SnackBarBehavior.floating,
-            ));
-          }
-          return;
-        }
-      }
-
-      final envelopeMap = <String, dynamic>{
-        'from':        widget.mySovId,
-        'contentType': contentType,
-        if (mimeType != null) 'mimeType': mimeType,
-        'sizeBytes':   sizeBytes,
-        if (relayBase64.isNotEmpty) 'data': relayBase64,
-        if (thumbnailBase64 != null) 'thumbnail': thumbnailBase64,
-      };
-      final envelope = jsonEncode(envelopeMap);
-
+      final label  = const {'image': '📷 Photo', 'audio': '🎤 Voice note', 'video': '🎬 Video'}[contentType] ?? '📎 File';
       final localMsg = LocalMessage(
         id:               messageId,
         conversationId:   convId,
         fromSovereignId:  widget.mySovId,
         toSovereignId:    widget.participantId,
         contentType:      contentType,
-        encryptedContent: envelope,
+        encryptedContent: '',
         decryptedContent: localFilePath,
         status:           'sending',
         sentAt:           now,
@@ -891,40 +860,51 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
         nickname:    PalmNameEngine.deriveName([], sovereignId: widget.participantId),
       );
       await ContactsDb.upsertConversation(
-        id:            convId,
-        participantId: widget.participantId,
-        preview:       '[$contentType]',
-        lastMessageAt: now,
-      );
+        id: convId, participantId: widget.participantId, preview: label, lastMessageAt: now);
       MessageEvents.notifyConversationChanged();
       if (mounted) setState(() => _threadMessages = [..._threadMessages, localMsg]);
 
-      if (!isRoutable) {
-        await ContactsDb.updateMessageStatus(messageId, 'queued');
-        if (mounted) {
-          setState(() {
-            for (final m in _threadMessages) {
-              if (m.id == messageId) m.status = 'queued';
-            }
-          });
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            content: Text(
-                'Large file queued — will be sent when recipient is online.'),
-            backgroundColor: _cardBg,
-            behavior: SnackBarBehavior.floating,
-          ));
-        }
-        return;
+      final outcome = await MediaTransfer.send(
+        toId: widget.participantId, messageId: messageId, file: File(localFilePath),
+        contentType: contentType, mimeType: mimeType ?? 'application/octet-stream');
+      String status; String? note;
+      switch (outcome) {
+        case MediaSendOutcome.delivered: status = 'delivered'; break;
+        case MediaSendOutcome.relayed:   status = 'relayed';   break;
+        case MediaSendOutcome.offline:
+          status = 'queued';
+          note = 'They are offline. Kept on this device — it will be sent when they come online.';
+          await MediaTransfer.keepPending(toId: widget.participantId, messageId: messageId,
+              path: localFilePath, contentType: contentType,
+              mimeType: mimeType ?? 'application/octet-stream');
+          break;
+        case MediaSendOutcome.noKey:
+          status = 'failed';
+          note = 'They have not opened the SOV app since enrolling, so it cannot be encrypted for them yet.';
+          break;
+        case MediaSendOutcome.tooLarge:
+          status = 'failed';
+          note = 'This file is too large to send.';
+          break;
+        case MediaSendOutcome.failed:
+          status = 'failed';
+          note = 'Could not send. Check your connection and try again.';
+          break;
       }
-
-      await _dispatchToRelay(
-        messageId:   messageId,
-        envelope:    envelope,
-        contentType: contentType,
-        timeoutSecs: 30,
-      );
+      await ContactsDb.updateMessageStatus(messageId, status,
+          deliveredAt: status == 'delivered' ? DateTime.now().millisecondsSinceEpoch : null);
+      if (mounted) {
+        setState(() {
+          for (final m in _threadMessages) {
+            if (m.id == messageId) m.status = status;
+          }
+        });
+        if (note != null) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text(note), backgroundColor: _cardBg, behavior: SnackBarBehavior.floating));
+        }
+      }
     } finally {
-      // Always reset the spinner â€” no matter which path returns or throws.
       if (mounted) setState(() => _sending = false);
     }
   }
@@ -1545,8 +1525,86 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
         );
 
       case 'file':
+        return GestureDetector(
+          onTap: () => _fileActions(msg.decryptedContent),
+          child: _fileBox(msg),
+        );
+
+      default: // 'text' and anything unknown
+        final raw = msg.decryptedContent ?? msg.encryptedContent;
+        // Never show a raw encrypted envelope as message text — if decryption
+        // hasn't resolved yet (or an older message was stored un-decrypted),
+        // show a placeholder while the re-decrypt pass runs.
+        final isCipher = MessageEncryptor.isEncryptedEnvelope(raw);
+        return Text(
+          isCipher ? '🔒 Encrypted — syncing…' : raw,
+          style: TextStyle(
+            color: isCipher ? textColor.withOpacity(0.6) : textColor,
+            fontSize: 14, height: 1.4,
+            fontStyle: isCipher ? FontStyle.italic : FontStyle.normal,
+          ),
+        );
+    }
+  }
+
+
+  /// Open or save a received/sent file. Desktop: the file opens in its default app, or is
+  /// copied to Downloads. Phone: the system sheet (PDF viewers, document apps, Save to Files).
+  Future<void> _fileActions(String? path) async {
+    if (path == null || !File(path).existsSync()) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('File not available on this device.')));
+      return;
+    }
+    try {
+      await _fileActionsInner(path);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not open the file: $e')));
+      }
+    }
+  }
+
+  Future<void> _fileActionsInner(String path) async {
+    final desktop = Platform.isWindows || Platform.isMacOS || Platform.isLinux;
+    if (!desktop) {
+      await Share.shareXFiles([XFile(path)]);
+      return;
+    }
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: _navy,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(leading: const Icon(Icons.open_in_new, color: _gold), title: const Text('Open', style: TextStyle(color: Colors.white)),
+              onTap: () => Navigator.pop(ctx, 'open')),
+          ListTile(leading: const Icon(Icons.download, color: _gold), title: const Text('Save to Downloads', style: TextStyle(color: Colors.white)),
+              onTap: () => Navigator.pop(ctx, 'save')),
+        ]),
+      ),
+    );
+    if (choice == 'open') {
+      await launchUrl(Uri.file(path));
+    } else if (choice == 'save') {
+      final dl = await getDownloadsDirectory();
+      if (dl == null) return;
+      final name = path.split(RegExp(r'[\\/]')).last;
+      var dest = File('${dl.path}${Platform.pathSeparator}$name');
+      for (var i = 1; dest.existsSync(); i++) {
+        final dot = name.lastIndexOf('.');
+        final stem = dot > 0 ? name.substring(0, dot) : name, ext = dot > 0 ? name.substring(dot) : '';
+        dest = File('${dl.path}${Platform.pathSeparator}$stem ($i)$ext');
+      }
+      await File(path).copy(dest.path);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Saved to Downloads as ${dest.path.split(RegExp(r'[\\/]')).last}')));
+      }
+    }
+  }
+
+  Widget _fileBox(LocalMessage msg) {
+    {
         final filename = msg.decryptedContent != null
-            ? msg.decryptedContent!.split('/').last
+            ? msg.decryptedContent!.split(RegExp(r'[\\/]')).last   // Windows paths use backslashes — never show the folder
             : 'File';
         return Container(
           padding: const EdgeInsets.all(12),
@@ -1568,20 +1626,6 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
           ),
         );
 
-      default: // 'text' and anything unknown
-        final raw = msg.decryptedContent ?? msg.encryptedContent;
-        // Never show a raw encrypted envelope as message text — if decryption
-        // hasn't resolved yet (or an older message was stored un-decrypted),
-        // show a placeholder while the re-decrypt pass runs.
-        final isCipher = MessageEncryptor.isEncryptedEnvelope(raw);
-        return Text(
-          isCipher ? '🔒 Encrypted — syncing…' : raw,
-          style: TextStyle(
-            color: isCipher ? textColor.withOpacity(0.6) : textColor,
-            fontSize: 14, height: 1.4,
-            fontStyle: isCipher ? FontStyle.italic : FontStyle.normal,
-          ),
-        );
     }
   }
 
