@@ -115,9 +115,12 @@ class _HomeTabState extends State<HomeTab> with WidgetsBindingObserver {
       }
       // SOV Shield escrow events — refresh locked-balance display so the
       // citizen instantly sees SOV move between spendable and locked.
+      // EXCHANGE_ESCROW_RELEASED is raised locally by RelayConnector after this citizen's own
+      // confirm / refund / cancel succeeds (audit D30).
       if (type == 'EXCHANGE_ESCROW_LOCKED' ||
           type == 'EXCHANGE_ORDER_FILLED_NOTIFY' ||
-          type == 'EXCHANGE_STATUS_BROADCAST') {
+          type == 'EXCHANGE_STATUS_BROADCAST' ||
+          type == 'EXCHANGE_ESCROW_RELEASED') {
         _loadLockedSeeds();
       }
     });

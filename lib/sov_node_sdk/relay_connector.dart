@@ -3760,7 +3760,17 @@ class RelayConnector {
       responseType: 'EXCHANGE_DELIVERY_CONFIRMED',
       timeout: const Duration(seconds: 15),
     );
+    _announceEscrowReleased(resp);
     return resp ?? {'success': false, 'error': 'No response from relay'};
+  }
+
+  /// A confirm / refund / cancel releases escrow, but its reply is consumed by sendAndWait and no
+  /// broadcast reaches the citizen who made it - so the home screen's SOV Shield line kept showing
+  /// released SOV until the app reloaded (audit D30). Tell the listeners locally on success.
+  static void _announceEscrowReleased(Map<String, dynamic>? resp) {
+    if (resp != null && resp['success'] == true) {
+      _incomingMessageController.add({'type': 'EXCHANGE_ESCROW_RELEASED', 'order_id': resp['order_id']});
+    }
   }
 
   /// Raise a dispute on a filled exchange order — escrow stays locked; justice case opened.
@@ -3793,6 +3803,7 @@ class RelayConnector {
       responseType: 'EXCHANGE_REFUND_PROCESSED',
       timeout: const Duration(seconds: 15),
     );
+    _announceEscrowReleased(resp);
     return resp ?? {'success': false, 'error': 'No response from relay'};
   }
 
@@ -3808,6 +3819,7 @@ class RelayConnector {
       responseType: 'EXCHANGE_ORDER_CANCELLED',
       timeout: const Duration(seconds: 10),
     );
+    _announceEscrowReleased(resp);
     return resp ?? {'success': false, 'error': 'No response from relay'};
   }
 

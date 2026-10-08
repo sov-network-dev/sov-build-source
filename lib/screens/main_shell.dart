@@ -249,7 +249,8 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
       // ── SOV Shield: seller's SOV locked in escrow on list order ──────────
       if (type == 'EXCHANGE_ESCROW_LOCKED') {
-        final sovAmt  = (msg['sov_amount'] as num?)?.toDouble() ?? 0.0;
+        // sov_amount is in SEEDS (exchange_engine.js XS/XN); shown as SOV it read 50000000.00 (audit D32).
+        final sovAmt  = ((msg['sov_amount'] as num?)?.toDouble() ?? 0.0) / 1000000;
         if (sovAmt > 0 && mounted) {
           final sovStr = sovAmt >= 1
               ? '${sovAmt.toStringAsFixed(2)} SOV'
@@ -270,7 +271,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
       // ── SOV Shield: seller notified their order was filled ────────────────
       if (type == 'EXCHANGE_ORDER_FILLED_NOTIFY') {
-        final sovAmt = (msg['sov_amount'] as num?)?.toDouble() ?? 0.0;
+        final sovAmt = ((msg['sov_amount'] as num?)?.toDouble() ?? 0.0) / 1000000;   // seeds -> SOV (D32)
         final desc   = msg['asking_description'] as String? ?? 'your order';
         if (mounted) {
           final sovStr = sovAmt >= 1
