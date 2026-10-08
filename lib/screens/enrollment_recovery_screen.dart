@@ -73,6 +73,7 @@ class _EnrollmentRecoveryScreenState extends State<EnrollmentRecoveryScreen> {
       final helperData = prefs.getString('pending_helper_data')       ?? '';
       final keyHash    = prefs.getString('pending_key_hash')          ?? '';
       final handType   = prefs.getString('pending_hand_type')         ?? '';
+      final faceJson   = prefs.getString('pending_face_embedding')    ?? '';   // D1 (1.2.27)
       final threshold  = prefs.getDouble('pending_threshold')         ?? 0.5;
 
       if (sovId.isEmpty || embJson.isEmpty || helperData.isEmpty || keyHash.isEmpty) {
@@ -152,6 +153,8 @@ class _EnrollmentRecoveryScreenState extends State<EnrollmentRecoveryScreen> {
           'threshold_3':   threshold,
           'key_hash':      keyHash,
           'hand_type':     handType,
+          // D1: nodes require the face; it was captured at enrolment and kept for this resume.
+          if (faceJson.isNotEmpty) 'face_embedding': faceJson,
         },
         'PALM_EMBEDDING_RESULT',
         maxRetries: 3,
@@ -190,6 +193,7 @@ class _EnrollmentRecoveryScreenState extends State<EnrollmentRecoveryScreen> {
         prefs.remove('pending_helper_data'),
         prefs.remove('pending_key_hash'),
         prefs.remove('pending_hand_type'),
+        prefs.remove('pending_face_embedding'),
         prefs.remove('pending_threshold'),
       ]);
 
@@ -260,6 +264,7 @@ class _EnrollmentRecoveryScreenState extends State<EnrollmentRecoveryScreen> {
       prefs.remove('pending_helper_data'),
       prefs.remove('pending_key_hash'),
       prefs.remove('pending_hand_type'),
+      prefs.remove('pending_face_embedding'),
       prefs.remove('pending_threshold'),
       prefs.remove('left_helper_data'),
       prefs.remove('left_key_hash'),

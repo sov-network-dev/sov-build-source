@@ -10,8 +10,9 @@ import '../sov_node_sdk/relay_connector.dart';
 ///
 /// A website owner registers their site to use SOV Login directly from inside
 /// the wallet: no external IP exposure, no command-line script. The wallet signs
-/// the request with the owner's enrolled key and burns the platform-registration
-/// fee (default 10 SOV) → operator pool. On success the owner gets a platform_id
+/// the request with the owner's enrolled key; the node deducts the yearly platform-registration
+/// fee (`platform_register_fee`, default 10 SOV, renewed every `platform_fee_period_days`) and credits
+/// it to the operator pool — nothing is burned. On success the owner gets a platform_id
 /// + callback_secret to paste into their site's SOV Login configuration.
 class PlatformRegisterScreen extends StatefulWidget {
   const PlatformRegisterScreen({super.key});
@@ -56,7 +57,7 @@ class _PlatformRegisterScreenState extends State<PlatformRegisterScreen> {
   String _friendlyError(String code) {
     switch (code) {
       case 'SOV_LOGIN_NOT_ACTIVATED':
-        return 'SOV Login is not active on the network yet. It must be enabled by a governance vote before platforms can register.';
+        return 'SOV Login has been switched off by a citizen vote, so platforms cannot register right now.';
       case 'NOT_ENROLLED':
         return 'Your wallet is not enrolled as a citizen. Enroll first, then register your platform.';
       case 'INSUFFICIENT_BALANCE':

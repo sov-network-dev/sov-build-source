@@ -39,6 +39,17 @@ const { bootstrapNodes } = require('./bootstrap');
 // right now. Dialling is unchanged. Before the mesh is wired, nothing is
 // published: fail closed rather than repeat the leak during boot.
 let _advertMesh = null;
+// 1.4.92: a host that goes into a published list or a generated plugin must be a plain IP or
+// hostname. Never the request's Host header (attacker-chosen text, written verbatim into
+// PHP/JS handed to platforms) — the node's own discovered address is used instead.
+function _safeHost(h) {
+  h = String(h || '').trim().toLowerCase();
+  return /^[a-z0-9.-]{1,253}$/.test(h) || /^[0-9a-f:]{2,39}$/.test(h) ? h : '';
+}
+function _selfHost(network) {
+  return _safeHost(process.env.RELAY_IP || (network && network.publicAddress ? String(network.publicAddress).split(':')[0] : ''));
+}
+
 function advertisedNodes(db) {
   const candidates = (bootstrapNodes(db) || []).filter(Boolean);
   if (!_advertMesh || typeof _advertMesh.activePeers !== 'function') return [];
@@ -218,18 +229,32 @@ class RelayPool {
     return candidates[candidates.length - 1];
   }
 
+  // 1.4.92 (discovery hardening): the signed pool lists ONLY peers this node has ADMITTED - passed
+  // the HELLO interrogation (source_root included) and linked right now - each with its Ed25519
+  // public key, and the envelope carries the signer's own key. Until 1.4.91 it listed every gossiped
+  // address and signed with a key it never published, so an app could not verify the signature at
+  // all and anything announcing on the DHT could feed a fresh install a list of its choosing. The
+  // app now checks: sha256(signer_pubkey) == signer, the signature, and that it trusts the signer.
+  // Fail closed: before the mesh is wired the pool is empty.
+  _admittedEntries() {
+    const out = [];
+    try {
+      if (!_advertMesh || !_advertMesh._peers) return out;
+      for (const [nodeId, p] of _advertMesh._peers.entries()) {
+        if (!p || !p.verified || !p.ws || p.ws.readyState !== 1 || !p.publicKey) continue;
+        if (typeof _advertMesh.isAddressProven === 'function' && !_advertMesh.isAddressProven(nodeId)) continue;   // 1.4.92
+        const pub = Buffer.isBuffer(p.publicKey) ? p.publicKey.toString('hex') : String(p.publicKey);
+        if (!/^[0-9a-f]{64}$/.test(pub)) continue;
+        out.push({ node_id: nodeId, address: p.address, last_seen: p.lastSeen || Date.now(),
+                   version: p.version || '1.0.0', public_key: pub });
+      }
+    } catch (_) {}
+    return out.sort((a, b) => b.last_seen - a.last_seen).slice(0, 500);
+  }
+
   buildPoolResponse() {
     const now   = Date.now();
-    const nodes = [...this._pool.entries()]
-      .filter(([, entry]) => now - entry.lastSeen < STALE_MS)
-      .sort((a, b) => b[1].lastSeen - a[1].lastSeen)
-      .slice(0, 500) // serve at most 500 entries
-      .map(([nodeId, entry]) => ({
-        node_id:   nodeId,
-        address:   entry.address,
-        last_seen: entry.lastSeen,
-        version:   entry.version || '1.0.0',
-      }));
+    const nodes = this._admittedEntries();
 
     const body = JSON.stringify({
       version:   this._db ? parseInt(this._db.getGovParam('governance_version', '0')) : 0,
@@ -243,9 +268,26 @@ class RelayPool {
 
     return JSON.stringify({
       payload: JSON.parse(body),
+      payload_json: body,          // the exact signed bytes: verifiers need not re-encode JSON (1.4.92)
       sig,
       signer: this._identity.nodeId,
+      signer_pubkey: Buffer.from(this._identity.publicKey).toString('hex'),
+      // 1.4.92: this node's OWN admission certificate (signed approvals from the nodes that admitted
+      // it), so an app can decide to trust this signer offline from keys it already trusts — even
+      // when every node it knew is unreachable. Self-authenticating; 'genesis' for the first node.
+      signer_cert: this._ownCert(),
     });
+  }
+
+  _ownCert() {
+    try {
+      const r = this._db && this._db._db.prepare('SELECT admission_cert FROM sov_operator_registry WHERE node_id = ?')
+        .get(this._identity.nodeId);
+      const raw = String((r && r.admission_cert) || '');
+      if (raw === 'genesis') return 'genesis';
+      const c = raw ? JSON.parse(raw) : [];
+      return Array.isArray(c) ? c.slice(0, 64) : [];
+    } catch (_) { return []; }
   }
 
   // ── Fetch pool from a remote node ─────────────────────────────────────────
@@ -311,7 +353,8 @@ class RelayPool {
       }
       const seen = new Set();
       const cand = [];
-      for (const p of this._mesh.activePeers()) {
+      const _peers = typeof this._mesh.provenPeers === 'function' ? this._mesh.provenPeers() : this._mesh.activePeers();   // 1.4.92
+      for (const p of _peers) {
         if (!p || !p.address || seen.has(p.address)) continue;
         seen.add(p.address);
         cand.push({ address: p.address, uptime: now - (firstByAddr.get(p.address) || now) });
@@ -503,7 +546,7 @@ function _ensureSovLoginSdkTables(db) {
       CREATE TABLE IF NOT EXISTS sov_app_pairings (
         pairing_code TEXT PRIMARY KEY,         -- 6-digit string, leading zeros preserved
         session_id   TEXT NOT NULL,            -- FK to sov_auth_sessions
-        expires_at   INTEGER NOT NULL,         -- created_at + 90_000 ms
+        expires_at   INTEGER NOT NULL,         -- created_at + 300_000 ms
         used_at      INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_app_pairings_session ON sov_app_pairings(session_id);
@@ -793,7 +836,7 @@ function createDiscoveryServer(identity, db, relayPool, network) {
       const now = Date.now();
       const r1 = db._db.prepare('DELETE FROM sov_app_pairings WHERE expires_at < ?').run(now);
       // Verified sessions are kept (audit trail). Only delete still-pending or
-      // never-completed sessions whose 90s window has lapsed.
+      // never-completed sessions whose 5-minute window has lapsed.
       const r2 = db._db.prepare("DELETE FROM sov_auth_sessions WHERE expires_at < ? AND status != 'verified'").run(now);
       if ((r1.changes || 0) + (r2.changes || 0) > 0) {
         global.sovLog.debug(`[SOV Login cleanup] pruned ${r1.changes||0} pairings, ${r2.changes||0} stale sessions`);
@@ -807,8 +850,32 @@ function createDiscoveryServer(identity, db, relayPool, network) {
   setTimeout(_cleanupExpiredSovLoginRows, 60 * 1000);
   setInterval(_cleanupExpiredSovLoginRows, 60 * 60 * 1000);
 
+  // 1.4.92: public discovery/login endpoints are rate-limited per source IP (the socket's, never a
+  // header) so nobody can scrape or hammer them. 60 requests a minute per IP per endpoint group is
+  // far above what an app, a platform or a peer node needs.
+  const _RL_WINDOW_MS = 60 * 1000, _RL_MAX = 60;
+  const _rl = new Map();
+  const _rlGroup = (u) => u === '/relay-pool' || u === '/relay-pool/latest' ? 'pool'
+    : u.startsWith('/sdk/') ? 'sdk' : u === '/node-info' ? 'info'
+    : u.startsWith('/sov-login/challenge') ? 'login' : null;
+  const _rlLimited = (req, u) => {
+    const g = _rlGroup(u); if (!g) return false;
+    const ip = String((req.socket && req.socket.remoteAddress) || '').replace(/^::ffff:/, '');
+    const k = g + '|' + ip, now = Date.now();
+    let e = _rl.get(k);
+    if (!e || now - e.t > _RL_WINDOW_MS) { e = { t: now, n: 0 }; _rl.set(k, e); }
+    e.n++;
+    if (_rl.size > 20000) { for (const [kk, v] of _rl) if (now - v.t > _RL_WINDOW_MS) _rl.delete(kk); }
+    return e.n > _RL_MAX;
+  };
+
   const server = http.createServer((req, res) => {
     const url = req.url.split('?')[0];
+    if (_rlLimited(req, url)) {
+      res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '60' });
+      res.end(JSON.stringify({ success: false, error: 'RATE_LIMITED' }));
+      return;
+    }
 
     // ── GET /relay-pool — return signed list of known nodes ────────────────
     if (url === '/relay-pool') {
@@ -1081,7 +1148,7 @@ function createDiscoveryServer(identity, db, relayPool, network) {
             VALUES (?, ?, ?, 'pending', ?, ?)
           `).run(sessionId, challenge, clientOrigin, now, expiresAt);
 
-          const nodeIp = (network && network.publicAddress) ? network.publicAddress.split(':')[0] : req.headers['host'] || '127.0.0.1';
+          const nodeIp = _selfHost(network) || '127.0.0.1';   // 1.4.92: never the Host header
           const port   = process.env.SOV_PORT || '443';
           const qrPayload = `sovlogin://${nodeIp}:${port}?s=${sessionId}&c=${challenge}`;
 
@@ -1408,7 +1475,7 @@ function createDiscoveryServer(identity, db, relayPool, network) {
     // Phishing-proof because:
     //   - Citizen's private key lives in SOV app's secure storage; never typed in a browser
     //   - SOV app validates the relay's identity via bundled Ed25519 public keys
-    //   - Pairing code is short-lived (90s), one-use, bound to platform_domain
+    //   - Pairing code is short-lived (5 min), one-use, bound to platform_domain
     // ─────────────────────────────────────────────────────────────────────────
 
     // ── POST /sov-login/initiate-app — platform starts an app-flow session ────
@@ -1571,7 +1638,7 @@ function createDiscoveryServer(identity, db, relayPool, network) {
         try {
           if (!db) { res.writeHead(503); res.end(JSON.stringify({ success: false, error: 'DB_UNAVAILABLE' })); return; }
           _ensureSovLoginSdkTables(db);
-          const { session_id, sovereign_id, signature, timestamp, password: rawPw } = JSON.parse(body || '{}');
+          const { session_id, sovereign_id, signature, timestamp, password: rawPw, password_verifier: pvIn } = JSON.parse(body || '{}');
           if (!session_id || !sovereign_id || !signature || !timestamp) {
             res.writeHead(400); res.end(JSON.stringify({ success: false, error: 'MISSING_FIELDS' })); return;
           }
@@ -1584,12 +1651,18 @@ function createDiscoveryServer(identity, db, relayPool, network) {
           // the Ed25519-signed authorization). Relay computes scrypt verifier
           // here so Flutter doesn't need a scrypt package. Plain password is
           // held in memory for this one RPC and discarded.
-          let rawPwClean = '';
+          // 1.4.93 (D2): a site password NEVER travels. The app makes the bcrypt verifier on the device
+          // and signs it (sov-link-v2-app); a plain password is refused, so it can be neither read nor
+          // swapped on the way. `rawPwClean` now holds the client's VERIFIER, never a password.
           if (typeof rawPw === 'string' && rawPw.length > 0) {
-            if (rawPw.length < 8 || rawPw.length > 256) {
-              res.writeHead(400); res.end(JSON.stringify({ success: false, error: 'INVALID_PASSWORD_LENGTH' })); return;
+            res.writeHead(400); res.end(JSON.stringify({ success: false, error: 'PASSWORD_PLAINTEXT_REFUSED' })); return;
+          }
+          let rawPwClean = '';
+          if (typeof pvIn === 'string' && pvIn.length > 0) {
+            if (!/^\$2[aby]\$1[2-4]\$[./A-Za-z0-9]{53}$/.test(pvIn)) {
+              res.writeHead(400); res.end(JSON.stringify({ success: false, error: 'INVALID_PASSWORD_VERIFIER' })); return;
             }
-            rawPwClean = rawPw;
+            rawPwClean = pvIn;
           }
 
           const session = db._db.prepare('SELECT * FROM sov_auth_sessions WHERE session_id = ? AND status = ? AND flow_type = ?').get(session_id, 'pending', 'app');
@@ -1612,7 +1685,9 @@ function createDiscoveryServer(identity, db, relayPool, network) {
           }
 
           // Verify Ed25519 signature over canonical payload
-          const canonical = `sov-link-v1-app:${session_id}:${sovereign_id}:${platform.domain}:${timestamp}`;
+          const canonical = rawPwClean
+            ? `sov-link-v2-app:${session_id}:${sovereign_id}:${platform.domain}:${timestamp}:${crypto.createHash('sha256').update(rawPwClean).digest('hex')}`
+            : `sov-link-v1-app:${session_id}:${sovereign_id}:${platform.domain}:${timestamp}`;
           let sigValid = false;
           try {
             const pubKeyBytes = Buffer.from(enrPub.public_key_hex, 'hex');
@@ -1691,9 +1766,7 @@ function createDiscoveryServer(identity, db, relayPool, network) {
           let issuedAt;
           let linkId;
           if (isFirstLink) {
-            passwordVerifier = rawPwClean
-              ? _computePasswordVerifier(rawPwClean, sovereign_id, platformDomain)
-              : '';
+            passwordVerifier = rawPwClean;   // D2: already a bcrypt verifier, made and signed on the device
             const bindingData = `${sovereign_id}|${platformDomain}|${passwordVerifier}`;
             const bindingHash = crypto.createHash('sha256').update(bindingData).digest();
             bindingSig = identity ? identity.sign(bindingHash).toString('hex') : '';
@@ -2109,8 +2182,7 @@ function createDiscoveryServer(identity, db, relayPool, network) {
         // published to third parties and goes stale the moment a node moves —
         // which is exactly how verify_endpoints ended up pointing at
         // documentation addresses that can never answer.
-        const selfHost2 = String((req.headers && req.headers.host) || '').split(':')[0];
-        const nodeIp2 = process.env.RELAY_IP || selfHost2 || '';
+        const nodeIp2 = _selfHost(network);   // 1.4.92: never the Host header
         let sovlinkHosts = [];
         try { sovlinkHosts = advertisedNodes(db); } catch (_) {}
         if (!sovlinkHosts.length && nodeIp2) sovlinkHosts = [nodeIp2];
@@ -2287,95 +2359,11 @@ function createDiscoveryServer(identity, db, relayPool, network) {
     // ── POST /sov-link/verify-plugin — platform verifies citizen login (sovlink-v2) ──
     // Two-step: (1) lookup platform by install_hash; (2) verify scrypt password
     if (url === '/sov-link/verify-plugin') {
-      if (req.method === 'OPTIONS') {
-        res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' });
-        res.end(); return;
-      }
-      if (req.method !== 'POST') { res.writeHead(405); res.end('POST required'); return; }
-      let bodyVP = '';
-      req.on('data', d => { bodyVP += d; });
-      req.on('end', () => {
-        try {
-          const parsedVP = JSON.parse(bodyVP);
-          const { install_hash, password, domain } = parsedVP;
-          // [FIELD RENAME 2026-08-14] The field is `sovereign_id`. The old
-          // `sovereign_id_or_name` is accepted as a DEPRECATED ALIAS for one
-          // release and then removed. It was named for an input this endpoint no
-          // longer takes (see the oracle cut below), and a field name that invites
-          // the wrong value is how the next platform reinvents the bug.
-          const sovereignIdIn = parsedVP.sovereign_id || parsedVP.sovereign_id_or_name;
-          if (!parsedVP.sovereign_id && parsedVP.sovereign_id_or_name) {
-            global.sovLog && global.sovLog.warn(
-              `[SOV-LINK] verify-plugin: deprecated field 'sovereign_id_or_name' sent by ${domain || 'unknown domain'} — ` +
-              `rename it to 'sovereign_id'; the alias is removed after this release`);
-          }
-          if (!install_hash || !domain) {
-            res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-            res.end(JSON.stringify({ success: false, error: 'install_hash and domain required' })); return;
-          }
-          if (!db) {
-            res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-            res.end(JSON.stringify({ success: false, error: 'DB not available' })); return;
-          }
-          _ensureSovLoginSdkTables(db);
-          // Step 1: lookup link by install_hash
-          const linkRow = db._db.prepare('SELECT * FROM sov_citizen_links WHERE plugin_hash = ? AND platform_domain = ?').get(install_hash, domain);
-          if (!linkRow) {
-            res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-            res.end(JSON.stringify({ success: false, error: 'Plugin not found. Re-download your .sovlink file.' })); return;
-          }
-          // The identifier is a CROSS-CHECK against the link, never a lookup.
-          // [ORACLE CUT 2026-08-14] The palm-name branch that stood here —
-          // SELECT sovereign_id FROM sov_enrollments WHERE palm_name = ? — is gone,
-          // for the same two reasons as the one in /sov-login/resolve below.
-          // (1) It answered name → id, which is the direction that turns a name
-          //     into a network directory. install_hash already binds this call to
-          //     exactly one citizen, so it bought nothing.
-          // (2) Palm names are NOT unique. The colliding citizen resolved to
-          //     someone else's id and fell straight into 'Identity mismatch' — a
-          //     lockout, not a login. Names come from a ~1,024-word dictionary, so
-          //     the first collision is expected at ~38 enrolled citizens.
-          const resolvedId = linkRow.sovereign_id;
-          if (sovereignIdIn) {
-            if (!/^SOV-[0-9A-Fa-f]{16}$/.test(sovereignIdIn)) {
-              res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-              res.end(JSON.stringify({ success: false, error: "sovereign_id must be 'SOV-' followed by 16 hex characters" })); return;
-            }
-            if (sovereignIdIn.toUpperCase() !== String(resolvedId).toUpperCase()) {
-              res.writeHead(403, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-              res.end(JSON.stringify({ success: false, error: 'Identity mismatch' })); return;
-            }
-          }
-          // Step 2: verify password if provided
-          if (password) {
-            if (!_verifyPasswordAgainstVerifier(password, linkRow.password_verifier)) {
-              res.writeHead(401, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-              res.end(JSON.stringify({ success: false, error: 'Incorrect password' })); return;
-            }
-          }
-          // Check citizen still enrolled.
-          // [GHOST-COUNT 2026-09-26] `enrolled` below reads enrollRow, NOT discRow.
-          // A sov_disc row is created by touchLiveness()/ensureDiscEntry() for any
-          // signed session, so keying `enrolled` off it told a platform that a key
-          // which never enrolled is a verified citizen. The 2026-08-14 pass fixed
-          // /sov-status and /economy/snapshot and missed this one; the correct row
-          // was already being fetched here for palm_name.
-          const discRow = db._db.prepare('SELECT balance_seeds FROM sov_disc WHERE sovereign_id = ?').get(resolvedId);
-          const enrollRow = db._db.prepare('SELECT palm_name FROM sov_enrollments WHERE sovereign_id = ?').get(resolvedId);
-          res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-          res.end(JSON.stringify({
-            success: true,
-            enrolled: !!enrollRow,
-            sovereign_id: resolvedId,
-            palm_name: (enrollRow && enrollRow.palm_name) || '',
-            platform_domain: domain,
-          }));
-        } catch (err) {
-          global.sovLog && global.sovLog.error('verify-plugin error:', err.message);
-          res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-          res.end(JSON.stringify({ success: false, error: 'Internal error' }));
-        }
-      });
+      // 1.4.93 (D4/D5): retired. The old plugins called a removed endpoint and needed a file nothing
+      // can produce any more; the registration script asked for the seed phrase; verify-plugin took
+      // citizens' passwords in clear. The app's platform registration hands out the working plugin.
+      res.writeHead(410, { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+      res.end('Retired with the old plugins. Passwords are verified on the platform\'s own server against the verifier it received.\n');
       return;
     }
 
@@ -2492,437 +2480,31 @@ function createDiscoveryServer(identity, db, relayPool, network) {
     // can be hot-swapped without restarting sov-node. Served from every relay node
     // whose :80 is free (a node co-tenanted with another web service will not serve it).
     if (url === '/sdk/sov-platform-register.py' || url === '/sdk/sov-platform-register.py.sha256') {
-      try {
-        const fs = require('fs');
-        const path = require('path');
-        const isHash = url.endsWith('.sha256');
-        const scriptPath = path.join(__dirname, 'sdk', 'sov-platform-register.py');
-        if (!fs.existsSync(scriptPath)) {
-          res.statusCode = 404;
-          res.end('Not Found');
-          return;
-        }
-        const scriptBytes = fs.readFileSync(scriptPath);
-        if (isHash) {
-          const crypto = require('crypto');
-          const sha = crypto.createHash('sha256').update(scriptBytes).digest('hex');
-          res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-          res.setHeader('Access-Control-Allow-Origin', '*');
-          res.end(`${sha}  sov-platform-register.py\n`);
-        } else {
-          res.setHeader('Content-Type', 'text/x-python; charset=utf-8');
-          res.setHeader('Access-Control-Allow-Origin', '*');
-          res.setHeader('Content-Disposition', 'attachment; filename="sov-platform-register.py"');
-          res.end(scriptBytes);
-        }
-      } catch (e) {
-        res.statusCode = 500;
-        res.end('Server error reading SDK script');
-      }
+      // 1.4.93 (D4/D5): retired. The old plugins called a removed endpoint and needed a file nothing
+      // can produce any more; the registration script asked for the seed phrase; verify-plugin took
+      // citizens' passwords in clear. The app's platform registration hands out the working plugin.
+      res.writeHead(410, { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+      res.end('Retired. Register your platform from the SOV app: it signs the request on your device and gives you a ready-made plugin. Never type your seed phrase anywhere.\n');
       return;
     }
 
     // ── GET /sdk/sov-plugin.php — serve platform PHP plugin (sovlink-v2) ────────
     if (url === '/sdk/sov-plugin.php') {
-      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Content-Disposition', 'attachment; filename="sov-plugin.php"');
-      // [2026-08-14] Host source changed: bootstrapNodes(db), NOT
-      // buildPoolResponse(). buildPoolResponse serves this node's in-memory
-      // _pool filtered only by lastSeen < STALE_MS — no reachability check, no
-      // denylist, and crucially no check that the peer was ADMITTED. A box
-      // refused at peer HELLO with UNRECOGNISED_SOURCE is still a box that was
-      // SEEN, so it stayed in _pool and got baked into every plugin download.
-      // Measured on the genesis node this day: /relay-pool/latest returned ONE
-      // host while this route, in the same minute, baked SIX — including
-      // a pre-genesis node that release_enforce_mode=refuse
-      // exists to keep out. verifyLogin() below POSTs the citizen's plaintext
-      // password to these hosts in order until one answers 200, so a stale
-      // entry here is credential disclosure, not just a wasted round-trip.
-      // bootstrapNodes(db) is what /relay-pool/latest (:981) and the .sovlink
-      // generator (:1975) already use; this route and the .js one beside it
-      // were the two that were missed.
-      let phpHosts = [];
-      try { phpHosts = advertisedNodes(db); } catch (_) {}
-      const _selfPhp = String((req.headers && req.headers.host) || '').split(':')[0];
-      if (_selfPhp && !phpHosts.includes(_selfPhp)) phpHosts.unshift(_selfPhp);
-      const relayPool80v2 = phpHosts.map(ip => `"http://${ip}"`).join(', ');
-      res.writeHead(200);
-      res.end(`<?php
-/**
- * SOV Login Platform Plugin v2.0 (sovlink-v2)
- * ─────────────────────────────────────────────────────────────────────────────
- * HOW IT WORKS:
- *   You (the platform developer) do NOT interact with the SOV relay directly.
- *   Your citizen (who owns this platform) downloads their .sovlink file from
- *   the SOV Network app and provides it to you once.
- *
- * INSTALL:
- *   1. Ask your citizen to open their SOV Network app → Settings → Platform Connections
- *      → "Download Plugin for this Site" → they save the .sovlink file
- *   2. They send you the .sovlink file (it is encrypted — they can share it safely)
- *   3. Place it outside your web root: /var/www/keys/my-site.sovlink
- *   4. Set define('SOV_PLUGIN_FILE', '/var/www/keys/my-site.sovlink'); below
- *   5. require_once 'sov-plugin.php'; in your login handler
- *
- * CITIZEN LOGIN FLOW:
- *   Path A (first visit or password reset): SovLogin::initiateLogin() → redirect → handle callback
- *   Path B (returning visitor):             SovLogin::verifyLogin($sovereignId, $password)
- *
- * NEVER expose the .sovlink file over HTTP. It is your platform's identity credential.
- */
-
-define('SOV_PLUGIN_FILE', '/path/to/your-site.sovlink');  // ← SET THIS
-
-// ← SET THIS TOO. The callback_secret you received (sealed) from
-// /sov-platform/register. handleCallback() REFUSES to run without it — a
-// SOV_LINK_CREATED callback creates or re-binds an account, so a handler that
-// cannot authenticate the sender must refuse, never accept. Keep this in a file
-// outside your web root and require it; do not commit it.
-define('SOV_CALLBACK_SECRET', '');  // ← SET THIS
-
-class SovLogin {
-  const SDK_VERSION = '2.0.0';
-
-  // Read install_hash from the .sovlink binary header (bytes 73-104, no crypto needed)
-  private static function _installHash(): string {
-    \$f = fopen(SOV_PLUGIN_FILE, 'rb');
-    if (!\$f) throw new Exception('Cannot open .sovlink file: ' . SOV_PLUGIN_FILE);
-    \$header = fread(\$f, 105); fclose(\$f);
-    if (strlen(\$header) < 105) throw new Exception('Corrupt .sovlink file');
-    if (substr(\$header, 0, 8) !== 'SOVLINK2') throw new Exception('Not a sovlink-v2 file');
-    return bin2hex(substr(\$header, 73, 32));
-  }
-
-  private static function _nodes(): array {
-    return [${relayPool80v2}];
-  }
-
-  // PATH A: Initiate — redirect citizen to SOV Auth Portal
-  // Returns ['success'=>true, 'portal_url'=>'http://...'] or ['success'=>false, 'error'=>'...']
-  public static function initiateLogin(): array {
-    \$hash = self::_installHash();
-    \$payload = json_encode(['install_hash' => \$hash]);
-    foreach (self::_nodes() as \$node) {
-      \$r = self::_post(\$node . '/sov-login/initiate-v2', \$payload);
-      if (\$r && !empty(\$r['success'])) return \$r;
-    }
-    return ['success' => false, 'error' => 'No relay responded'];
-  }
-
-  // PATH A: Handle the SOV_LINK_CREATED callback from the relay
-  // Call this in your return_url handler (POST from relay)
-  // Returns ['success'=>true, 'sovereign_id'=>..., 'palm_name'=>..., ...]
-  // Store sovereign_id and issue your own session after verifying.
-  public static function handleCallback(string \$rawBody, ?string \$hmacHeader = null): array {
-    // ── AUTHENTICATE FIRST. Nothing below may run on an unverified body. ──
-    // A SOV_LINK_CREATED callback creates or re-binds an account, so an
-    // unauthenticated POST to your return_url is an account-takeover primitive.
-    // Until 2026-08-14 this method verified NOTHING: it returned
-    // success + sovereign_id for any body carrying the right 'event' string.
-    //
-    // A MISSING secret is a REFUSAL, not a skip. Wrapping this block in
-    // "if the secret is defined" is correct as a config guard and wrong as a
-    // security guard — lose the secret file and the whole check disappears
-    // silently, which is the same failure as not having one.
-    if (!defined('SOV_CALLBACK_SECRET') || SOV_CALLBACK_SECRET === '') {
-      error_log('SOV_LINK_CALLBACK_UNVERIFIABLE_REFUSED: SOV_CALLBACK_SECRET is not set — refusing');
-      http_response_code(503);   // 503, not 401: MY config is broken, not their signature.
-      return ['success' => false, 'error' => 'CALLBACK_AUTH_UNAVAILABLE'];
-    }
-    \$rcvMac = (\$hmacHeader !== null) ? \$hmacHeader : (\$_SERVER['HTTP_X_SOV_CALLBACK_HMAC'] ?? '');
-    \$expMac = hash_hmac('sha256', \$rawBody, SOV_CALLBACK_SECRET);
-    // A MISSING header is a rejection, not "nothing to verify".
-    if (\$rcvMac === '' || !hash_equals(\$expMac, \$rcvMac)) {
-      error_log('SOV_LINK_CALLBACK_REJECTED: X-Sov-Callback-Hmac ' . (\$rcvMac === '' ? 'missing' : 'mismatched'));
-      http_response_code(401);
-      return ['success' => false, 'error' => 'UNAUTHORIZED'];
-    }
-    \$d = json_decode(\$rawBody, true);
-    if (!\$d || (\$d['event'] ?? '') !== 'SOV_LINK_CREATED') {
-      return ['success' => false, 'error' => 'INVALID_EVENT'];
-    }
-    // install_hash is a SECOND-ORDER check only, and it is skipped when the
-    // field is absent — which is always, because the relay does not put
-    // install_hash in the SOV_LINK_CREATED payload. It authenticates nothing
-    // on its own; the HMAC above is what makes this handler safe.
-    \$ourHash = self::_installHash();
-    if (!empty(\$d['install_hash']) && \$d['install_hash'] !== \$ourHash) {
-      return ['success' => false, 'error' => 'PLUGIN_MISMATCH'];
-    }
-    return [
-      'success'      => true,
-      'sovereign_id' => \$d['sovereign_id'] ?? '',
-      'palm_name'    => \$d['palm_name']    ?? '',
-      'redirect'     => \$d['redirect']     ?? '',
-    ];
-  }
-
-  // PATH B: Verify returning citizen (relay call — uses scrypt matching relay-side)
-  // Returns true if password is correct, false otherwise.
-  public static function verifyLogin(string \$sovereignId, string \$password): bool {
-    \$hash = self::_installHash();
-    // [2026-08-14] Field renamed 'sovereign_id_or_name' -> 'sovereign_id'. The
-    // endpoint never wanted a name: it is a cross-check against the .sovlink file,
-    // and the name branch behind it was a network-directory oracle (cut the same
-    // day). The node accepts the old key as a deprecated alias for ONE release.
-    \$payload = json_encode([
-      'install_hash' => \$hash,
-      'sovereign_id' => \$sovereignId,
-      'password'     => \$password,
-      'domain'       => parse_url((isset(\$_SERVER['HTTPS']) ? 'https' : 'http') . '://' . \$_SERVER['HTTP_HOST'], PHP_URL_HOST),
-    ]);
-    foreach (self::_nodes() as \$node) {
-      \$r = self::_post(\$node . '/sov-link/verify-plugin', \$payload);
-      if (\$r !== null) return !empty(\$r['success']);
-    }
-    return false;
-  }
-
-  // Optional: check that citizen is still enrolled on the SOV network
-  public static function getStatus(string \$sovereignId): array {
-    foreach (self::_nodes() as \$node) {
-      \$ch = curl_init(\$node . '/sov-status/' . urlencode(\$sovereignId));
-      curl_setopt_array(\$ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 4, CURLOPT_CONNECTTIMEOUT => 2]);
-      \$r = curl_exec(\$ch); curl_close(\$ch);
-      if (\$r) { \$d = json_decode(\$r, true); if (isset(\$d['enrolled'])) return \$d; }
-    }
-    return ['enrolled' => false];
-  }
-
-  private static function _post(string \$url, string \$payload): ?array {
-    \$ch = curl_init(\$url);
-    curl_setopt_array(\$ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_POST => true,
-      CURLOPT_POSTFIELDS => \$payload, CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
-      CURLOPT_TIMEOUT => 6, CURLOPT_CONNECTTIMEOUT => 3]);
-    \$r = curl_exec(\$ch); \$code = curl_getinfo(\$ch, CURLINFO_HTTP_CODE); curl_close(\$ch);
-    if (\$code === 200 && \$r) return json_decode(\$r, true);
-    return null;
-  }
-}
-`);
+      // 1.4.93 (D4/D5): retired. The old plugins called a removed endpoint and needed a file nothing
+      // can produce any more; the registration script asked for the seed phrase; verify-plugin took
+      // citizens' passwords in clear. The app's platform registration hands out the working plugin.
+      res.writeHead(410, { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+      res.end('Retired. Register your platform from the SOV app; it gives you a plugin already set up for your site.\n');
       return;
     }
 
     // ── GET /sdk/sov-plugin.js — serve platform JavaScript plugin (sovlink-v2) ──
     if (url === '/sdk/sov-plugin.js') {
-      res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Content-Disposition', 'attachment; filename="sov-plugin.js"');
-      // Seed the plugin from what is ACTUALLY running, not from a constant —
-      // but "running" is not the same as "admitted". [2026-08-14] Switched from
-      // buildPoolResponse() to bootstrapNodes(db) for the reason spelled out at
-      // the .php route above: buildPoolResponse filters on lastSeen only, so a
-      // peer REFUSED at HELLO is still baked into the file we hand an
-      // integrator, and this plugin's verifyLogin() sends a plaintext password
-      // to each host in turn. Same source as /relay-pool/latest (:981) and the
-      // .sovlink generator (:1975).
-      let seedHosts = [];
-      try { seedHosts = advertisedNodes(db); } catch (_) { /* fall through to the request host below */ }
-      const selfHost = String(req.headers.host || '').split(':')[0];
-      if (selfHost && !seedHosts.includes(selfHost)) seedHosts.unshift(selfHost);
-      const relayNodesV2 = seedHosts.map(ip => `'http://${ip}'`).join(', ');
-      res.writeHead(200);
-      res.end(`/**
- * SOV Login Platform Plugin v2.0 (sovlink-v2) — Node.js/Express
- * ─────────────────────────────────────────────────────────────────────────────
- * HOW IT WORKS:
- *   Your citizen (who owns this platform) downloads their .sovlink file from
- *   the SOV Network app and provides it to you once. You never need to register
- *   or manage API keys — the file IS the credential.
- *
- * INSTALL:
- *   1. Ask your citizen to open their SOV app → Settings → Platform Connections
- *      → "Download Plugin for this Site" → save the .sovlink file
- *   2. Place the file outside your web root: /var/www/keys/my-site.sovlink
- *   3. Set SOV_PLUGIN_FILE below
- *   4. require('./sov-plugin') in your Express routes
- *
- * NEVER serve the .sovlink file over HTTP — keep it server-side only.
- */
-'use strict';
-const fs     = require('fs');
-const http   = require('http');
-const https  = require('https');
-const crypto = require('crypto');
-
-const SOV_PLUGIN_FILE  = process.env.SOV_PLUGIN_FILE || '/path/to/your-site.sovlink';
-// SET THIS: the callback_secret you received (sealed) from /sov-platform/register.
-// handleCallback() REFUSES to run without it — a SOV_LINK_CREATED callback
-// creates or re-binds an account, so a handler that cannot authenticate the
-// sender must refuse, never accept.
-const SOV_CALLBACK_SECRET = process.env.SOV_CALLBACK_SECRET || '';
-// ── Where this plugin looks for the network ─────────────────────────────────
-// Nothing is hard-coded, and nothing here needs editing when the network moves.
-//
-//   SOV_NODE            your own node, if you run one. Wins over everything.
-//   SOV_SEED_NODES      the nodes that were live when you downloaded this file,
-//                       including the one you downloaded it from.
-//   SOV_POINTER_MIRRORS independently hosted files saying where the network is
-//                       now. Re-checked at runtime, so this file keeps working
-//                       long after the seeds below have gone.
-const SOV_NODE = process.env.SOV_NODE || '';
-const SOV_SEED_NODES = [${relayNodesV2}];
-const SOV_POINTER_MIRRORS = [
-  'https://raw.githubusercontent.com/sov-network/relay-releases/main/relay_pool.json',
-  'https://sov-pointer.sovnetworkdev.workers.dev/relay-pool.json',
-];
-
-let _nodeCache = null, _nodeCacheAt = 0;
-
-function _getJson(url) {
-  return new Promise((resolve) => {
-    try {
-      const u = new URL(url);
-      const mod = u.protocol === 'https:' ? https : http;
-      const req = mod.get(url, { timeout: 6000 }, (res) => {
-        if (res.statusCode !== 200) { res.resume(); return resolve(null); }
-        let b = ''; res.on('data', c => b += c);
-        res.on('end', () => { try { resolve(JSON.parse(b)); } catch (e) { resolve(null); } });
-      });
-      req.on('error', () => resolve(null));
-      req.on('timeout', () => { req.destroy(); resolve(null); });
-    } catch (e) { resolve(null); }
-  });
-}
-
-// Nodes to try, best first. Cached 10 minutes so a busy site is not refetching
-// mirrors on every login.
-async function _nodes() {
-  if (SOV_NODE) return [SOV_NODE];
-  if (_nodeCache && (Date.now() - _nodeCacheAt) < 600000) return _nodeCache;
-
-  const found = [];
-  for (const m of SOV_POINTER_MIRRORS) {
-    const j = await _getJson(m);
-    const list = (j && (j.nodes || (j.payload && j.payload.nodes))) || [];
-    for (const n of list) {
-      // [SDK PARSE FIX 2026-08-14] The escapes here MUST be doubled. This line is
-      // inside the template literal that generates the file, so a single \\/ is
-      // consumed by the template and the SERVED plugin got /^wss?:/// — a
-      // SyntaxError on the very first require(). Verified against the live node:
-      // GET http://<a-node>/sdk/sov-plugin.js returned 200, 6844 bytes, and
-      // node --check failed at this line. The plugin has never been loadable.
-      const host = String(n.address || n.endpoint || '').replace(/^wss?:\\/\\//, '').split(':')[0];
-      if (host && !found.includes('http://' + host)) found.push('http://' + host);
-    }
-  }
-  // Seeds last: they were correct when this file was made, and are the fallback
-  // if every mirror is unreachable.
-  for (const s of SOV_SEED_NODES) if (!found.includes(s)) found.push(s);
-
-  if (found.length) { _nodeCache = found; _nodeCacheAt = Date.now(); }
-  return found;
-}
-
-// Read install_hash from .sovlink header (bytes 73-104, no crypto)
-function _installHash() {
-  const buf = fs.readFileSync(SOV_PLUGIN_FILE);
-  if (!buf || buf.length < 105) throw new Error('Corrupt or missing .sovlink file');
-  if (buf.slice(0, 8).toString('ascii') !== 'SOVLINK2') throw new Error('Not a sovlink-v2 file');
-  return buf.slice(73, 105).toString('hex');
-}
-
-async function _post(url, payload) {
-  return new Promise((resolve) => {
-    const u   = new URL(url);
-    const mod = u.protocol === 'https:' ? https : http;
-    const opts = { hostname: u.hostname, port: parseInt(u.port) || (u.protocol === 'https:' ? 443 : 80), path: u.pathname + (u.search || ''), method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }, timeout: 6000 };
-    const req = mod.request(opts, (res) => { let b = ''; res.on('data', c => b += c); res.on('end', () => { try { resolve(JSON.parse(b)); } catch(e) { resolve(null); } }); });
-    req.on('error', () => resolve(null));
-    req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.write(payload); req.end();
-  });
-}
-
-// PATH A: Initiate — get portal URL to redirect citizen to
-async function initiateLogin() {
-  const hash = _installHash();
-  for (const node of await _nodes()) {
-    const r = await _post(node + '/sov-login/initiate-v2', JSON.stringify({ install_hash: hash }));
-    if (r && r.success) return r;
-  }
-  return { success: false, error: 'No relay responded' };
-}
-
-// PATH A: Handle SOV_LINK_CREATED callback from relay
-// rawBody = the raw POST body string sent by the relay to your return_url
-// Returns { success, sovereign_id, palm_name, redirect }
-// hmacHeader = req.get('X-Sov-Callback-Hmac'). rawBody must be the RAW bytes,
-// not a re-serialised object — express.json() will not give you a body that
-// hashes to the same value. Use express.raw({type:'application/json'}) or
-// express.json({verify:(req,res,buf)=>{req.rawBody=buf.toString('utf8');}}).
-// Returns http_status so your route can answer 401/503 correctly.
-function handleCallback(rawBody, hmacHeader) {
-  // ── AUTHENTICATE FIRST. Nothing below may run on an unverified body. ──
-  // A SOV_LINK_CREATED callback creates or re-binds an account, so an
-  // unauthenticated POST to your return_url is an account-takeover primitive.
-  // Until 2026-08-14 this function verified NOTHING: it returned success +
-  // sovereign_id for any body carrying the right 'event' string.
-  //
-  // A MISSING secret is a REFUSAL, not a skip — "only check if configured" is
-  // a config guard, not a security guard, and it fails open when the config
-  // goes missing, which is exactly when you need the check.
-  if (!SOV_CALLBACK_SECRET) {
-    console.error('SOV_LINK_CALLBACK_UNVERIFIABLE_REFUSED: SOV_CALLBACK_SECRET is not set — refusing');
-    // 503, not 401: MY config is broken, not their signature.
-    return { success: false, error: 'CALLBACK_AUTH_UNAVAILABLE', http_status: 503 };
-  }
-  const rcvMac = hmacHeader || '';
-  const expMac = crypto.createHmac('sha256', SOV_CALLBACK_SECRET).update(rawBody).digest('hex');
-  const rcvBuf = Buffer.from(rcvMac, 'utf8');
-  const expBuf = Buffer.from(expMac, 'utf8');
-  // A MISSING header is a rejection, not "nothing to verify". Length is checked
-  // first because timingSafeEqual throws on a length mismatch.
-  if (rcvMac === '' || rcvBuf.length !== expBuf.length || !crypto.timingSafeEqual(rcvBuf, expBuf)) {
-    console.error('SOV_LINK_CALLBACK_REJECTED: X-Sov-Callback-Hmac ' + (rcvMac === '' ? 'missing' : 'mismatched'));
-    return { success: false, error: 'UNAUTHORIZED', http_status: 401 };
-  }
-  let d;
-  try { d = JSON.parse(rawBody); } catch(e) { return { success: false, error: 'INVALID_JSON', http_status: 400 }; }
-  if (!d || d.event !== 'SOV_LINK_CREATED') return { success: false, error: 'INVALID_EVENT', http_status: 400 };
-  // install_hash is a SECOND-ORDER check only, and it is skipped when the field
-  // is absent — which is always, because the relay does not put install_hash in
-  // the SOV_LINK_CREATED payload. The HMAC above is what makes this handler safe.
-  const ourHash = _installHash();
-  if (d.install_hash && d.install_hash !== ourHash) return { success: false, error: 'PLUGIN_MISMATCH', http_status: 403 };
-  return { success: true, sovereign_id: d.sovereign_id || '', palm_name: d.palm_name || '', redirect: d.redirect || '' };
-}
-
-// PATH B: Verify returning citizen (relay-side scrypt check)
-// Returns true if password is correct
-async function verifyLogin(sovereignId, password, domain) {
-  const hash = _installHash();
-  // [2026-08-14] Field renamed 'sovereign_id_or_name' -> 'sovereign_id'. The
-  // endpoint never wanted a name: it is a cross-check against the .sovlink file,
-  // and the name branch behind it was a network-directory oracle (cut the same
-  // day). The node accepts the old key as a deprecated alias for ONE release.
-  const payload = JSON.stringify({ install_hash: hash, sovereign_id: sovereignId, password, domain });
-  for (const node of await _nodes()) {
-    const r = await _post(node + '/sov-link/verify-plugin', payload);
-    if (r !== null) return r.success === true;
-  }
-  return false;
-}
-
-// Optional: check citizen enrollment status
-// [2026-08-14] Was _post() to a route the node registers GET-only (its guard is
-// req.method === 'GET' plus the /sov-status/ regex): every POST
-// fell through to the catch-all 404, _post returned null, and this function
-// ALWAYS returned { enrolled: false } — for enrolled and unenrolled citizens
-// alike. Fail-closed, so it never granted anything it should not have, but a
-// platform using it to detect a revoked citizen was reading a constant.
-// _getJson is the GET helper already defined above for the pointer mirrors.
-async function getStatus(sovereignId) {
-  for (const node of await _nodes()) {
-    const r = await _getJson(node + '/sov-status/' + encodeURIComponent(sovereignId));
-    if (r && typeof r.enrolled !== 'undefined') return r;
-  }
-  return { enrolled: false };
-}
-
-module.exports = { initiateLogin, handleCallback, verifyLogin, getStatus };
-`);
+      // 1.4.93 (D4/D5): retired. The old plugins called a removed endpoint and needed a file nothing
+      // can produce any more; the registration script asked for the seed phrase; verify-plugin took
+      // citizens' passwords in clear. The app's platform registration hands out the working plugin.
+      res.writeHead(410, { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+      res.end('Retired. Register your platform from the SOV app; it gives you a plugin already set up for your site.\n');
       return;
     }
 
@@ -2934,12 +2516,20 @@ module.exports = { initiateLogin, handleCallback, verifyLogin, getStatus };
     global.sovLog.info(`      Node software:     http://[your-ip]:${port}/sov-relay.snap`);
   });
 
+  // 1.4.93 (D45): never fail SILENTLY. On an upgrade the old process can still hold the port for a
+  // moment; every other error used to be swallowed and the node ran with no discovery server at all.
+  let _bindTries = 0;
   server.on('error', (err) => {
-    if (err.code === 'EACCES') {
+    if (err.code === 'EACCES' && port !== 8080) {
       // Port 80 requires root on Linux — try port 8080
       server.listen(8080, () => {
         global.sovLog.info(`      Discovery server: http://[your-ip]:8080 (port 80 requires root)`);
       });
+    } else if (err.code === 'EADDRINUSE' && ++_bindTries <= 30) {
+      global.sovLog.warn(`      Discovery server: port ${port} busy — retry ${_bindTries}/30 in 3 s`);
+      setTimeout(() => { try { server.listen(port); } catch (_) {} }, 3000);
+    } else {
+      global.sovLog.error(`      Discovery server FAILED on port ${port}: ${err.code || err.message} — the node list, downloads and plugins are NOT served`);
     }
   });
 

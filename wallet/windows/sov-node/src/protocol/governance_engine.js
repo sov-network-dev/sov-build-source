@@ -166,7 +166,7 @@ const PARAM_DEFAULTS = [
   ['relay_join_min_stake',          '0'],   // king's design: no join stake (param kept but unused)
   ['operator_min_uptime_days',      '21'],  // continuous days required to earn the monthly payout
   ['operator_signup_sample',        '5'],
-  ['tx_signature_enforce',          'log'],   // 'log' until real traffic proves the payload hash agrees, then 'reject'   // ask 5 peers, not the whole network — cost stays flat as the network grows
+  ['tx_signature_enforce',          'reject'],   // 1.4.93 (D29): real traffic proved the payload; bad signatures are refused   // ask 5 peers, not the whole network — cost stays flat as the network grows
   ['operator_signup_quorum',        '3'],   // 3 must agree, so one dishonest interrogator cannot admit a node
   ['dedup_witnesses_n',             '3'],   // Phase 2: a light node asks 3 full peers...
   ['dedup_threshold_t',             '2'],   // ...and needs 2 agreeing signed answers with no dissent
@@ -195,6 +195,13 @@ const PARAM_DEFAULTS = [
   ['sov_login_max_sessions',        '5'],
 ];
 
+
+// Value oracle (D8, 1.4.93). Fixed in code on purpose: a vote that changed the round length mid-round
+// would renumber the rounds. Make these governed only with all four parts of CLAUDE.md §4b.
+const VALUE_EPOCH_MS      = 7 * 24 * 60 * 60 * 1000;   // one round = 7 days
+const VALUE_MIN_PROPOSALS = 25;                        // no rate is published below this
+const VALUE_MAX_USD = 50.0, VALUE_MIN_USD = 0.0001;
+const valueEpoch = (now = Date.now()) => Math.floor(now / VALUE_EPOCH_MS);
 class GovernanceEngine {
 
   constructor(identity, db, peerMesh) {
@@ -548,6 +555,12 @@ class GovernanceEngine {
       this._send(ws, 'ED', { type: 'PETITION_RESULT', success: false, error: 'UNKNOWN_PARAM' });
       return;
     }
+    // 1.4.93 (D9): a petition carries no value, so it can only flip an on/off switch. A numeric
+    // setting was marked 'direct_activation' while nothing changed. Settings change by poll.
+    if (!PARAM_MAP[param_key].binary) {
+      this._send(ws, 'ED', { type: 'PETITION_RESULT', success: false, error: 'PETITION_SWITCH_ONLY' });
+      return;
+    }
 
     const now       = Date.now();
     const expiresAt = now + 30 * 24 * 60 * 60 * 1000;  // 30 days
@@ -831,6 +844,9 @@ class GovernanceEngine {
   _checkPetitionThresholds(petition) {
     // V21 fix: skip petitions already acted upon — prevents re-firing supermajority activation
     if (petition.status !== 'open') return;
+    // 1.4.93 (D9): switches only — also covers petitions on settings replicated from older nodes.
+    const _spec = PARAM_MAP[petition.param_key];
+    if (!_spec || !_spec.binary) return;
 
     const enrolled        = this._enrolledCitizenCount();
     if (enrolled === 0) return;
@@ -1169,65 +1185,36 @@ class GovernanceEngine {
   // ═══════════════════════════════════════════════════════════════════════════
   // Citizens vote each epoch on the USD value they perceive for 1 SOV.
   // The median of all proposals in the current epoch is computed and stored
-  // in sov_supply.  This lets the app display a community-derived price.
+  // 1.4.93 (D8): the rate is derived on read from the replicated proposals (sov_supply is no longer written).
 
   handleSovValueSubmit(ws, msg) {
-    const sovereignId = msg.sovereign_id || ws._sovereignId;
+    // 1.4.93 (D8): only the signed-in citizen can propose, for themselves (msg.sovereign_id is not trusted).
+    if (ws._legacyMode || !ws._verified || !ws._sovereignId) {
+      return this._send(ws, 'QV', { type: 'SOV_VALUE_SUBMITTED', success: false, error: 'SIGNATURE_REQUIRED' });
+    }
+    const sovereignId = ws._sovereignId;
     const proposedUsd = parseFloat(msg.proposed_usd);
-
-    if (!sovereignId || isNaN(proposedUsd) || proposedUsd <= 0) {
+    if (isNaN(proposedUsd) || proposedUsd <= 0) {
       return this._send(ws, 'QV', { type: 'SOV_VALUE_SUBMITTED', success: false, error: 'Invalid fields' });
     }
-
     try {
-      // Only enrolled citizens may vote
-      const enrolled = this._db._db.prepare(
-        'SELECT enrolled_at FROM sov_enrollments WHERE sovereign_id = ?'
-      ).get(sovereignId);
-
+      const enrolled = this._db._db.prepare('SELECT enrolled_at FROM sov_enrollments WHERE sovereign_id = ?').get(sovereignId);
       if (!enrolled) {
         return this._send(ws, 'QV', { type: 'SOV_VALUE_SUBMITTED', success: false, error: 'Not enrolled' });
       }
-
-      const epoch  = Math.floor(Date.now() / 60000);   // one epoch per minute
-      const MAX_CAP = 50.0;                              // $50 per SOV cap
-      const capped  = Math.min(Math.max(proposedUsd, 0.0001), MAX_CAP);
-
-      // INSERT or UPDATE (one proposal per citizen per epoch)
-      try {
-        this._db._db.prepare(
-          'INSERT INTO sov_value_proposals (sovereign_id, proposed_usd, epoch, submitted_at) VALUES (?, ?, ?, ?)'
-        ).run(sovereignId, capped, epoch, Date.now());
-      } catch (_dup) {
-        this._db._db.prepare(
-          'UPDATE sov_value_proposals SET proposed_usd = ?, submitted_at = ? WHERE sovereign_id = ? AND epoch = ?'
-        ).run(capped, Date.now(), sovereignId, epoch);
+      const epoch  = valueEpoch();
+      const capped = Math.min(Math.max(proposedUsd, VALUE_MIN_USD), VALUE_MAX_USD);
+      // One proposal per citizen per round, and it cannot be changed: proposals replicate with
+      // INSERT OR IGNORE, so an UPDATE would never reach the other nodes and they would disagree.
+      const r = this._db._db.prepare(
+        'INSERT OR IGNORE INTO sov_value_proposals (sovereign_id, proposed_usd, epoch, submitted_at) VALUES (?, ?, ?, ?)'
+      ).run(sovereignId, capped, epoch, Date.now());
+      if (r.changes === 0) {
+        return this._send(ws, 'QV', { type: 'SOV_VALUE_SUBMITTED', success: false, error: 'ALREADY_PROPOSED', epoch });
       }
-
-      // Recompute median and store in sov_supply
-      const proposals = this._db._db.prepare(
-        'SELECT proposed_usd FROM sov_value_proposals WHERE epoch = ? ORDER BY proposed_usd'
-      ).all(epoch);
-
-      if (proposals.length >= 1) {
-        const mid    = Math.floor(proposals.length / 2);
-        const median = proposals.length % 2 === 0
-          ? (proposals[mid - 1].proposed_usd + proposals[mid].proposed_usd) / 2
-          : proposals[mid].proposed_usd;
-
-        this._db._db.prepare(
-          'INSERT INTO sov_supply (sov_usd_rate, vote_count, epoch, computed_at) VALUES (?, ?, ?, ?)'
-        ).run(median, proposals.length, epoch, Date.now());
-      }
-
-      global.sovLog.info(`[Governance] SOV value proposal: ${sovereignId} → $${capped} (epoch ${epoch})`);
-
+      global.sovLog.info(`[Governance] SOV value proposal: ${sovereignId} → $${capped} (round ${epoch})`);
       this._send(ws, 'QV', {
-        type:         'SOV_VALUE_SUBMITTED',
-        success:      true,
-        proposed_usd: capped,
-        epoch,
-        timestamp:    Date.now(),
+        type: 'SOV_VALUE_SUBMITTED', success: true, proposed_usd: capped, epoch, timestamp: Date.now(),
       });
     } catch (e) {
       global.sovLog.error('[Governance] SOV_VALUE_SUBMIT error:', e.message);
@@ -1235,15 +1222,26 @@ class GovernanceEngine {
     }
   }
 
+  // The published rate is the median of the most recent CLOSED round that reached the minimum
+  // number of proposals. Derived from the replicated proposals on read, so every node agrees.
+  _valueRate(curEpoch) {
+    const row = this._db._db.prepare(
+      'SELECT epoch, COUNT(*) AS n FROM sov_value_proposals WHERE epoch < ? GROUP BY epoch HAVING n >= ? ORDER BY epoch DESC LIMIT 1'
+    ).get(curEpoch, VALUE_MIN_PROPOSALS);
+    if (!row) return { rate: 0, epoch: null, votes: 0 };
+    const v = this._db._db.prepare('SELECT proposed_usd FROM sov_value_proposals WHERE epoch = ? ORDER BY proposed_usd')
+      .all(row.epoch).map(x => x.proposed_usd);
+    const m = Math.floor(v.length / 2);
+    return { rate: v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2, epoch: row.epoch, votes: v.length };
+  }
+
   handleSovValueStatus(ws, msg) {
-    const sovereignId = msg.sovereign_id || ws._sovereignId;
+    const sovereignId = ws._sovereignId || msg.sovereign_id;
 
     try {
-      const epoch      = Math.floor(Date.now() / 60000);
-      const rateRow    = this._db._db.prepare(
-        'SELECT sov_usd_rate FROM sov_supply ORDER BY id DESC LIMIT 1'
-      ).get();
-      const currentRate = (rateRow && rateRow.sov_usd_rate) ? rateRow.sov_usd_rate : 0;
+      const epoch       = valueEpoch();
+      const R           = this._valueRate(epoch);     // 1.4.93 (D8): derived, identical on every node
+      const currentRate = R.rate;
 
       const voteCount   = this._db._db.prepare(
         'SELECT COUNT(*) as c FROM sov_value_proposals WHERE epoch = ?'
@@ -1261,6 +1259,10 @@ class GovernanceEngine {
         type:             'SOV_VALUE_STATUS_RESULT',
         success:          true,
         current_usd_rate: currentRate,
+        rate_epoch:       R.epoch,               // the closed round the rate comes from (D8)
+        rate_vote_count:  R.votes,
+        min_proposals:    VALUE_MIN_PROPOSALS,
+        round_ms:         VALUE_EPOCH_MS,
         current_epoch:    epoch,
         vote_count:       (voteCount || { c: 0 }).c,
         citizen_count:    (citizenCount || { c: 0 }).c,

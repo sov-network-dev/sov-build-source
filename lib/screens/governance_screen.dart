@@ -9,6 +9,7 @@ import 'governance_errors.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
+import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:image_picker/image_picker.dart';
@@ -978,7 +979,12 @@ class _GovernanceScreenState extends State<GovernanceScreen>
     final desc = _descCtrl.text.trim();
     final hash = _hashCtrl.text.trim();
 
-    if (txId.isEmpty) { _snack('Enter a transaction ID'); return; }
+    // D17 (1.2.27): a dispute is AGAINST a citizen — the node needs their SOV ID, not a tx hash.
+    final defendant = txId.toUpperCase();
+    if (!RegExp(r'^SOV-[0-9A-F]{16}$').hasMatch(defendant)) {
+      _snack("Enter the other person's SOV ID (SOV-XXXXXXXXXXXXXXXX) — or pick them from contacts");
+      return;
+    }
     if (desc.length < 50) {
       _snack('Description must be at least 50 characters (${desc.length}/50)');
       return;
@@ -987,14 +993,23 @@ class _GovernanceScreenState extends State<GovernanceScreen>
     setState(() { _submittingDispute = true; _disputeResult = null; });
 
     try {
-      final images = _evidenceImages.map(base64Encode).toList();
+      // D17: photos stay on this phone (nodes keep no media). The network records ONE fingerprint
+      // of the description + every photo, so the evidence cannot be swapped later; show the
+      // photos to the jurors when they ask.
+      final photoHashes = _evidenceImages.map((b) => sha256.convert(b).toString()).toList();
+      final evidence = hash.isNotEmpty
+          ? hash
+          : sha256.convert(utf8.encode([desc, ...photoHashes].join('\n'))).toString();
+      final caseId = 'case-${DateTime.now().millisecondsSinceEpoch}-'
+          '${sha256.convert(utf8.encode('${widget.sovereignId}|$defendant|$evidence')).toString().substring(0, 8)}';
 
       final resp = await RelayConnector.openJusticeDispute(
         sovereignId:      widget.sovereignId,
-        defendantId:      txId,   // reused field — txId is the "defendant / tx to dispute"
-        evidenceHash:     hash.isNotEmpty ? hash : desc.substring(0, desc.length.clamp(0, 64)),
+        caseId:           caseId,
+        defendantId:      defendant,
+        evidenceHash:     evidence,
         claimAmountSeeds: 0,
-        evidenceImages:   images.isNotEmpty ? images : null,
+        memo:             desc,
       );
 
       if (!mounted) return;
@@ -1046,7 +1061,7 @@ class _GovernanceScreenState extends State<GovernanceScreen>
           const SizedBox(height: 8),
           _VerdictBtn(
             label: 'Dismiss',
-            sub:   'Burn plaintiff bond (10 SOV), unfreeze defendant',
+            sub:   'Bond forfeited: pays the jurors, the rest goes to the defendant',
             color: Colors.redAccent,
             icon:  Icons.cancel_outlined,
             onTap: () { choice = 'dismiss'; Navigator.pop(ctx); },
@@ -1588,7 +1603,7 @@ class _GovernanceScreenState extends State<GovernanceScreen>
                 controller: _txIdCtrl,
                 onChanged: (_) => _saveDisputeDrafts(),
                 style: const TextStyle(color: Colors.white, fontSize: 13),
-                decoration: _inputDecor('SOV-XXXXXXXXXXXXXXXX or tx hash'),
+                decoration: _inputDecor('Their SOV ID: SOV-XXXXXXXXXXXXXXXX'),
               ),
             ),
             const SizedBox(width: 8),
@@ -1705,7 +1720,7 @@ class _GovernanceScreenState extends State<GovernanceScreen>
           ElevatedButton.icon(
             icon: const Icon(Icons.add_photo_alternate_rounded, size: 16),
             label: Text(_evidenceImages.isEmpty
-                ? 'Add Evidence Photo' : 'Add Another Photo'),
+                ? 'Add Evidence Photo (stays on your phone)' : 'Add Another Photo'),
             onPressed: _pickEvidenceImage,
             style: ElevatedButton.styleFrom(
               backgroundColor: Colors.white.withAlpha(15),
@@ -1880,6 +1895,151 @@ class _GovernanceScreenState extends State<GovernanceScreen>
                       'the network actually has.',
             options:  ['1', '2', '3', '5', '7'],
             unit:     ' operators',
+          ),
+          // ── 1.2.27 (D10): every votable setting now has a ready-made poll ──
+          _buildGovParamItem(
+            paramKey: 'exchange_max_order_sov',
+            icon:     Icons.swap_horiz_rounded,
+            title:    'Largest Exchange Order',
+            desc:     'The most SOV one exchange order may offer.',
+            options:  ['1000', '5000', '10000', '50000', '100000'],
+            unit:     ' SOV',
+          ),
+          _buildGovParamItem(
+            paramKey: 'relay_join_min_stake',
+            icon:     Icons.lock_outline_rounded,
+            title:    'Stake to Run a Node',
+            desc:     'SOV a citizen must hold to register a node. 0 means anyone may run one.',
+            options:  ['0', '10', '100', '1000'],
+            unit:     ' SOV',
+          ),
+          _buildGovParamItem(
+            paramKey: 'operator_min_uptime_days',
+            icon:     Icons.timer_rounded,
+            title:    'Uptime Before Reward',
+            desc:     'Continuous days a node must stay up before it earns the operator reward. A gap restarts the count.',
+            options:  ['7', '14', '21', '30', '60'],
+            unit:     ' days',
+          ),
+          _buildGovParamItem(
+            paramKey: 'operator_signup_sample',
+            icon:     Icons.casino_rounded,
+            title:    'Nodes Asked When a Node Joins',
+            desc:     'How many nodes are asked to check a newcomer.',
+            options:  ['3', '5', '7', '9', '11'],
+            unit:     ' nodes',
+          ),
+          _buildGovParamItem(
+            paramKey: 'operator_signup_quorum',
+            icon:     Icons.how_to_vote_rounded,
+            title:    'Approvals for a New Node',
+            desc:     'How many of those nodes must approve before a newcomer is admitted.',
+            options:  ['2', '3', '4', '5', '7'],
+            unit:     ' approvals',
+          ),
+          _buildGovParamItem(
+            paramKey: 'relay_max_citizens',
+            icon:     Icons.people_alt_rounded,
+            title:    'Citizens per Node',
+            desc:     'The most citizens one node will serve at once.',
+            options:  ['10000', '50000', '100000', '500000', '1000000'],
+            unit:     '',
+          ),
+          _buildGovParamItem(
+            paramKey: 'operator_uptime_reward',
+            icon:     Icons.payments_rounded,
+            title:    'Monthly Operator Reward',
+            desc:     'Paid per qualifying node every 30 days, from the operator pool (in seeds; 1 SOV = 1,000,000 seeds).',
+            options:  ['0', '10000000', '20000000', '50000000', '100000000'],
+            unit:     ' seeds',
+          ),
+          _buildGovParamItem(
+            paramKey: 'operator_tx_reward',
+            icon:     Icons.receipt_long_rounded,
+            title:    'Reward per Transaction',
+            desc:     'Paid to operators per confirmed transaction, from the operator pool (in seeds).',
+            options:  ['0', '1000', '10000', '100000', '1000000'],
+            unit:     ' seeds',
+          ),
+          _buildGovParamItem(
+            paramKey: 'operator_reserve_draw_cap',
+            icon:     Icons.savings_rounded,
+            title:    'Monthly Operator Pool Limit',
+            desc:     'The most the operator pool may pay out in one month (in seeds).',
+            options:  ['0', '10000000000', '50000000000', '100000000000', '250000000000'],
+            unit:     ' seeds',
+          ),
+          _buildGovParamItem(
+            paramKey: 'platform_register_fee',
+            icon:     Icons.web_rounded,
+            title:    'Platform Registration Fee',
+            desc:     'Yearly SOV a website pays to offer Sign in with SOV. It goes to the operator pool; nothing is burned.',
+            options:  ['0', '5', '10', '25', '50', '100'],
+            unit:     ' SOV',
+          ),
+          _buildGovParamItem(
+            paramKey: 'platform_fee_period_days',
+            icon:     Icons.event_repeat_rounded,
+            title:    'Platform Fee Period',
+            desc:     'How often a website renews its registration.',
+            options:  ['90', '180', '365', '730'],
+            unit:     ' days',
+          ),
+          _buildGovParamItem(
+            paramKey: 'dispute_bond_amount',
+            icon:     Icons.gavel_rounded,
+            title:    'Dispute Bond',
+            desc:     'SOV held when a citizen files a dispute; returned if the case is upheld.',
+            options:  ['0', '5', '10', '25', '50'],
+            unit:     ' SOV',
+          ),
+          _buildGovParamItem(
+            paramKey: 'justice_jury_size',
+            icon:     Icons.groups_2_rounded,
+            title:    'Largest Jury',
+            desc:     'The most jurors a case can grow to. Must stay at or above the starting jury size.',
+            options:  ['3', '5', '7', '9', '11'],
+            unit:     ' jurors',
+          ),
+          _buildGovParamItem(
+            paramKey: 'justice_conviction_threshold',
+            icon:     Icons.balance_rounded,
+            title:    'Votes Needed to Uphold',
+            desc:     'Share of juror votes needed to uphold a complaint.',
+            options:  ['0.51', '0.6', '0.67', '0.75', '0.9'],
+            unit:     '',
+          ),
+          _buildGovParamItem(
+            paramKey: 'message_retention_days',
+            icon:     Icons.history_rounded,
+            title:    'Message Record Retention',
+            desc:     'Days a node keeps delivery records (never the messages themselves).',
+            options:  ['7', '30', '90', '180', '365'],
+            unit:     ' days',
+          ),
+          _buildGovParamItem(
+            paramKey: 'group_max_members',
+            icon:     Icons.group_add_rounded,
+            title:    'Largest Group',
+            desc:     'The most members one group may have.',
+            options:  ['25', '50', '100', '250', '500'],
+            unit:     ' members',
+          ),
+          _buildGovParamItem(
+            paramKey: 'sov_login_session_duration_hours',
+            icon:     Icons.login_rounded,
+            title:    'Sign-in Session Length',
+            desc:     'How long a Sign in with SOV session lasts on a website.',
+            options:  ['1', '12', '24', '168', '720'],
+            unit:     ' hours',
+          ),
+          _buildGovParamItem(
+            paramKey: 'sov_login_max_sessions',
+            icon:     Icons.devices_rounded,
+            title:    'Sign-in Sessions per Citizen',
+            desc:     'How many website sessions one citizen may have open at once.',
+            options:  ['1', '3', '5', '10', '20'],
+            unit:     '',
           ),
           _buildGovParamItem(
             paramKey: 'release_signer_min_uptime_days',
@@ -2219,7 +2379,8 @@ class _GovernanceScreenState extends State<GovernanceScreen>
     final voteCount   = (s?['vote_count']         as num?)?.toInt() ?? 0;
     final myProposal  = (s?['my_proposal']        as num?)?.toDouble();
     final hasProposed = myProposal != null;
-    const threshold   = 5000;
+    // D8 (node 1.4.93): weekly rounds; a rate is published once a closed round had this many.
+    final threshold   = (s?['min_proposals'] as num?)?.toInt() ?? 25;
     final progress    = (voteCount / threshold).clamp(0.0, 1.0);
 
     return Container(
@@ -2243,7 +2404,7 @@ class _GovernanceScreenState extends State<GovernanceScreen>
                 child: CircularProgressIndicator(
                     strokeWidth: 1.5, color: _gold))
           else if (epoch > 0)
-            Text('Epoch $epoch',
+            Text('Round $epoch · weekly',
                 style: const TextStyle(color: Colors.white38, fontSize: 11)),
         ]),
         const SizedBox(height: 10),
@@ -2744,13 +2905,9 @@ class _GovernanceScreenState extends State<GovernanceScreen>
   // Map of tag → { govParamKey, title } for all known governable protocols
   static const _knownProtocols = [
     { 'tag': 'sov_enclave',           'govParamKey': 'sov_enclave',  'title': 'SOV Enclave'           },
-    { 'tag': 'sov_request',         'govParamKey': 'sov_request',    'title': 'SOV Payment Links'     },
     { 'tag': 'sov_login',           'govParamKey': 'sov_login',      'title': 'SOV Login'             },
-    { 'tag': 'privacy_toggle',      'govParamKey': 'balance_privacy','title': 'Balance Privacy Mode'  },
-    { 'tag': 'relay_staking',       'govParamKey': 'relay_staking',  'title': 'Relay Staking Rewards' },
-    { 'tag': 'merit_pool',          'govParamKey': 'merit_pool',     'title': 'Citizen Merit Pool'    },
-    { 'tag': 'sov_escrow_api',      'govParamKey': 'sov_escrow_api', 'title': 'Merchant Escrow API'   },
-    { 'tag': 'nfc_id',              'govParamKey': 'nfc_id',         'title': 'NFC Identity Tap'      },
+    // (1.2.27: six entries removed — payment links, balance privacy, relay staking, merit pool, escrow
+    //  API, NFC — the network has no such switch, so a petition on them could never do anything.)
   ];
 
   Widget _buildPetitionsTab() {

@@ -34,6 +34,8 @@ import 'package:video_player/video_player.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:mime/mime.dart';
+import 'document_viewer_screen.dart';
 import '../sov_node_sdk/relay_connector.dart';
 import '../sov_node_sdk/contacts_db.dart';
 import '../sov_node_sdk/conversation_utils.dart';
@@ -879,8 +881,13 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
               mimeType: mimeType ?? 'application/octet-stream');
           break;
         case MediaSendOutcome.noKey:
-          status = 'failed';
-          note = 'They have not opened the SOV app since enrolling, so it cannot be encrypted for them yet.';
+          // D21 (1.2.27): keep it, like an offline send — it goes as soon as their key is available.
+          status = 'queued';
+          note = 'They have not opened the SOV app since enrolling. Kept on this device — it will be '
+              'sent once they do.';
+          await MediaTransfer.keepPending(toId: widget.participantId, messageId: messageId,
+              path: localFilePath, contentType: contentType,
+              mimeType: mimeType ?? 'application/octet-stream');
           break;
         case MediaSendOutcome.tooLarge:
           status = 'failed';
@@ -1566,22 +1573,40 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
 
   Future<void> _fileActionsInner(String path) async {
     final desktop = Platform.isWindows || Platform.isMacOS || Platform.isLinux;
-    if (!desktop) {
-      await Share.shareXFiles([XFile(path)]);
-      return;
-    }
+    final viewable = docKindFor(path) != DocKind.unsupported;
     final choice = await showModalBottomSheet<String>(
       context: context,
       backgroundColor: _navy,
       builder: (ctx) => SafeArea(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          ListTile(leading: const Icon(Icons.open_in_new, color: _gold), title: const Text('Open', style: TextStyle(color: Colors.white)),
+          if (viewable)
+            ListTile(leading: const Icon(Icons.description, color: _gold), title: const Text('View in SOV', style: TextStyle(color: Colors.white)),
+                subtitle: const Text('Stays inside SOV — no other app sees it', style: TextStyle(color: Colors.white54)),
+                onTap: () => Navigator.pop(ctx, 'view')),
+          ListTile(leading: const Icon(Icons.open_in_new, color: _gold), title: const Text('Open in another app', style: TextStyle(color: Colors.white)),
               onTap: () => Navigator.pop(ctx, 'open')),
-          ListTile(leading: const Icon(Icons.download, color: _gold), title: const Text('Save to Downloads', style: TextStyle(color: Colors.white)),
-              onTap: () => Navigator.pop(ctx, 'save')),
+          if (desktop)
+            ListTile(leading: const Icon(Icons.download, color: _gold), title: const Text('Save to Downloads', style: TextStyle(color: Colors.white)),
+                onTap: () => Navigator.pop(ctx, 'save')),
         ]),
       ),
     );
+    if (choice == 'view') {
+      if (!mounted) return;
+      await Navigator.push(context, MaterialPageRoute(builder: (_) => DocumentViewerScreen(
+        path: path,
+        onSendEdited: (edited) async {
+          final f = File(edited);
+          await _sendMedia(MediaResult(file: f, contentType: 'file',
+              mimeType: lookupMimeType(edited) ?? 'application/octet-stream', sizeBytes: await f.length()));
+        },
+      )));
+      return;
+    }
+    if (choice == 'open' && !desktop) {
+      await Share.shareXFiles([XFile(path)]);
+      return;
+    }
     if (choice == 'open') {
       await launchUrl(Uri.file(path));
     } else if (choice == 'save') {

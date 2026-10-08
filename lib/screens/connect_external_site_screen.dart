@@ -15,7 +15,7 @@
 //   - The signing key lives in KeyManager's secure storage. It is never
 //     transmitted; only Ed25519 signatures over short canonical payloads
 //     leave the device.
-//   - The pairing code is 6 digits + 90s TTL + one-use + domain-bound.
+//   - The pairing code is 6 digits + 5-min TTL + one-use + domain-bound.
 //     Useless as a stolen credential.
 //
 // Entry point: Profile tab → SECURITY section → "Connect to External Site"
@@ -179,6 +179,10 @@ class _ConnectExternalSiteScreenState extends State<ConnectExternalSiteScreen> {
         // relay refuses to overwrite it, so the only route in is the website.
         return 'You are already linked to this site. Sign in on the website '
                'with your SOV ID and the password you set when you linked.';
+      case 'PASSWORD_PLAINTEXT_REFUSED':
+        return 'This version of the app is out of date for site passwords. Update SOV and try again.';
+      case 'INVALID_PASSWORD_VERIFIER':
+        return 'Your password could not be protected on this device. Try again, or link without a password.';
       case 'INVALID_PASSWORD_LENGTH':
         return 'Password must be 8 to 256 characters.';
       case 'NETWORK_ERROR':

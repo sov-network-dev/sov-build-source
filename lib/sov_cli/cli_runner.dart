@@ -488,11 +488,15 @@ class SovCLI {
     final prefs  = await SharedPreferences.getInstance();
     final sovId  = prefs.getString('sovereign_id') ?? '';
 
-    final txs = TransactionStore.getAll(prefs);
-    final recent = txs.length > limit ? txs.sublist(txs.length - limit) : txs;
+    // D25 (1.2.27): take the NEWEST `limit` regardless of how the store is ordered (it is newest-first,
+    // so the old `sublist(length - limit)` returned the OLDEST entries).
+    int ts(Map<String, dynamic> t) => (t['created_at'] as int?) ?? (t['timestamp'] as int?) ?? 0;
+    final txs = [...TransactionStore.getAll(prefs)]..sort((a, b) => ts(b).compareTo(ts(a)));
+    final newest = txs.length > limit ? txs.sublist(0, limit) : txs;
+    final recent = newest.reversed.toList();   // oldest -> newest, for the table below
 
     if (json) {
-      print(jsonEncode(recent.reversed.toList()));
+      print(jsonEncode(newest));                // newest first
       return 0;
     }
 
@@ -1316,7 +1320,7 @@ foreach ($id in $pids) {
   // ───────────────────────────────────────────────────────────────────────────
   // AUTOMATION POLICY — network-enforced spend caps + allowlist for a bot wallet
   // The NODES enforce these limits, so a compromised PC that holds the key still
-  // cannot exceed them. Loosening a limit is delayed (cooldown) + alerted.
+  // cannot exceed them. Loosening a limit is delayed (cooldown); only this CLI can see or cancel it.
   // ───────────────────────────────────────────────────────────────────────────
   static Future<int> _cmdAutomation(Map<String, dynamic> opts, bool json) async {
     final rest = (opts['_rest'] as List<String>? ?? const <String>[]);
@@ -1432,7 +1436,7 @@ foreach ($id in $pids) {
     else {
       final cool = (resp?['cooldown_hours'] as num?)?.toInt() ?? 48;
       print('Loosening a limit is delayed ${cool}h for safety. It takes effect after the cooldown '
-            'unless you run "automation cancel" from any device.');
+            'unless you run "automation cancel" from this desktop CLI (on any desktop where this wallet is restored).');
     }
     return 0;
   }

@@ -8,6 +8,9 @@
 // after the plain fallback, so a new node error is never swallowed.
 
 const Map<String, String> _plain = {
+  // 1.2.27 (node 1.4.93): value oracle, petitions, disputes
+  'ALREADY_PROPOSED':     'You have already proposed a value this round. Rounds last one week.',
+  'PETITION_SWITCH_ONLY': 'A petition can only switch a feature on or off. To change a value, propose a poll.',
   // Polls
   'ALREADY_VOTED':    'You have already voted in this poll.',
   'POLL_CLOSED':      'This poll has closed.',

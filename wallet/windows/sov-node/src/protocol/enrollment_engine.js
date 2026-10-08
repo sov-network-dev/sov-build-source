@@ -145,6 +145,15 @@ class EnrollmentEngine {
   // ── Main entry point — called by CitizenGateway for ENROLL_REQUEST ────────
 
   async handleEnroll(ws, msg) {
+    // 1.4.93 (D1): EN is RETIRED. No shipped app sends it, and it carries neither a face nor a palm
+    // template, so neither one-human check could run; its commitment check is structural and can be
+    // satisfied by construction, so every forged commitment minted a new citizen paid from the
+    // citizens' pool. Enrolment is LE/LP (palm + face, both checked on the node).
+    if (ws) clearTimeout(ws._helloTimeout);
+    this._rejectEnroll(ws, 'ENROLL_ROUTE_RETIRED',
+      'This enrolment route is retired — enrol with the current SOV app (palm + face).');
+    return;
+    // eslint-disable-next-line no-unreachable
     const {
       embedding_commitment,   // 64-char hex: BCH(embedding) — the 255-bit codeword
       helper_data,            // Object: { slot_a, slot_b, slot_c } — BCH reconstruction
@@ -858,8 +867,8 @@ class EnrollmentEngine {
     // dual palm permanent one human could enroll twice. The liveness step now
     // captures a face embedding; here it is checked SERVER-SIDE (cannot be
     // skipped by a modified client, unlike the client-driven PALM_DUPLICATE_
-    // CHECK). Absent embedding = allowed for the old-client migration window
-    // unless FACE_REQUIRED=1. Threshold mirrors palm's env-var pattern.
+    // CHECK). 1.4.93 (D1): a face template is MANDATORY — absent or malformed is refused. "Absent =
+    // old client, allowed" let any client enrol past the only cross-hand duplicate check.
     let faceEmb = null;
     if (msg.face_embedding) {
       try {
@@ -914,9 +923,9 @@ class EnrollmentEngine {
           'This node could not confirm you are not already enrolled — please try again shortly.');
         return;
       }
-    } else if (process.env.FACE_REQUIRED === '1') {
+    } else {
       this._rejectLegacyEnroll(ws, 'FACE_REQUIRED',
-        'This node requires a face liveness capture to enroll — update your SOV app.');
+        'A face liveness capture is required to enrol — update your SOV app and retry the face step.');
       return;
     }
 

@@ -445,7 +445,7 @@ class MessageEngine {
     for (const watcherId of watchers) {
       const watcherConn = this._gateway && this._gateway.getConnection(watcherId);
       if (watcherConn) {
-        this._sendDirect(watcherConn, MSG_OP.CITIZEN_ONLINE, { cid: sovereignId, ts: Date.now() });
+        this._sendDirect(watcherConn, MSG_OP.CITIZEN_ONLINE, { cid: sovereignId, sovereign_id: sovereignId, ts: Date.now() });
       }
     }
 
@@ -468,7 +468,7 @@ class MessageEngine {
     // If the watched citizen is already online on this node — fire immediately
     const conn = this._gateway && this._gateway.getConnection(watching_id);
     if (conn) {
-      this._pushToSender(ws, MSG_OP.CITIZEN_ONLINE, { cid: watching_id, ts: Date.now() });
+      this._pushToSender(ws, MSG_OP.CITIZEN_ONLINE, { cid: watching_id, sovereign_id: watching_id, ts: Date.now() });
     }
   }
 
@@ -585,7 +585,7 @@ class MessageEngine {
     for (const watcherId of watchers) {
       const conn = this._gateway && this._gateway.getConnection(watcherId);
       if (conn) {
-        this._sendDirect(conn, MSG_OP.CITIZEN_ONLINE, { cid: sovereign_id, ts: Date.now() });
+        this._sendDirect(conn, MSG_OP.CITIZEN_ONLINE, { cid: sovereign_id, sovereign_id, ts: Date.now() });
       }
     }
   }
@@ -599,7 +599,7 @@ class MessageEngine {
     for (const watcherId of watchers) {
       const conn = this._gateway && this._gateway.getConnection(watcherId);
       if (conn) {
-        this._sendDirect(conn, MSG_OP.CITIZEN_OFFLINE, { cid: sovereign_id, ts: Date.now() });
+        this._sendDirect(conn, MSG_OP.CITIZEN_OFFLINE, { cid: sovereign_id, sovereign_id, ts: Date.now() });
       }
     }
   }

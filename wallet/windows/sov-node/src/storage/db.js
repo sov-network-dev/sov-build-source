@@ -242,6 +242,7 @@ const CONSENSUS_TABLES = [
   'sov_reputation','sov_polls','sov_poll_votes','sov_petitions','sov_petition_signatures',
   'sov_value_proposals','sov_vaults','sov_vault_claims','sov_inheritance_escrow',
   'sov_profiles',
+  'sov_certifications',   // 1.4.93 (D16): passed certifications, append-only
   // ── Witness signers (PI-37) ────────────────────────────────────────────
   // Added 2026-09-26. These were the ONE governance subsystem missing from this list,
   // so every node would have run its own private election, tallied its own votes and
@@ -658,6 +659,16 @@ class NodeDB {
       );
       CREATE INDEX IF NOT EXISTS idx_pioneer_code ON sov_pioneers (pioneer_code);
 
+      -- 1.4.93 (D16): a passed certification as an append-only FACT, so it replicates like the
+      -- other consensus tables. sov_pioneers rows change after creation and differ per node, so
+      -- they cannot be synced with INSERT OR IGNORE; a badge used to exist only on the grading node.
+      CREATE TABLE IF NOT EXISTS sov_certifications (
+        sovereign_id   TEXT    NOT NULL,
+        specialisation TEXT    NOT NULL,
+        certified_at   INTEGER NOT NULL,
+        PRIMARY KEY (sovereign_id, specialisation)
+      );
+
       -- ── Pioneer Assessment Questions ──────────────────────────────────────
       -- Bank of questions for relay_engineer / enrollment_agent / protocol_specialist
       CREATE TABLE IF NOT EXISTS sov_pioneer_questions (
@@ -816,7 +827,7 @@ class NodeDB {
       ['proof_of_service_reward_seeds','0'],            // seeds per proof score unit (0 = disabled until governance vote)
       ['max_nodes_per_operator',       '3'],            // max nodes one citizen may operate
       ['operator_signup_sample',       '5'],
-      ['tx_signature_enforce',         'log'],  // 'log' -> 'reject' once verified against live traffic            // peers asked to interrogate a joining node
+      ['tx_signature_enforce',         'reject'],  // 1.4.93 (D29, king 2026-10-08): verified against live traffic            // peers asked to interrogate a joining node
       ['operator_signup_quorum',       '3'],            // approvals required before a node counts as joined
       ['dedup_witnesses_n',            '3'],            // Phase 2: full peers asked to run a light node's dedup
       ['dedup_threshold_t',            '2'],            // Phase 2: agreeing signed answers required
@@ -857,6 +868,13 @@ class NodeDB {
     for (const [key, val] of DEFAULTS) {
       insert.run(key, val);
     }
+    // 1.4.93 (D29, king's decision 2026-10-08): transfers with a bad or missing signature are now
+    // REFUSED. 'log' was the rollout setting until live transfers (app and CLI) proved the signed
+    // payload; an INSERT OR IGNORE seed never reaches a node that already holds the row, so move it.
+    // This param is not votable and not replicated, so each node migrates itself, once.
+    this._db.prepare(
+      "UPDATE sov_governance_params SET param_value = 'reject' WHERE param_key = 'tx_signature_enforce' AND param_value = 'log'"
+    ).run();
   }
 
   // ── Pioneer questions seed ─────────────────────────────────────────────────
@@ -870,8 +888,6 @@ class NodeDB {
   // identities, no internal engineering terms — plain civic language only.
 
   _seedPioneerQuestions() {
-    const check = this._db.prepare('SELECT COUNT(*) as cnt FROM sov_pioneer_questions').get();
-    if (check && check.cnt === 48) return; // already correctly seeded — nothing to do
 
     const insert = this._db.prepare(`
       INSERT OR IGNORE INTO sov_pioneer_questions
@@ -886,21 +902,21 @@ class NodeDB {
       ['relay_engineer','Your node is switched off for a few hours. What happens when it returns?','Its citizens lose their balances','It must be re-installed from scratch','It automatically catches up from the other nodes and carries on — nothing is lost','It is permanently removed from the network','C'],
       ['relay_engineer','Can a citizen connect to any node on the network?','No, each citizen is locked to one node','Yes — every node can serve any citizen, and they all hold the same truth','Only if the operator approves them first','Only nodes in the same country','B'],
       ['relay_engineer','What can running a node earn an operator?','A share of every citizen\'s balance','Nothing, it is purely voluntary forever','The network can reward operators for the service their node provides, as decided by governance','A fee taken from every message sent','C'],
-      ['relay_engineer','Does running a node let the operator read citizens\' messages or take their SOV?','Yes, operators can see everything','No — messages are end-to-end encrypted and SOV can only move with the owner\'s signature','Operators can read messages but not move SOV','Operators can move SOV but not read messages','B'],
+      ['relay_engineer','Does running a node let the operator read citizens\' messages or take their SOV?','Yes, operators can see everything','No — messages are end-to-end encrypted, and SOV moves only when the owner\'s own signed-in wallet asks for it','Operators can read messages but not move SOV','Operators can move SOV but not read messages','B'],
       ['relay_engineer','An old computer or a nearly-full node can no longer hold all the data. What can it still do?','Nothing, it must shut down','Delete other citizens to make room','Keep taking part by delegating heavy work to more capable nodes and using their verified results','Force citizens to move to another node','C'],
       ['relay_engineer','What is the easiest way to install node software?','Compile it by hand from source','A one-command package on Linux, or a portable app on Windows and Mac','Order a pre-built server in the post','It can only be installed by the founder','B'],
-      ['relay_engineer','How does a brand-new node find the others when it first starts?','The operator types in every address by hand','It starts from a built-in list of known nodes and asks them for more peers','A central directory server assigns it','It waits for other nodes to call it','B'],
+      ['relay_engineer','How does a brand-new node find the others when it first starts?','The operator types in every address by hand','It finds them by itself through public peer discovery and gossip — no address is built into the software or needs typing','A central directory server assigns it','It waits for other nodes to call it','B'],
       ['relay_engineer','Is there a central server that controls the whole network?','Yes, one master server runs everything','No — nodes are equal peers, none is in charge, and any node can be replaced','Yes, but only during business hours','Only the founder\'s node can approve transactions','B'],
       ['relay_engineer','What is a full node on Windows or Mac?','A separate paid product','The same node software bundled with the wallet, running on your own PC, able to auto-start when your connection can be reached','A backup of the phone app','A tool only developers can use','B'],
       ['relay_engineer','Does a Windows or Mac operator need to scan their palm again to run a node?','Yes, every time they start it','No — they restore their existing wallet; they already passed verification','Yes, once per week','Only if they move house','B'],
-      ['relay_engineer','How is a node\'s stored data protected on the machine?','It is left as plain readable files','The node database is encrypted and its keys are locked to that specific machine','It is uploaded to a public website','It has no protection, so nodes hold no secrets','B'],
+      ['relay_engineer','How is a node\'s stored data protected on the machine?','It is left as plain readable files','The node database is encrypted; its key is kept in a separate protected file (on Windows it is also bound to that user\'s login)','It is uploaded to a public website','It has no protection, so nodes hold no secrets','B'],
       ['relay_engineer','What keeps the network healthy without an administrator watching it?','A paid support team fixes it each night','Nodes constantly check each other and self-heal — stale links are dropped and re-formed automatically','Citizens must restart their nodes daily','Nothing; problems must be reported by email','B'],
       ['relay_engineer','Why is the SOV network described as lightweight compared with older cryptocurrencies?','It stores fewer citizens','Nodes hold compact current records rather than an ever-growing chain of every transaction in history','It only runs a few hours a day','It deletes citizens who do not transact','B'],
       ['relay_engineer','When can a home full node start serving the network automatically?','Never — nodes must be started by hand each time','When it can be reached from the outside — for example through a working forwarded connection or a reachability service — the node can auto-start and join','Only between certain hours','Only if it is the fastest node','B'],
       // enrollment_agent  →  Enrollment Helper track
       ['enrollment_agent','What does palm enrollment actually create?','A photo of the palm stored on a server','A unique network identity from a mathematical commitment to the palm — the palm image itself is never stored','A username and password','A printed membership card','B'],
       ['enrollment_agent','What is a Sovereign ID?','An email address','A username the citizen picks','A unique network identity created at enrollment that reveals nothing about who the person is','A government reference number','C'],
-      ['enrollment_agent','How many wallets can one human have?','As many as they like','Exactly one — the palm check blocks the same person enrolling twice','One per device','One per country','B'],
+      ['enrollment_agent','How many wallets can one human have?','As many as they like','Exactly one — enrolment compares the new palm and face against every citizen and refuses a match','One per device','One per country','B'],
       ['enrollment_agent','What is the very first thing a new citizen should do after enrolling?','Share their Sovereign ID publicly','Save their encrypted wallet backup and write down their recovery phrase, kept offline','Send their reward to an exchange','Delete the app to stay safe','B'],
       ['enrollment_agent','Who receives the one-time enrollment reward?','The person who introduced them','The newly enrolled citizen themselves','The node operator','It is split between operators','B'],
       ['enrollment_agent','Is anyone paid by the network for referring or recruiting new citizens?','Yes, a fixed SOV amount per referral','No — the network never pays for referrals; the reward belongs to the enrolled citizen','Yes, but only certified helpers','Yes, a share of the new citizen\'s future transfers','B'],
@@ -915,7 +931,7 @@ class NodeDB {
       ['enrollment_agent','What should a citizen NEVER share publicly?','Their Sovereign ID','Their recovery phrase, backup file and PIN','The fact that they are enrolled','Which country they are in','B'],
       ['enrollment_agent','What does one-human-one-wallet mean for fairness at enrollment?','Rich citizens get extra wallets','Every person counts once, so rewards and votes cannot be gamed by making fake accounts','Only the first citizen in a family can enroll','Wallets are shared between family members','B'],
       // protocol_specialist  →  Protocol Expert track
-      ['protocol_specialist','How is the SOV supply controlled?','It grows without limit','There is a fixed cap; a community reserve can only be activated by a citizen vote','The founder mints more when needed','Each node creates its own supply','B'],
+      ['protocol_specialist','How is the SOV supply controlled?','It grows without limit','A fixed 50,000,000 SOV was created at genesis and nothing is ever minted — every payment comes out of that fixed supply','The founder mints more when needed','Each node creates its own supply','B'],
       ['protocol_specialist','How does governance voting work?','Votes are weighted by SOV balance','One enrolled human, one vote, regardless of balance — enforced by the one-person-one-identity check','Only node operators may vote','The founder has the final say','B'],
       ['protocol_specialist','How is double-spending prevented?','The fastest node wins a race to confirm','Every transfer is signed by the owner and ordered so the same balance cannot be spent twice, and nodes reconcile to the same result','Citizens must wait 24 hours between transfers','A central ledger checks each payment','B'],
       ['protocol_specialist','What is SOV Login?','Citizens hand their password to each website','Citizens sign in to outside websites by signing a challenge with their key — no password is shared and no separate account is made','A paid membership for premium sites','A way for websites to read a citizen\'s balance','B'],
@@ -923,15 +939,23 @@ class NodeDB {
       ['protocol_specialist','How does the SOV Exchange work?','A company sets the price and holds the funds','Peer-to-peer: citizens list and fill offers directly, funds held in escrow and released when the seller confirms — no middleman holds the money','Only the founder can approve trades','It only trades SOV for other coins','B'],
       ['protocol_specialist','What are certifications for in the current model?','They are network jobs that pay a salary','They are professional qualifications: a certified citizen can offer services and set their own price — the network does not pay them for it','They unlock extra voting power','They are required to hold a wallet','B'],
       ['protocol_specialist','What replaced any idea of "earning for referrals"?','A bigger referral bonus','Nothing pays for referrals — you learn the protocol, get certified, and charge clients for the services you provide','A monthly recruiter salary','A share of new citizens\' rewards','B'],
-      ['protocol_specialist','What happens to balances left completely inactive for many years?','They transfer to the founder','After a long period with no liveness and no allocation, they can be reclaimed or burned under protocol rules','They are given to node operators','They double in value automatically','B'],
+      ['protocol_specialist','What happens to balances left completely inactive for many years?','They transfer to the founder','Ordinary balances are never taken. Only a locked Vault whose owner shows no sign of life for 20 years moves to the operator pool, and the owner or a verified heir can still reclaim it','They are split among the other citizens','They double in value automatically','B'],
       ['protocol_specialist','What is the role of the justice council?','A team of operators who approve big transfers','Randomly selected active citizens who review certain disputes and inheritance claims and vote to approve or reject','The founder and advisors','A committee of senior recruiters','B'],
       ['protocol_specialist','How does the network stop any single node becoming a gatekeeper?','A backup node is kept in reserve','The app can use any available node and all nodes hold the same records, so no node can block a citizen','Government approval of each node','Citizens pay the node they trust most','B'],
       ['protocol_specialist','Can a node operator censor or reverse a citizen\'s transfer?','Yes, operators have that power','No — transfers need the owner\'s signature and any node can carry them','Only within the first minute','Only for large amounts','B'],
       ['protocol_specialist','What is proof of service?','Proof a citizen paid their fees','The idea that nodes can be rewarded for the useful work they do for the network, as set by governance','A certificate of enrollment','A record of a citizen\'s messages','B'],
-      ['protocol_specialist','How are protocol rules and values changed after launch?','The founder edits them','Citizens vote — a governed value changes only when a vote passes; nothing important is hard-coded','Node operators change them freely','They can never change','B'],
+      ['protocol_specialist','How are protocol rules and values changed after launch?','The founder edits them','Citizens vote — a governed setting changes only when a poll passes; some values are still fixed in the software and change only with a new release','Node operators change them freely','They can never change','B'],
       ['protocol_specialist','Why is SOV described as a sovereign mesh rather than a blockchain?','It uses a single giant server','Compact current state is held across equal, self-healing nodes instead of an ever-growing chain every node must keep forever','It has no records at all','It runs only on phones','B'],
       ['protocol_specialist','How does a certified citizen turn their qualification into income?','The network pays them a monthly wage','They offer their service to others, set their own price, and get paid directly in SOV — advertising, for example, on the Exchange','They collect a fee from every node','They are paid for each person they certify','B'],
     ];
+    // 1.4.93 (D18): reseed when the CONTENT differs, not when the count does — the old count check
+    // meant a corrected question never reached a node that already held 48 rows.
+    const _fp = (rows) => require('crypto').createHash('sha256').update(JSON.stringify(rows)).digest('hex');
+    const _have = this._db.prepare(
+      'SELECT specialisation, question, option_a, option_b, option_c, option_d, correct_answer FROM sov_pioneer_questions ORDER BY id'
+    ).all().map(r => [r.specialisation, r.question, r.option_a, r.option_b, r.option_c, r.option_d, r.correct_answer]);
+    if (_fp(_have) === _fp(questions)) return;   // already exactly this set — nothing to do
+
 
     // Atomic reset: clear whatever is there (empty, stale, or duplicated) and lay down
     // exactly the canonical set in one transaction so the table can never end up holding
@@ -1018,6 +1042,28 @@ class NodeDB {
     return r.t || 0;
   }
 
+  isEnrolled(sovereignId) {
+    try { return !!this._db.prepare('SELECT 1 FROM sov_enrollments WHERE sovereign_id = ?').get(String(sovereignId || '')); }
+    catch (_) { return false; }
+  }
+
+  // 1.4.93 (D46): remove GHOST accounts — rows with no money, no nonce, no enrolment, and no ledger
+  // operation that mentions them. They were made by a login (or a peer's copy of one), carry nothing,
+  // and could only accumulate. Also drops messaging keys and stale presence of never-enrolled ids.
+  pruneGhostAccounts() {
+    const ghost = `sovereign_id NOT IN (SELECT sovereign_id FROM sov_enrollments)`;
+    const tx = this._db.transaction(() => {
+      const disc = this._db.prepare(
+        `DELETE FROM sov_disc WHERE balance_seeds = 0 AND spendable_seeds = 0 AND COALESCE(nonce,0) = 0 AND ${ghost}
+           AND NOT EXISTS (SELECT 1 FROM sov_ledger_ops o WHERE o.owner_acct = sov_disc.sovereign_id
+                                                        OR instr(o.op_json, sov_disc.sovereign_id) > 0)`).run().changes;
+      const keys = this._db.prepare(`DELETE FROM sov_messaging_keys WHERE ${ghost}`).run().changes;
+      const pres = this._db.prepare(`DELETE FROM sov_presence WHERE ${ghost} AND last_seen < ?`).run(Date.now() - 3600000).changes;
+      return { disc, keys, pres };
+    });
+    try { return tx(); } catch (e) { global.sovLog && global.sovLog.warn('[DB] pruneGhostAccounts: ' + e.message); return { disc: 0, keys: 0, pres: 0 }; }
+  }
+
   ensureDiscEntry(sovereignId) {
     // GHOST-ROW GUARD: never create a disc row for an empty id or a transient
     // enrolment-application id (AS-2026-XXXX, a legacy relay operator scheme
@@ -1037,7 +1083,9 @@ class NodeDB {
     if (!sovereignId) return 0;
     const tsSec = Math.floor(Date.now() / 1000);
     try {
-      this.ensureDiscEntry(sovereignId);
+      // 1.4.93 (D46): only an ENROLLED citizen gets a wallet row from logging in. Creating one for
+      // any signed HELLO let anyone with a fresh key add a permanent row to every node.
+      if (this.isEnrolled(sovereignId)) this.ensureDiscEntry(sovereignId);
       this._db.prepare('UPDATE sov_disc SET liveness_ts = ? WHERE sovereign_id = ?').run(tsSec, sovereignId);
     } catch (e) { global.sovLog && global.sovLog.warn('[DB] touchLiveness: ' + e.message); }
     return tsSec;
@@ -1295,9 +1343,11 @@ class NodeDB {
     const row = this._db.prepare(
       'SELECT last_verified, public_key_hex, reputation FROM sov_node_registry WHERE node_id = ?'
     ).get(nodeId);
-    // New discovery gets a full grace window (last_verified = now) so it isn't pruned
-    // before it has a fair chance to prove itself. Existing rows only advance on real contact.
-    const lastVerified = row ? (verified ? now : row.last_verified) : now;
+    // last_verified advances ONLY on real reachability proof. A new row learned by gossip or an
+    // inbound socket starts at 0: giving it 'now' made a home node behind NAT count as verified
+    // for the whole fresh window, so its home IP was published (1.4.92). Unverified rows are
+    // pruned by last_seen instead (pruneDeadNodes).
+    const lastVerified = verified ? now : (row ? row.last_verified : 0);
     const pk  = (publicKeyHex && publicKeyHex !== '') ? publicKeyHex : (row ? row.public_key_hex : '');
     const rep = row ? row.reputation : 100;
     this._db.prepare(`
@@ -1338,7 +1388,12 @@ class NodeDB {
     const res = this._db.prepare(
       'DELETE FROM sov_node_registry WHERE last_verified > 0 AND last_verified < ?'
     ).run(cutoff);
-    return res.changes;
+    // Never-verified rows age out on last_seen: gossip only carries verified rows, so a node
+    // nobody can reach stops being mentioned and its row expires.
+    const res0 = this._db.prepare(
+      'DELETE FROM sov_node_registry WHERE last_verified = 0 AND last_seen < ?'
+    ).run(cutoff);
+    return res.changes + res0.changes;
   }
 
   // One-shot removal of explicitly-known-dead hosts (terminated VPS / test entries).
@@ -1373,6 +1428,15 @@ class NodeDB {
       INSERT OR REPLACE INTO sov_messaging_keys (sovereign_id, x25519_pub_hex, updated_at)
       VALUES (?, ?, ?)
     `).run(sovereignId, x25519PubHex, Date.now());
+  }
+
+  // 1.4.92: a key pushed by a peer (MESSAGING_KEY_PUBLISHED) — newest wins, as in state sync.
+  upsertMessagingKeyIfNewer(sovereignId, x25519PubHex, updatedAt) {
+    return this._db.prepare(
+      'INSERT INTO sov_messaging_keys (sovereign_id, x25519_pub_hex, updated_at) VALUES (?, ?, ?) ' +
+      'ON CONFLICT(sovereign_id) DO UPDATE SET x25519_pub_hex = excluded.x25519_pub_hex, updated_at = excluded.updated_at ' +
+      'WHERE excluded.updated_at > sov_messaging_keys.updated_at'
+    ).run(sovereignId, x25519PubHex, updatedAt).changes;
   }
 
   getMessagingPublicKey(sovereignId) {
@@ -1922,7 +1986,8 @@ class NodeDB {
     // tally is COUNT(*) grouped by candidate, and eligibility is decided by
     // `closes_at`, which IS hashed because it is deterministic.
     return ['updated_at', 'ts', 'last_seen', 'updated', 'last_message_at',
-            'synced_at', 'member_count', 'stood_at', 'voted_at'];
+            'synced_at', 'member_count', 'stood_at', 'voted_at',
+            'certified_at'];   // D16: two nodes grading the same pass stamp different times
   }
 
   _stableRow(r) {

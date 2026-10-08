@@ -61,8 +61,11 @@ class OutboxManager {
         final plaintext   = payload.substring(_awaitingKeyPrefix.length);
         final recipientKey = await RelayConnector.lookupMessagingKey(toId);
         if (recipientKey == null || recipientKey.isEmpty) {
-          // Still no key — re-watch and wait another cycle
-          await _addWatch(toId);
+          // D21 (1.2.27): they are online (that is why we are here) but their key has not reached
+          // our node yet. The node still holds our watch, so do NOT re-send WATCH_ADD (that could
+          // loop); re-check on a short back-off instead: 5, 10, ... 30 s.
+          _watchedRecipients.add(toId);
+          _scheduleKeyRecheck(toId);
           return;
         }
         final myPrivBytes = await MessageKeyManager.getPrivateKeyBytes();
@@ -231,7 +234,10 @@ class OutboxManager {
   }
 
   /// Retry all pending outbox messages on reconnect.
+  /// D21 (1.2.27): a reconnect may land on a DIFFERENT node (watch rows are per node), and the key
+  /// may have arrived while we were away — so re-register every watch AND retry the queue.
   static Future<void> retryAll() async {
+    _watchedRecipients.clear();
     final all = await ContactsDb.getAllOutboxQueued();
     final byRecipient = <String, List<Map<String, dynamic>>>{};
     for (final msg in all) {
@@ -240,7 +246,31 @@ class OutboxManager {
     }
     for (final entry in byRecipient.entries) {
       await _addWatch(entry.key);
+      for (final m in entry.value) {
+        await _retryMessage(m);
+      }
     }
+  }
+
+  static final Map<String, int> _keyRecheckCount = {};
+  static final Set<String> _keyRecheckPending = {};
+
+  static void _scheduleKeyRecheck(String toId) {
+    if (_keyRecheckPending.contains(toId)) return;
+    final n = (_keyRecheckCount[toId] ?? 0) + 1;
+    if (n > 6) {                        // give up for now; the next CITIZEN_ONLINE or reconnect retries
+      _keyRecheckCount.remove(toId);
+      _watchedRecipients.remove(toId);
+      return;
+    }
+    _keyRecheckCount[toId] = n;
+    _keyRecheckPending.add(toId);
+    Timer(Duration(seconds: 5 * n), () async {
+      _keyRecheckPending.remove(toId);
+      for (final m in await ContactsDb.getOutboxForRecipient(toId)) {
+        await _retryMessage(m);
+      }
+    });
   }
 
   static void dispose() {

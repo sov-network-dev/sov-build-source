@@ -198,6 +198,12 @@ global.sovLog.info(`      [VERSION] sov-relay v${process.env.SOV_RELAY_VERSION |
 
   log.info(`      ✓ Citizens on disc: ${db.citizenCount()}`);
 
+  // 1.4.93 (D46): ghost accounts — empty, never-enrolled rows a login used to create — are removed.
+  try {
+    const g = db.pruneGhostAccounts();
+    if (g.disc || g.keys || g.pres) log.info(`      ✓ Removed ghost accounts: ${g.disc} wallet row(s), ${g.keys} key(s), ${g.pres} presence row(s)`);
+  } catch (_) {}
+
   // ── Step 4 — Network ──────────────────────────────────────────────────────
   log.info('[4/9] Configuring network reachability...');
   const { NetworkManager } = require('./network/network_manager');
@@ -364,7 +370,7 @@ global.sovLog.info(`      [VERSION] sov-relay v${process.env.SOV_RELAY_VERSION |
   peerMesh.setOperatorEngine(operatorEngine);
 
   // Monthly operator payout — checks hourly, fires once per 30-day period.
-  // Anti-monopoly tier multipliers locked in protocol (1.0/0.5/0.25/0).
+  // Anti-monopoly tier multipliers locked in protocol (1.00/0.25/0.25/0 — operator_engine.js _PAYOUT_TIER_RATES).
   setInterval(() => operatorEngine._runMonthlyOperatorPayout(), 3600 * 1000);
   // First check 60s after boot
   setTimeout(() => operatorEngine._runMonthlyOperatorPayout(), 60 * 1000);

@@ -67,6 +67,11 @@ const NETWORK_MASTER_PUBLIC_KEY_HEX =
   process.env.NETWORK_MASTER_PUBLIC_KEY ||
   '0000000000000000000000000000000000000000000000000000000000000000'; // set at build time
 
+
+// 1.4.92: host part of a mesh address ('ws://h:p', 'h:p', '[v6]:p') for comparing a claim with a dial.
+function _hostOf(a) {
+  return String(a || '').replace(/^wss?:\/\//, '').replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase();
+}
 class PeerMesh {
 
   constructor(identity, network, db, relayPool) {
@@ -141,7 +146,7 @@ class PeerMesh {
       if (nodeId === excludeNodeId) continue;
       if (!peer.verified) continue; // never send to unverified peers
       if (peer.ws.readyState === WebSocket.OPEN) {
-        peer.ws.send(JSON.stringify(msg));
+        this._wsSend(peer.ws, msg);
       }
     }
   }
@@ -149,8 +154,7 @@ class PeerMesh {
   sendTo(nodeId, type, payload) {
     const peer = this._peers.get(nodeId);
     if (!peer || !peer.verified || peer.ws.readyState !== WebSocket.OPEN) return false;
-    peer.ws.send(JSON.stringify(this._sign({ type, ...payload })));
-    return true;
+    return this._wsSend(peer.ws, this._sign({ type, ...payload }));
   }
 
   on(type, handler) { this._handlers.set(type, handler); }
@@ -229,6 +233,39 @@ class PeerMesh {
     return [...this._peers.values()].filter(p =>
       p.verified && p.ws.readyState === WebSocket.OPEN
     );
+  }
+
+  // 1.4.92: may this node's address be handed to citizens or published? Only if WE reached it
+  // there by an outbound dial within the fresh window — never an inbound-only (NAT'd home) peer.
+  isAddressProven(nodeId) {
+    const r = this._registry.get(nodeId);
+    return !!(r && r.lastVerified && r.lastVerified >= Date.now() - GOSSIP_FRESH_MS);
+  }
+
+  // 1.4.92: prove a peer's claimed address by dialling it ourselves (a peer we only know through
+  // a connection IT opened). At most once per 10 minutes per peer.
+  _proveAddress(nodeId, address) {
+    if (!address || this.isAddressProven(nodeId)) return;
+    this._proving = this._proving || new Map();
+    if (Date.now() - (this._proving.get(nodeId) || 0) < 10 * 60 * 1000) return;
+    this._proving.set(nodeId, Date.now());
+    let ws;
+    try { ws = new WebSocket(address.startsWith('ws') ? address : `ws://${address}`, { handshakeTimeout: DIAL_TIMEOUT_MS }); }
+    catch (_) { return; }
+    ws._probeFor = nodeId; ws._dialAddress = address; ws._helloSent = true;
+    const t = setTimeout(() => { try { ws.terminate(); } catch (_) {} }, 20000);
+    ws.on('open', () => { const h = this._buildHelloPayload(ws); h.probe = true; try { ws.send(JSON.stringify(h)); } catch (_) {} });
+    ws.on('message', (raw) => this._handleMessage(ws, raw));
+    ws.on('error', () => { clearTimeout(t); try { ws.terminate(); } catch (_) {} });
+    ws.on('close', () => clearTimeout(t));
+  }
+
+  // Active peers whose address is proven (see isAddressProven) — what citizens may be given.
+  provenPeers() {
+    return this.activePeers().filter(p => {
+      for (const [id, q] of this._peers) if (q === p) return this.isAddressProven(id);
+      return false;
+    });
   }
 
   async close() {
@@ -320,6 +357,7 @@ class PeerMesh {
       let ws;
       try {
         ws = new WebSocket(url, { rejectUnauthorized: false, handshakeTimeout: DIAL_TIMEOUT_MS });
+        ws._dialAddress = address;   // 1.4.92: the address WE reached, checked against the peer's claim
       } catch (_) { release(); return resolve(); }
 
       // Hard cap on how long a dial may sit unconnected. handshakeTimeout only
@@ -338,8 +376,8 @@ class PeerMesh {
         // Set _helloSent BEFORE sending so that when the peer responds with
         // their own PEER_HELLO we don't reply again (prevents infinite loop).
         ws._helloSent = true;
-        const helloPayload = this._buildHelloPayload();
-        ws.send(JSON.stringify(helloPayload));
+        const helloPayload = this._buildHelloPayload(ws);
+        ws.send(JSON.stringify(helloPayload));   // PEER_HELLO is the one plaintext frame
         resolve();
       });
 
@@ -394,9 +432,14 @@ class PeerMesh {
 
   // ── Build PEER_HELLO with interrogation proofs ────────────────────────────
 
-  _buildHelloPayload() {
+  _buildHelloPayload(ws) {
     const timestamp = Date.now();
     const nodeId    = this._identity.nodeId;
+    // 1.4.92 link encryption: a fresh X25519 key for THIS connection, bound to our identity by a
+    // signature so nobody in the path can swap it. Every frame after the HELLOs is sealed with it.
+    if (ws && !ws._linkKeys) ws._linkKeys = nacl.box.keyPair();
+    const linkPub = ws && ws._linkKeys ? Buffer.from(ws._linkKeys.publicKey).toString('hex') : '';
+    const linkSig = linkPub ? this._identity.signMessage(Buffer.from(`SOV-LINK-v1|${nodeId}|${timestamp}|${linkPub}`)).toString('hex') : '';
 
     // Identity proof: sign (node_id + timestamp) with our private key
     const identityProofData = Buffer.from(`${nodeId}:${timestamp}`);
@@ -435,6 +478,8 @@ class PeerMesh {
       // because a peer on an older build silently drops RELAY_REGISTER. Absent
       // field ⇒ treated as not-capable (old snap).
       circuit_relay:   true,
+      link_pub:        linkPub,
+      link_sig:        linkSig,
     };
 
     return payload; // PEER_HELLO is not signed with node key — it IS the handshake
@@ -463,9 +508,37 @@ class PeerMesh {
 
   // ── Message handling ───────────────────────────────────────────────────────
 
+  // 1.4.92: the mesh link is encrypted. Only PEER_HELLO travels in the clear; once both HELLOs
+  // are exchanged every frame is nacl.secretbox-sealed under the per-connection X25519 key, and a
+  // plaintext frame is dropped (no downgrade). Before the link exists nothing else may be sent.
+  _wsSend(ws, obj) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    if (!ws._linkShared) {
+      global.sovLog.debug(`[Mesh] not sent (link not encrypted yet): ${obj && obj.type}`);
+      return false;
+    }
+    const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
+    const box = nacl.secretbox(new Uint8Array(Buffer.from(JSON.stringify(obj))), nonce, ws._linkShared);
+    ws.send(JSON.stringify({ e: Buffer.concat([Buffer.from(nonce), Buffer.from(box)]).toString('base64') }));
+    return true;
+  }
+
   _handleMessage(ws, raw) {
     let msg;
     try { msg = JSON.parse(raw); } catch (_) { return; }
+    if (msg && typeof msg.e === 'string') {
+      if (!ws._linkShared) return;
+      try {
+        const b = Buffer.from(msg.e, 'base64');
+        const n = nacl.secretbox.nonceLength;
+        const open = b.length > n ? nacl.secretbox.open(new Uint8Array(b.subarray(n)), new Uint8Array(b.subarray(0, n)), ws._linkShared) : null;
+        if (!open) { global.sovLog.debug('[Mesh] undecryptable frame dropped'); return; }
+        msg = JSON.parse(Buffer.from(open).toString('utf8'));
+      } catch (_) { return; }
+    } else if (!msg || msg.type !== 'PEER_HELLO') {
+      global.sovLog.debug(`[Mesh] plaintext ${msg && msg.type} dropped — the mesh link is encrypted`);
+      return;
+    }
 
     // PEER_HELLO is the interrogation handshake — handled specially
     if (msg.type === 'PEER_HELLO') {
@@ -604,6 +677,49 @@ class PeerMesh {
       return;
     }
 
+    // ── Check 7 (1.4.92): link key, signed by the identity key just proven ──
+    const { link_pub, link_sig } = msg;
+    let _linkOk = false;
+    try {
+      _linkOk = /^[0-9a-f]{64}$/.test(String(link_pub || '')) && NodeIdentity.verify(
+        Buffer.from(`SOV-LINK-v1|${node_id}|${timestamp}|${link_pub}`),
+        Buffer.from(String(link_sig || ''), 'hex'), pubKeyBytes);
+    } catch (_) { _linkOk = false; }
+    if (!_linkOk) {
+      global.sovLog.info(`Peer HELLO rejected: no valid link key — ${node_id.slice(0, 16)} (pre-1.4.92 software?)`);
+      ws.close(4009, 'HELLO_LINK_KEY_REQUIRED');
+      return;
+    }
+    if (!ws._linkKeys) ws._linkKeys = nacl.box.keyPair();   // inbound: our reply HELLO carries it
+    ws._linkShared = nacl.box.before(new Uint8Array(Buffer.from(link_pub, 'hex')), ws._linkKeys.secretKey);
+
+    // ── 1.4.92 dial-back proof ────────────────────────────────────────────────
+    // (a) We are the PROBER: we dialled this address only to see who answers. Mark it proven
+    //     only if the node we expected answered, at exactly the address it claims; then hang up.
+    if (ws._probeFor) {
+      if (node_id === ws._probeFor && _hostOf(ws._dialAddress) === _hostOf(address)) {
+        this._updateRegistry(node_id, address, public_key, true);
+        const p = this._peers.get(node_id);
+        if (p) p.addressProven = true;
+        if (this._relayPool) { try { this._relayPool.addOrUpdate(node_id, address, version); } catch (_) {} }
+        global.sovLog.info(`[Mesh] Address proven by dial-back: ${node_id.slice(0, 16)}… @ ${address}`);
+      } else {
+        global.sovLog.info(`[Mesh] Dial-back to ${ws._dialAddress} answered as ${node_id.slice(0, 16)}… claiming ${address} — not proven`);
+      }
+      try { ws.close(1000, 'PROBE_DONE'); } catch (_) {}
+      return;
+    }
+    // (b) We are PROBED: answer with our HELLO so the prober can see who we are, then close.
+    //     Nothing is stored or changed here, so a forged probe flag gains nothing.
+    if (msg.probe === true && ws._inbound) {
+      try { ws.send(JSON.stringify(this._buildHelloPayload(ws))); } catch (_) {}
+      if (this._network && typeof this._network.markInboundVerified === 'function') {
+        try { this._network.markInboundVerified(address || node_id.slice(0, 12)); } catch (_) {}
+      }
+      setTimeout(() => { try { ws.close(1000, 'PROBE_ANSWERED'); } catch (_) {} }, 2000);
+      return;
+    }
+
     // ── All checks passed — peer accepted ───────────────────────────────────
     ws._verified = true;
     ws._nodeId   = node_id;
@@ -630,7 +746,14 @@ class PeerMesh {
       // the address it claims is reachable, because a node behind a NAT with no
       // port forwarding can dial out perfectly well and never accept anything in.
       // Only mark the address verified when WE dialled THEM at it and it worked.
-      this._updateRegistry(node_id, address, public_key, !ws._inbound);
+      // 1.4.92: and only when the address it CLAIMS is the one we actually dialled. Otherwise a
+      // peer could get any address (someone else's, or a victim's) stamped verified and published.
+      const _claimProven = !ws._inbound && !!ws._dialAddress && _hostOf(ws._dialAddress) === _hostOf(address);
+      if (!ws._inbound && !_claimProven) {
+        global.sovLog.info(`Peer ${String(node_id).slice(0, 16)} claims ${address} but was reached at ${ws._dialAddress} — address not marked verified`);
+      }
+      this._peers.get(node_id) && (this._peers.get(node_id).addressProven = _claimProven);
+      this._updateRegistry(node_id, address, public_key, _claimProven);
 
 
       // ── cancelable-key fingerprint check ────────────────────────────────
@@ -709,7 +832,7 @@ class PeerMesh {
       }
 
       // Update relay pool — this is now a known active citizen node
-      if (this._relayPool) {
+      if (this._relayPool && this.isAddressProven(node_id)) {   // 1.4.92: proven addresses only
         this._relayPool.addOrUpdate(node_id, address, version);
       }
 
@@ -718,7 +841,7 @@ class PeerMesh {
       // Without this, phones only discover new nodes on their next reconnect.
       // IP masking rule: relay_id uses opaque node hash tag; name/nickname are
       // human-readable labels without raw IP to prevent passive IP enumeration.
-      if (this._gateway && address) {
+      if (this._gateway && address && this.isAddressProven(node_id)) {   // 1.4.92: never an unproven (home) address
         const parts   = address.split(':');
         const ip      = parts[0];
         const port    = parts[1] ? parseInt(parts[1]) : 443;
@@ -798,7 +921,7 @@ class PeerMesh {
     // reply to the server's response PEER_HELLO, which would create an infinite loop.
     if (!ws._helloSent) {
       ws._helloSent = true;
-      ws.send(JSON.stringify(this._buildHelloPayload()));
+      ws.send(JSON.stringify(this._buildHelloPayload(ws)));   // plaintext by design (handshake)
       // Send peer list to help them discover more nodes
       this._handlePeerListRequest(ws);
     }
@@ -810,11 +933,11 @@ class PeerMesh {
       ws._offerSeed = false;
       try {
         const ns = require('../security/network_seed');
-        ws.send(JSON.stringify(this._sign({
+        this._wsSend(ws, this._sign({
           type:    'NETWORK_SEED',
           node_id: this._identity.nodeId,
           seed:    ns.load(),
-        })));
+        }));
         global.sovLog.info(
           `[Mesh] Offered the network seed to ${node_id.slice(0, 12)}… (they were on the legacy key).`
         );
@@ -972,7 +1095,8 @@ class PeerMesh {
       // and must not publish it to citizens via the relay pool. Otherwise the
       // unproven address leaks into the pool one heartbeat after the handshake
       // and the check above is worthless.
-      const _reachable = !peer.inbound;
+      const _reachable = !peer.inbound && peer.addressProven !== false;   // 1.4.92: claim must match the dial
+      if (!_reachable && peer.address && !this.isAddressProven(msg.node_id)) this._proveAddress(msg.node_id, peer.address);
       this._updateRegistry(msg.node_id, peer.address, peer.publicKey, _reachable);
       if (_reachable && this._relayPool && peer.address) { try { this._relayPool.addOrUpdate(msg.node_id, peer.address, peer.version); } catch (_) {} }
 
@@ -1039,7 +1163,7 @@ class PeerMesh {
         address:    info.address,
         public_key: info.publicKey,
       }));
-    ws.send(JSON.stringify(this._sign({ type: 'PEER_LIST', peers })));
+    this._wsSend(ws, this._sign({ type: 'PEER_LIST', peers }));
   }
 
   _handlePeerDisconnect(ws) {
@@ -1178,7 +1302,7 @@ class PeerMesh {
   _requestPeerList() {
     for (const peer of this._peers.values()) {
       if (peer.verified && peer.ws.readyState === WebSocket.OPEN) {
-        peer.ws.send(JSON.stringify(this._sign({ type: 'PEER_LIST_REQ' })));
+        this._wsSend(peer.ws, this._sign({ type: 'PEER_LIST_REQ' }));
       }
     }
   }
@@ -1190,7 +1314,7 @@ class PeerMesh {
   _updateRegistry(nodeId, address, publicKey, verified = false) {
     const now  = Date.now();
     const prev = this._registry.get(nodeId);
-    const lastVerified = prev ? (verified ? now : (prev.lastVerified || 0)) : now;
+    const lastVerified = verified ? now : (prev ? (prev.lastVerified || 0) : 0);   // 1.4.92: no grace
     this._registry.set(nodeId, { address, publicKey, lastSeen: now, lastVerified });
     if (this._db) this._db.upsertNodeRegistry(nodeId, address, publicKey, verified);
   }

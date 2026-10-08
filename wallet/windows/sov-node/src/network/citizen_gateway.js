@@ -454,6 +454,16 @@ class CitizenGateway {
     // mesh keeps one handler per type, so whichever registered last silently won). The handler
     // receives the socket so the claim is accepted only from node N itself.
     peerMesh.on('CITIZEN_ONLINE_RELAY',    (msg, ws) => gw._handleCrossRelayOnline(msg, ws));
+    // 1.4.92: a citizen's messaging key, pushed by the node they published it on (newest wins).
+    peerMesh.on('MESSAGING_KEY_PUBLISHED', (msg) => {
+      const id = String((msg && msg.sovereign_id) || ''), key = String((msg && msg.x25519_pub_hex) || '').toLowerCase();
+      const at = Number(msg && msg.updated_at);
+      if (!/^SOV-[0-9A-F]{16}$/i.test(id) || !/^[0-9a-f]{64}$/.test(key)) return;
+      if (!Number.isFinite(at) || at > Date.now() + 5 * 60 * 1000) return;
+      // The SENDING node only pushes keys of enrolled citizens (D46), so no enrolment check here:
+      // a brand-new citizen's key may arrive before their enrolment record does (D44).
+      try { gw._db.upsertMessagingKeyIfNewer(id, key, at); } catch (_) {}
+    });
     peerMesh.on('CITIZEN_OFFLINE_RELAY',   (msg, ws) => gw._handleCrossRelayOffline(msg, ws));
     // Presence is a fact about NOW. (1) At start nobody is connected here, so any row saying a
     // citizen is online at THIS node is left over from before a restart — and it made this node
@@ -541,6 +551,8 @@ class CitizenGateway {
         for (const row of (msg.rows || [])) {
           const local = db._db.prepare('SELECT balance_seeds, nonce FROM sov_disc WHERE sovereign_id = ?').get(row.sovereign_id);
           if (!local) {
+            // 1.4.93 (D46): never copy an empty, never-enrolled row — that is how a ghost spread.
+            if (Number(row.balance_seeds || 0) === 0 && Number(row.nonce || 0) === 0 && !db.isEnrolled(row.sovereign_id)) continue;
             try { db.ensureDiscEntry(row.sovereign_id); applied++; } catch (_) {}
             differs++;
           } else if (Number(row.balance_seeds) !== Number(local.balance_seeds) || Number(row.nonce || 0) !== Number(local.nonce || 0)) {
@@ -821,7 +833,13 @@ class CitizenGateway {
       try { ws.close(4090, 'OPERATOR_NOT_AUTHORIZED'); } catch (_) {}
       return;
     }
-    const remoteIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    // 1.4.92: X-Forwarded-For is client-supplied text. Trust it only when the socket itself comes
+    // from this machine (a local tunnel/proxy such as Tailscale Funnel); otherwise anyone could
+    // dodge the per-IP cap or pose as a local source by sending the header.
+    const _sockIP = String(req.socket.remoteAddress || '');
+    const _viaLocalProxy = /^(::ffff:)?127\./.test(_sockIP) || _sockIP === '::1';
+    const _xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    const remoteIP = (_viaLocalProxy && _xff) ? _xff : _sockIP;
 
     // reach-probe-v1: Funnel exposes ONLY :443, never the peer port, so no peer
     // can ever dial a tunnelled node. A citizen arriving from off-network proves
@@ -1145,7 +1163,8 @@ class CitizenGateway {
       case MSG_TYPE.LEDGER_SYNC_REQUEST: return this._handleLedgerSyncRequest(ws, msg);
       case MSG_TYPE.LEDGER_SYNC_ACK:   return; // Acknowledged — no further action
       case MSG_TYPE.MESSAGE_DELIVERY_RECEIPT: return; // Delivery confirmed — already logged on send
-      case MSG_TYPE.NODE_QUERY:        return this._phoneMesh.handlePhoneMessage(ws._sovereignId, ws, raw);
+      case MSG_TYPE.NODE_QUERY:        if (ws._legacyMode) return;   // 1.4.92: location answers need a signed session
+        return this._phoneMesh.handlePhoneMessage(ws._sovereignId, ws, raw);
       case MSG_TYPE.FRAG_ANNOUNCE:     return this._phoneMesh.handlePhoneMessage(ws._sovereignId, ws, raw);
       case MSG_TYPE.FRAG_REQUEST:      return this._phoneMesh.handlePhoneMessage(ws._sovereignId, ws, raw);
       case MSG_TYPE.FRAG_DELIVER:      return this._phoneMesh.handlePhoneMessage(ws._sovereignId, ws, raw);
@@ -1324,14 +1343,25 @@ class CitizenGateway {
         ws.close(4005, 'HELLO_INVALID_SIGNATURE');
         return;
       }
-    } else {
-      // ── Legacy HELLO: no signature. Log warning; accept for backward compat. ─
-      // Remove this branch once all apps are updated to sign HELLOs.
-      global.sovLog.debug(`[GW] Legacy unsigned HELLO from ${sovereign_id} — upgrade app for full security`);
     }
 
     // Look up enrollment — citizen must be enrolled in the network
     const enrollment = this._db.getEnrollment(sovereign_id);
+
+    // ── Unsigned HELLO for an ENROLLED citizen: REFUSED (1.4.92, audit D36). ─────────
+    // An unsigned HELLO skips the enrolled-key binding below, so anyone who knew a citizen's
+    // Sovereign ID could log in as them, REPLACE their published messaging key and have their
+    // incoming messages routed to the impostor's socket - end-to-end encryption defeated.
+    // Money was already gated (C3 fix); messages were not. An enrolled citizen's app always
+    // holds its key and signs. Unsigned HELLO stays allowed ONLY for an ID that is not
+    // enrolled (the enrolment flow, before the key is stored) - and even then it may not
+    // publish a messaging key (see below), so nothing can be planted for a future citizen.
+    if (legacyMode && enrollment) {
+      try { this._send(ws, MSG_TYPE.ERROR, { code: 'HELLO_SIGNATURE_REQUIRED',
+        message: 'This account needs a signed login. Please update or restart your SOV app.' }); } catch (_) {}
+      ws.close(4005, 'HELLO_SIGNATURE_REQUIRED');
+      return;
+    }
 
     // ── Bind the presented key to the enrolled key ───────────────────────────
     // The signature check above proves the caller holds the private key for the
@@ -1359,7 +1389,8 @@ class CitizenGateway {
 
     if (!enrollment) {
       // Not enrolled here — check if we know which node they belong to
-      const presence = this._db.getCitizenPresence(sovereign_id);
+      // 1.4.92: a redirect reveals where a citizen was last seen, so only a SIGNED HELLO gets one.
+      const presence = legacyMode ? null : this._db.getCitizenPresence(sovereign_id);
       if (presence && presence.node_id !== this._identity.nodeId) {
         // Redirect to their home node
         this._send(ws, MSG_TYPE.ERROR, {
@@ -1390,9 +1421,21 @@ class CitizenGateway {
     // Update presence in DB
     this._db.setPresenceOnline(sovereign_id, this._identity.nodeId, this._identity.publicAddress);
 
-    // Store messaging public key if provided (for E2E encryption)
-    if (messaging_public_key) {
-      this._db.setMessagingPublicKey(sovereign_id, messaging_public_key);
+    // Store messaging public key if provided (for E2E encryption) - SIGNED sessions only (D36):
+    // an unsigned session proves nothing about who holds this Sovereign ID.
+    // 1.4.93 (D46): and only for an ENROLLED citizen — a never-enrolled key has no one to message.
+    if (messaging_public_key && !legacyMode && enrollment && /^[0-9a-fA-F]{64}$/.test(String(messaging_public_key))) {
+      const _key = String(messaging_public_key).toLowerCase();
+      // 1.4.92: push a NEW key to the peers straight away. It used to reach them only through state
+      // sync, which runs when balance/exchange fingerprints differ — so a citizen on another node
+      // could get "no key" for this citizen until some unrelated change happened.
+      if (String(this._db.getMessagingPublicKey(sovereign_id) || '').toLowerCase() !== _key) {
+        this._db.setMessagingPublicKey(sovereign_id, _key);
+        try {
+          this._peerMesh && this._peerMesh.broadcast('MESSAGING_KEY_PUBLISHED',
+            { sovereign_id, x25519_pub_hex: _key, updated_at: Date.now() });
+        } catch (_) {}
+      }
     }
 
     // Store palm name if provided and row currently empty
@@ -1714,8 +1757,11 @@ class CitizenGateway {
 
     this._db.addWatch(watcherId, watchingId);
 
-    // If they are already online, notify immediately
-    if (this._citizens.has(watchingId)) {
+    // If they are already online, notify immediately — here OR at another node (1.4.93, D21: a
+    // recipient online elsewhere never triggered the sender's retry, so the message sat queued).
+    const _pres = this._citizens.has(watchingId) ? null : this._db.getCitizenPresence(watchingId);
+    const _onlineElsewhere = !!(_pres && _pres.status === 'online' && Date.now() - Number(_pres.last_seen || 0) < 10 * 60 * 1000);
+    if (this._citizens.has(watchingId) || _onlineElsewhere) {
       this._deliverToConnected(watcherId, MSG_TYPE.CITIZEN_ONLINE, {
         sovereign_id: watchingId,
         ts:           Date.now(),

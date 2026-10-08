@@ -957,7 +957,18 @@ class _EnrollmentScreenState extends State<EnrollmentScreen>
       } else if (result is String) {
         proofHash = result;
       }
-      if (proofHash != null && proofHash.isNotEmpty) {
+      if (proofHash != null && proofHash.isNotEmpty && _faceEmbedding == null) {
+        // D1 (1.2.27): a face capture is REQUIRED — nodes refuse an enrolment without one (one human,
+        // one identity). Ask for the face step again instead of failing after the palm and PIN.
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('Your face was not captured. Please retry the face step in good light, '
+                'with your face centred in the frame.'),
+            duration: Duration(seconds: 6),
+          ));
+        }
+        setState(() {});
+      } else if (proofHash != null && proofHash.isNotEmpty) {
         await _onLivenessPassed(proofHash);
       } else {
         // User dismissed — rebuild to show retry UI.
@@ -1151,6 +1162,9 @@ class _EnrollmentScreenState extends State<EnrollmentScreen>
           pendingPrefs.setString('pending_key_hash',        _leftEnroll!.masterKeyHash),
           pendingPrefs.setString('pending_hand_type',       _enrollHand),
           pendingPrefs.setDouble('pending_threshold',       _leftEnroll!.quantizeThreshold),
+          // D1: an interrupted enrolment resumed from Recovery must carry the face too.
+          if (_faceEmbedding != null)
+            pendingPrefs.setString('pending_face_embedding', jsonEncode(_faceEmbedding)),
         ]);
         debugPrint('[ENROLL] Intermediate write OK: enroll_pending=true  sovId=$_sovId');
       } catch (e) {
@@ -1232,9 +1246,8 @@ class _EnrollmentScreenState extends State<EnrollmentScreen>
           'key_hash':           _leftEnroll!.masterKeyHash,
           'hand_type':          _enrollHand,
           // FACE-LOCK: liveness face embedding (192-d) — node-side one-human-
-          // one-identity dedup across both hands. Null = omitted (old-client
-          // behaviour; node allows unless FACE_REQUIRED=1).
-          if (_faceEmbedding != null) 'face_embedding': _faceEmbedding,
+          // one-identity dedup across both hands. REQUIRED since node 1.4.93 (D1).
+          'face_embedding': _faceEmbedding,
           // [PALM-NAME] Send palm name with registration so relay stores it immediately
           'palm_name':          preRegPalmName,
         },
@@ -1252,6 +1265,9 @@ class _EnrollmentScreenState extends State<EnrollmentScreen>
       }
       if (palmResp['success'] != true) {
         final errCode = (palmResp['error'] ?? '').toString();
+        if (errCode == 'FACE_REQUIRED') {
+          throw Exception('Your face was not captured. Go back and retry the face step in good light.');
+        }
         if (errCode == 'FACE_ALREADY_ENROLLED') {
           throw Exception(
               'This face already has a SOV identity. One human, one identity — '

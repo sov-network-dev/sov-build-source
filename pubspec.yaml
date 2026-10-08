@@ -16,7 +16,7 @@ publish_to: 'none'
 # therefore claimed versionCode 1, and Android cannot order two builds that agree on
 # versionCode, so no release could ever update another. See
 # docs/PUBLIC_DOWNLOAD_IS_WRONG_2026-08-26.md section 3.
-version: 1.2.26+10226
+version: 1.2.27+10227
 
 environment:
   sdk: '>=3.5.0 <4.0.0'
@@ -103,6 +103,11 @@ dependencies:
   # a real phone call). Used by main_shell.dart _showIncomingCallBanner.
   flutter_ringtone_player: ^4.0.0+3
   sqflite_common_ffi: ^2.4.0+3
+  pdfrx: ^2.4.7
+  archive: ^4.3.0
+  xml: ^7.0.1
+  flutter_markdown_plus: ^1.0.12
+  bcrypt: ^1.2.0
 
 dev_dependencies:
   flutter_driver:

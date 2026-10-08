@@ -101,6 +101,7 @@ class _EconomySnapshotScreenState extends State<EconomySnapshotScreen> {
       case 'pioneer':               return 'Pioneer Referral Rewards';
       case 'foundation_treasury':   return 'Foundation Treasury';
       case 'community_contributors':return 'Community Contributors';
+      case 'bonds_held':            return 'Bonds Held';   // D31
       // Legacy IDs (pre-fair-launch-refactor) — kept for backwards-compat with any
       // older relay still serving them; display only, no economic effect on a
       // fair-launch network where these pools no longer exist.
@@ -116,6 +117,7 @@ class _EconomySnapshotScreenState extends State<EconomySnapshotScreen> {
       case 'witness_operator':      return 'Funds relay operators. Grows from transfer fees + SOV Link fees + the 10 SOV platform-registration fee. Distributed monthly via governance-set algorithm.';
       case 'pioneer':               return 'Rewards referrals + certifications. Sunsets when governance votes pioneer_rewards_active = 0.';
       case 'foundation_treasury':   return 'Community-governed tranches. Citizens vote on allocation via Allocation Protocol.';
+      case 'bonds_held':            return 'SOV citizens have put up as bonds (Academy articles and upvotes). Held, not spent: it is returned or paid out under the rules of that feature. Not new money.';
       case 'community_contributors':return 'Genesis cap 0. Citizen governance vote required, ≥10,000 enrolled citizens, allocations from witness_operator surplus only.';
       case 'founder_allocation':    return 'Removed in fair-launch refactor (2026-05-27). No new credits — the protocol no longer creates founder-stream entries. Cap merged into witness_operator pool.';
       case 'early_contributors':    return 'Removed in fair-launch refactor (2026-05-27). Renamed to community_contributors with cap 0; releases require citizen governance vote.';

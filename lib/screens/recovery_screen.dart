@@ -33,6 +33,7 @@ import 'package:encrypt/encrypt.dart' as enc;
 // import '../sov_node_sdk/palm_embedder.dart';
 import '../sov_node_sdk/contacts_db.dart';
 import '../sov_node_sdk/relay_connector.dart';
+import '../sov_node_sdk/node_discovery.dart';
 import '../sov_node_sdk/transaction_store.dart';
 import '../sov_node_sdk/wallet_engine.dart';
 import '../widgets/linux_pin_setup.dart';
@@ -302,8 +303,20 @@ class _RecoveryScreenState extends State<RecoveryScreen>
       // times out. Retry up to 3 times, waiting for isConnected before each
       // attempt and giving HELLO_ACK a moment to land so auto-reconnect doesn't
       // drop the in-flight request.
+      // D33 (1.2.27): on a brand-new install nothing is known yet — the app finds the network
+      // through the public DHT, which can take tens of seconds. Restoring before that finished
+      // failed with "Cannot reach the SOV Network"; now the restore waits for discovery first.
+      if (NodeDiscovery.count == 0) {
+        if (mounted) {
+          setState(() => _guidance = 'Finding the SOV network… (the first time can take up to a minute)');
+        }
+        for (int d = 0; d < 3 && NodeDiscovery.count == 0; d++) {
+          await NodeDiscovery.refresh();
+          if (NodeDiscovery.count == 0) await Future.delayed(const Duration(seconds: 5));
+        }
+      }
       Map<String, dynamic>? resp;
-      for (int attempt = 1; attempt <= 3 && resp == null; attempt++) {
+      for (int attempt = 1; attempt <= 4 && resp == null; attempt++) {
         if (!RelayConnector.isConnected) {
           await RelayConnector.connect();
           // Wait up to 20s for the connection to come up.

@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dht_discovery.dart';
+import 'node_trust.dart';
 
 /// ═══════════════════════════════════════════════════════════════════════════
 /// NodeDiscovery — SOV Node pool management
@@ -341,9 +342,10 @@ class NodeDiscovery {
       //
       // So require ONE of them to answer. If none do, the mirrors are stale and
       // we keep falling down the ladder.
-      if (await _anyNodeAlive(merged.values)) {
-        return merged.values.toList();
-      }
+      // 1.2.27: a mirror is a hint, never an authority — each host it names must prove itself
+      // (signed list from a trusted node) before it is used. This also covers liveness.
+      final proven = await verifyHosts(merged.keys);
+      if (proven.isNotEmpty) return proven;
       debugPrint('[NodeDiscovery] every mirrored node is unreachable — treating '
           'mirrors as stale and continuing to bootstrap/DHT');
     }
@@ -418,38 +420,10 @@ class NodeDiscovery {
         return entries;
       }
 
-      // No candidate served a verifiable pool over its HTTP courtesy endpoint.
-      // That /relay-pool check is an OPTIMISATION, not the security gate: it lets
-      // us learn a node's whole pool in one call and cheaply skip crawlers. But
-      // these hosts already cleared the DHT's SOV-mesh-port filter, so they are
-      // very likely real nodes whose :80 is firewalled, momentarily unreachable,
-      // or — for a lone genesis fronted by a picky proxy — simply not answering
-      // the pre-check while its relay port is up. Refusing them here is exactly
-      // what left the very first citizen with a working app, a DHT that had
-      // FOUND the genesis, and "cannot reach the SOV network relay".
-      //
-      // So hand them to the connector as DIAL TARGETS on the relay port. The WSS
-      // handshake and peer interrogation on :443 are the real gate: anything that
-      // is not a node fails to connect and the connector drops it (markFailure →
-      // failure-triggered rediscovery). Nothing is trusted by being returned
-      // here — it still has to survive connecting, which is the same bar a pool
-      // entry has always had to clear.
-      final now = DateTime.now().millisecondsSinceEpoch;
-      final dialTargets = [
-        for (final host in hosts.take(6))
-          SovNodeEntry(
-            nodeId:  host,
-            address: 'wss://$host:443',
-            ip:      host,
-            port:    443,
-            addedAt: now,
-          ),
-      ];
-      if (dialTargets.isNotEmpty) {
-        debugPrint('[NodeDiscovery] No DHT candidate served an HTTP pool — handing '
-            '${dialTargets.length} mesh-port candidate(s) to the connector as dial targets');
-        return dialTargets;
-      }
+      // 1.2.27: FAIL CLOSED. Hosts that did not prove themselves are never dialled — the old
+      // fallback handed every DHT host to the connector, so anyone announcing on the infohash could
+      // receive this citizen's connection. A node's certificate checks offline, so a genuine node,
+      // even one this build has never heard of, always passes.
       debugPrint('[NodeDiscovery] No DHT candidate proved to be a SOV node');
       return [];
     } catch (e) {
@@ -497,6 +471,8 @@ class NodeDiscovery {
       final body = await response.transform(utf8.decoder).join();
       final data = jsonDecode(body) as Map<String, dynamic>;
       if (!_looksLikeSovNodeResponse(data)) return null;
+      final signerPub = await NodeTrust.verifyEnvelope(data);
+      if (signerPub == null) return null;   // 1.2.27: genuine signature from a trusted node, or nothing
 
       final payload = data['payload'] as Map<String, dynamic>?;
       final list = data['relays'] as List?
@@ -511,6 +487,11 @@ class NodeDiscovery {
           if (e.isValid) entries.add(e);
         } catch (_) {}
       }
+      // 1.2.27: what a node LISTS is not trusted on its word — each listed host must prove itself.
+      final listed = await verifyHosts(entries.map((e) => e.ip).where((ip) => ip != host));
+      entries
+        ..clear()
+        ..addAll(listed);
       // The responder is proven reachable and proven a node — more than the
       // (possibly empty) pool it returned. Add it if the pool omitted it.
       if (entries.every((e) => e.ip != host)) {
@@ -531,32 +512,45 @@ class NodeDiscovery {
     }
   }
 
-  /// HTTP GET http://[ip]/relay-pool and parse the response.
-  /// The SOV Node relay_pool.js HTTP server serves this endpoint.
-  /// True if at least one of these nodes actually responds. Decides whether a
-  /// pointer mirror's pool is LIVE or merely PRESENT. Probes run in parallel with
-  /// a short timeout, so a fully dead mirror costs about 3s rather than N x 3s.
-  static Future<bool> _anyNodeAlive(Iterable<SovNodeEntry> nodes) async {
-    final probes = nodes.take(6).map((n) async {
-      final client = HttpClient();
-      client.connectionTimeout = const Duration(seconds: 3);
-      try {
-        final req = await client.getUrl(Uri.parse('http://${n.ip}/relay-pool'));
-        final res = await req.close().timeout(const Duration(seconds: 3));
+  /// Fetches http://host/relay-pool and returns an entry for [host] only if its signed list verifies
+  /// and its key is trusted ([NodeTrust.verifyEnvelope]). Never throws.
+  static Future<SovNodeEntry?> verifyHost(String host) async {
+    if (host.isEmpty) return null;
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
+    try {
+      final req = await client.getUrl(Uri.parse('http://$host/relay-pool'));
+      final res = await req.close().timeout(const Duration(seconds: 6));
+      if (res.statusCode != 200) {
         await res.drain<void>();
-        return res.statusCode == 200;
-      } catch (_) {
-        return false;
-      } finally {
-        client.close(force: true);
+        return null;
       }
-    }).toList();
-    for (final alive in await Future.wait(probes)) {
-      if (alive) return true;
+      final body = await res.transform(utf8.decoder).join().timeout(const Duration(seconds: 6));
+      if (body.length > 512 * 1024) return null;
+      final data = jsonDecode(body);
+      if (data is! Map<String, dynamic>) return null;
+      if (await NodeTrust.verifyEnvelope(data) == null) return null;
+      return SovNodeEntry(
+        nodeId:  '${data['signer']}',
+        address: 'wss://$host:443',
+        ip:      host,
+        port:    443,
+        addedAt: DateTime.now().millisecondsSinceEpoch,
+      );
+    } catch (_) {
+      return null;
+    } finally {
+      client.close(force: true);
     }
-    return false;
   }
 
+  /// [verifyHost] for several hosts in parallel (at most 12); returns only the ones that proved themselves.
+  static Future<List<SovNodeEntry>> verifyHosts(Iterable<String> hosts) async {
+    final uniq = hosts.where((h) => h.isNotEmpty).toSet().take(12);
+    final results = await Future.wait(uniq.map(verifyHost));
+    return [for (final r in results) if (r != null) r];
+  }
+
+  /// HTTP GET http://[ip]/relay-pool and parse the response.
   static Future<List<SovNodeEntry>> _fetchPoolFrom(String ip) async {
     final entries = await _fetchPoolFromUrl('http://$ip/relay-pool');
     // Include the bootstrap IP itself if not already in the list

@@ -81,22 +81,29 @@ function makeApproval(identity, pubHex, subject) {
 //   known     — function(nodeId) -> true if THIS node already knows that node (active row / verified peer)
 //   need      — approvals required (the caller computes it from the quorum and what it can see)
 // Returns { ok, valid, reason }.
-function verifyCertificate(cert, row, known, need) {
+//   opts.operatorOf(nodeId) -> operator id of an approver (1.4.93, D11)
+//   opts.needOps            -> distinct operators the approvals must span (0 = not checked)
+function verifyCertificate(cert, row, known, need, opts = {}) {
   if (cert === 'genesis') return { ok: false, valid: 0, reason: 'GENESIS_NOT_RELAYABLE' };
   if (!Array.isArray(cert) || !cert.length) return { ok: false, valid: 0, reason: 'NO_CERTIFICATE' };
   if (cert.length > 64) return { ok: false, valid: 0, reason: 'CERTIFICATE_TOO_LARGE' };
   const first = cert[0] || {};
   const subject = { node_id: row.node_id, operator_id: row.operator_id, source_root: first.source_root,
     signup_ts: first.signup_ts };
-  const seen = new Set();
+  const seen = new Set(), ops = new Set();
   for (const a of cert) {
     if (!a || seen.has(a.approver)) continue;
     if (!verifyApproval(a, subject)) continue;
     if (!known(a.approver)) continue;
     seen.add(a.approver);
+    if (opts.operatorOf) { const op = upper(opts.operatorOf(a.approver)); if (op) ops.add(op); }
   }
-  const ok = seen.size >= Math.max(1, need);
-  return { ok, valid: seen.size, reason: ok ? 'OK' : 'NOT_ENOUGH_VALID_APPROVALS' };
+  // 1.4.93 (D11): distinct NODES are cheap for one operator to have; distinct OPERATORS are not.
+  const needOps = Math.max(0, opts.needOps || 0);
+  const nodesOk = seen.size >= Math.max(1, need);
+  const ok = nodesOk && ops.size >= needOps;
+  return { ok, valid: seen.size, operators: ops.size,
+           reason: ok ? 'OK' : (nodesOk ? 'NOT_ENOUGH_DISTINCT_OPERATORS' : 'NOT_ENOUGH_VALID_APPROVALS') };
 }
 
 module.exports = { signupBody, approvalBody, verifySignup, verifyApproval, makeApproval, verifyCertificate, sha256hex };

@@ -50,6 +50,18 @@ const admission = require('./operator_admission');
 // a release is ratified by source_root agreement between earned nodes, which is
 // what this engine's _sourceRootAccepted() decides. See docs/NODE_INTEGRITY_DESIGN.md.
 
+
+// 1.4.92: a public key may arrive as hex, a Buffer/Uint8Array, or a JSON-decoded Buffer
+// ({type:'Buffer',data:[...]}). Always store 64-char hex — never String() of a buffer.
+function _keyHex(v) {
+  try {
+    if (v == null) return '';
+    if (typeof v === 'string') return /^[0-9a-fA-F]{64}$/.test(v) ? v.toLowerCase() : '';
+    if (v && v.type === 'Buffer' && Array.isArray(v.data)) v = Buffer.from(v.data);
+    const h = Buffer.from(v).toString('hex');
+    return /^[0-9a-f]{64}$/.test(h) ? h : '';
+  } catch (_) { return ''; }
+}
 class OperatorEngine {
 
   // How long a peer may go unseen before its observed streak resets. This tracks the
@@ -412,7 +424,10 @@ class OperatorEngine {
       if (!Array.isArray(cert) || !cert.length || String(cert[0].operator_id || '') !== mineOp) return true;
       // Earned on a smaller network than this one: newcomers would ask for more approvals than
       // it carries, so earn a bigger one (same cap a receiver applies in _certNeed).
-      return cert.length < this._certNeed(this._identity.nodeId);
+      if (cert.length < this._certNeed(this._identity.nodeId)) return true;
+      // D11: also stale if it spans fewer operators than this network can now provide.
+      const ops = new Set(cert.map(a => (this._operatorOf(a && a.approver) || ('node:' + (a && a.approver))).trim().toUpperCase()));
+      return ops.size < this._certNeedOps(this._identity.nodeId);
     } catch (_) { return true; }
   }
 
@@ -432,7 +447,15 @@ class OperatorEngine {
     const signup     = this._buildSignup();
     const sampleSize = parseInt(this._getGovParam('operator_signup_sample', '5'));
     const peers      = this._peerMesh.peerIds ? this._peerMesh.peerIds() : [];
-    const sample     = this._pickRandomPeers(peers, sampleSize);
+    // 1.4.93 (D11): one peer per distinct operator first, then fill at random — receivers now require
+    // approvals spanning distinct operators, which a purely random sample could miss.
+    const _byOp = new Map();
+    for (const p of this._pickRandomPeers(peers, peers.length)) {
+      const op = this._operatorOf(p).trim().toUpperCase() || ('?' + p);
+      if (!_byOp.has(op)) _byOp.set(op, p);
+    }
+    const _first = [..._byOp.values()];
+    const sample = [..._first, ...this._pickRandomPeers(peers.filter(p => !_first.includes(p)), peers.length)].slice(0, Math.max(sampleSize, 1));
     if (!sample.length) {
       global.sovLog.info('[Operator] No peers to ask — will retry');
       this._registrationTimer = setTimeout(() => this._attemptSelfRegistration(), 5 * 60 * 1000);
@@ -742,7 +765,7 @@ class OperatorEngine {
       // throws "Too few parameter values were provided" if any argument is undefined.
       const p_node_id       = String(node_id);
       const p_operator_id   = operator_id   != null ? String(operator_id)   : '';
-      const p_public_key    = public_key_hex != null ? String(public_key_hex): '';
+      const p_public_key    = _keyHex(public_key_hex);   // 1.4.92: was String(), which stored '[object Object]' / raw bytes
       const p_hw_class      = hardware_class != null ? String(hardware_class): 'desktop';
       const p_stake         = stake_seeds    != null ? Number(stake_seeds)   : 0;
       const p_reg_at        = registered_at  != null ? Number(registered_at) : Date.now();
@@ -763,7 +786,8 @@ class OperatorEngine {
       try { cert = typeof certRaw === 'string' ? JSON.parse(certRaw) : certRaw; } catch (_) { cert = null; }
       if (!known) {
         const v = admission.verifyCertificate(cert, { node_id: p_node_id, operator_id: p_operator_id },
-          (id) => this._isKnownNode(id, p_node_id), this._certNeed(p_node_id));
+          (id) => this._isKnownNode(id, p_node_id), this._certNeed(p_node_id),
+          { operatorOf: (id) => this._operatorOf(id) || ('node:' + id), needOps: this._certNeedOps(p_node_id) });   // D11: unknown operator = its own
         if (!v.ok) {
           // A node announcing ITS OWN row with no certificate at all has simply not earned one yet
           // (a genesis that registered alone - _broadcastRegistryEntry sends '' for its 'genesis'
@@ -804,7 +828,8 @@ class OperatorEngine {
         // in 1.4.81). Only a certificate that verifies, and only if it has more valid
         // approvals than the stored one.
         const v = admission.verifyCertificate(cert, { node_id: p_node_id, operator_id: p_operator_id },
-          (id) => this._isKnownNode(id, p_node_id), this._certNeed(p_node_id));
+          (id) => this._isKnownNode(id, p_node_id), this._certNeed(p_node_id),
+          { operatorOf: (id) => this._operatorOf(id) || ('node:' + id), needOps: this._certNeedOps(p_node_id) });   // D11: unknown operator = its own
         if (v.ok) {
           let storedValid = 0;
           if (known.admission_cert) {
@@ -972,7 +997,7 @@ class OperatorEngine {
       `).run(
         String(signup.node_id),
         signup.operator_sovereign_id != null ? String(signup.operator_sovereign_id) : '',
-        signup.public_key != null ? String(signup.public_key) : (this._identity.publicKey != null ? String(this._identity.publicKey) : ''),
+        _keyHex(signup.public_key) || _keyHex(this._identity.publicKey),
         signup.manifest_hash != null ? String(signup.manifest_hash) : '',
         signup.hardware_class != null ? String(signup.hardware_class) : 'desktop',
         signup.stake_seeds != null ? Number(signup.stake_seeds) : 0,
@@ -1026,6 +1051,24 @@ class OperatorEngine {
     const want = parseInt(this._getGovParam('operator_signup_quorum', '3'));
     const peers = (this._peerMesh.peerIds ? this._peerMesh.peerIds() : []).filter(p => p !== subjectNodeId);
     return Math.max(1, Math.min(want, peers.length));
+  }
+
+  /** 1.4.93 (D11): the operator behind a node, from the registry ('' if unknown). */
+  _operatorOf(nodeId) {
+    try {
+      const r = this._db._db.prepare("SELECT operator_id FROM sov_operator_registry WHERE node_id = ? AND status = 'active'").get(nodeId);
+      return r ? String(r.operator_id || '') : '';
+    } catch (_) { return ''; }
+  }
+
+  /** 1.4.93 (D11): distinct operators a certificate must span — the quorum, capped by the operators
+   *  this node can see (itself and its peers, excluding the subject). One operator today -> 1. */
+  _certNeedOps(subjectNodeId) {
+    const want = parseInt(this._getGovParam('operator_signup_quorum', '3'));
+    const ids = (this._peerMesh.peerIds ? this._peerMesh.peerIds() : []).filter(p => p !== subjectNodeId);
+    ids.push(this._identity.nodeId);
+    const ops = new Set(ids.map(id => this._operatorOf(id).trim().toUpperCase()).filter(Boolean));
+    return Math.max(1, Math.min(want, ops.size));
   }
 
   /** An approver counts only if THIS node already knows it: an active registry row, or a peer

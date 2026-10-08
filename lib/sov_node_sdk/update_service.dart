@@ -86,7 +86,7 @@ class UpdateService {
   // SHIP READY, REPLACE AT LAUNCH (see docs/SOV_LAUNCH_ROADMAP_FINAL_20260617.md §3).
   // Each is signature-verified after fetch, so adding neutral third-party mirrors
   // needs no extra trust. Keep >=3 INDEPENDENT hosts (no single point of failure);
-  // each must serve the SAME threshold-signed pool+manifest blob; none is a relay
+  // each must serve the SAME signed pool+manifest blob (one release key today; threshold signing at Phase 2); none is a relay
   // and none carries a relay IP. Until these are filled the list stays empty and
   // cold-start falls back to bootstrap (the temporary no-IP gap we are closing).
   // Uncomment + fill each with the real URL once the accounts in §2 are live:

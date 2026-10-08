@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'package:bcrypt/bcrypt.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -1477,8 +1478,14 @@ class RelayConnector {
               nickname:    rawRelay.nickname,
               addedAt:     rawRelay.addedAt,
             );
-      final exists = _knownRelays.any((r) => r.relayId == relay.relayId);
+      final exists = _knownRelays.any((r) => r.relayId == relay.relayId || r.ip == relay.ip);
       if (!exists) {
+        // 1.2.27: an announced address is a hint — it is used only once it proves itself.
+        if (await NodeDiscovery.verifyHost(relay.ip) == null) {
+          debugPrint('[RELAY] announced node ${relay.ip} did not prove itself — ignored');
+          return;
+        }
+        if (_knownRelays.any((r) => r.ip == relay.ip)) return;
         _knownRelays.add(relay);
         await _saveRelayList();
       }
@@ -1875,12 +1882,14 @@ class RelayConnector {
         _messageController?.add(decoded);
         return;
       // ── N2a SOV Speak ─────────────────────────────────────────────────────
-      case 'CITIZEN_ONLINE':
-        OutboxManager.onCitizenOnline(
-            decoded['sovereign_id'] as String? ?? '');
+      case 'CITIZEN_ONLINE': {
+        // D21 (1.2.27): some node sends carry only `cid`; reading only `sovereign_id` retried ''.
+        final sid = (decoded['sovereign_id'] ?? decoded['cid'] ?? '').toString();
+        if (sid.isNotEmpty) OutboxManager.onCitizenOnline(sid);
         _incomingMessageController.add(decoded);
         _messageController?.add(decoded);
         return;
+      }
       case 'MESSAGE_INCOMING':
         // Send delivery receipt immediately — relay holds RELAY_DELIVERY_ACK
         // for 5 s waiting for this confirmation before reporting delivery status
@@ -2151,10 +2160,30 @@ class RelayConnector {
       if (keep.isNotEmpty) fresh.add(keep.first);
     }
 
-    _knownRelays
-      ..clear()
-      ..addAll(fresh);
-    _saveRelayList();
+    // 1.2.27: addresses this device has not used before are hints from ONE node; each must prove
+    // itself (signed list from a trusted node) before it joins the failover list.
+    final knownIps = {for (final r in _knownRelays) r.ip};
+    final newcomers = fresh.where((r) => !knownIps.contains(r.ip) && r.ip != connectedIp).toList();
+    fresh.removeWhere((r) => newcomers.contains(r));
+    if (fresh.isNotEmpty) {
+      _knownRelays
+        ..clear()
+        ..addAll(fresh);
+      _saveRelayList();
+    }
+    if (newcomers.isNotEmpty) {
+      NodeDiscovery.verifyHosts(newcomers.map((r) => r.ip)).then((ok) {
+        final okIps = {for (final e in ok) e.ip};
+        var added = false;
+        for (final r in newcomers) {
+          if (okIps.contains(r.ip) && !_knownRelays.any((k) => k.ip == r.ip)) {
+            _knownRelays.add(r);
+            added = true;
+          }
+        }
+        if (added) _saveRelayList();
+      });
+    }
   }
 
   // ── Ledger sync — restores wallet balance after reinstall ─────────────────
@@ -2857,7 +2886,7 @@ class RelayConnector {
   /// The website owner registers their platform from inside the wallet: this
   /// generates an X25519 keypair on-device, signs the canonical payload with
   /// the wallet's enrolled Ed25519 key, and sends the citizen-signed
-  /// PLATFORM_REGISTER op over WSS. The relay burns platform_register_fee SOV
+  /// PLATFORM_REGISTER op over WSS. The node deducts platform_register_fee SOV (to the operator pool)
   /// (default 10) → witness_operator pool and returns the platform_id +
   /// callback_secret (plaintext over the WSS-TLS channel) for the owner to paste
   /// into their site config. Returns the relay's result map, or a failure map.
@@ -3257,6 +3286,9 @@ class RelayConnector {
       },
       responseType: 'PUBLIC_KEY_RESULT',
       timeout:      const Duration(seconds: 8),
+      // D21: two lookups at once could take each other's reply and cache the wrong key.
+      matchField:   'target_id',
+      matchValue:   sovereignId,
     );
     final key = resp?['x25519_public_key_hex'] as String? ?? '';
     if (key.isNotEmpty) {
@@ -4154,20 +4186,23 @@ class RelayConnector {
   /// Deducts 10 SOV bond from [sovereignId] on the relay.
   static Future<Map<String, dynamic>> openJusticeDispute({
     required String       sovereignId,
+    required String       caseId,
     required String       defendantId,
     required String       evidenceHash,
     required int          claimAmountSeeds,
-    List<String>?         evidenceImages,
+    String                memo = '',
   }) async {
+    // D17 (1.2.27): the node needs case_id, reads amount_seeds and memo, and keeps no media — so
+    // photos are never sent (only their fingerprint, inside evidence_hash).
     final resp = await sendAndWait(
       request: {
         'type':             'JUSTICE_DISPUTE_OPEN',
         'sovereign_id':     sovereignId,
+        'case_id':          caseId,
         'defendant_id':     defendantId,
         'evidence_hash':    evidenceHash,
-        'claim_amount':     claimAmountSeeds,
-        if (evidenceImages != null && evidenceImages.isNotEmpty)
-          'evidence_images': evidenceImages,
+        'amount_seeds':     claimAmountSeeds,
+        'memo':             memo,
       },
       responseType: 'JUSTICE_DISPUTE_OPENED',
       timeout: const Duration(seconds: 15),
@@ -4587,11 +4622,19 @@ class RelayConnector {
     if (sovereignId == null) {
       return {'success': false, 'error': 'NOT_ENROLLED'};
     }
+    if (password.isNotEmpty && (password.length < 8 || password.length > 256)) {
+      return {'success': false, 'error': 'INVALID_PASSWORD_LENGTH'};
+    }
+    // D2 (1.2.27): the site password NEVER leaves this device. The app makes the bcrypt verifier
+    // itself (the platform checks logins locally against it) and SIGNS it, so nobody on the path
+    // can read the password or swap in their own. Nodes refuse a plain password.
+    final verifier = password.isEmpty ? '' : await compute(_bcryptVerifier, password);
     final timestamp = _nowMs();
-    // Canonical payload — MUST match the relay's verification format exactly.
-    // Defined in relay_pool.js `authorize-app` handler.
-    final canonical =
-        'sov-link-v1-app:$sessionId:$sovereignId:$platformDomain:$timestamp';
+    // Canonical payload — MUST match the node's `authorize-app` handler (relay_pool.js) exactly.
+    final canonical = verifier.isEmpty
+        ? 'sov-link-v1-app:$sessionId:$sovereignId:$platformDomain:$timestamp'
+        : 'sov-link-v2-app:$sessionId:$sovereignId:$platformDomain:$timestamp:'
+          '${sha256.convert(utf8.encode(verifier))}';
     final signature = await KeyManager.signChallenge(canonical);
     final payload = <String, dynamic>{
       'session_id':   sessionId,
@@ -4599,14 +4642,11 @@ class RelayConnector {
       'signature':    signature,
       'timestamp':    timestamp,
     };
-    // Optional: citizen-chosen platform password. Sent ONLY to the bundled
-    // trust-anchor relay (same channel as the Ed25519 authorization). Relay
-    // derives scrypt verifier server-side, stores verifier, discards plain
-    // password. Empty = no Path B login allowed (Flow A2 every time).
-    if (password.isNotEmpty) {
-      payload['password'] = password;
-    }
+    if (verifier.isNotEmpty) payload['password_verifier'] = verifier;
     return _httpPostJsonRelayPool('/sov-login/authorize-app', payload);
   }
 
 }
+
+/// bcrypt (cost 12) verifier for a SOV-Link site password — runs in an isolate (it is slow on purpose).
+String _bcryptVerifier(String password) => BCrypt.hashpw(password, BCrypt.gensalt(logRounds: 12));

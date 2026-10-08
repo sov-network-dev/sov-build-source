@@ -131,13 +131,13 @@ class PioneerEngine {
         type:         'PIONEER_STATUS_RESULT',
         success:      true,
         sovereign_id,
-        is_pioneer:   !!(pioneer && (pioneer.cert_relay_engineer || pioneer.cert_enrollment_agent || pioneer.cert_protocol_specialist)),
+        is_pioneer:   this._certsOf(sovereign_id, pioneer).size > 0,
         pioneer_code: pioneer ? pioneer.pioneer_code : null,
         rank:         pioneer ? (pioneer.rank || 'apprentice') : null,
         certs: {
-          relay_engineer:       !!(pioneer && pioneer.cert_relay_engineer),
-          enrollment_agent:     !!(pioneer && pioneer.cert_enrollment_agent),
-          protocol_specialist:  !!(pioneer && pioneer.cert_protocol_specialist),
+          relay_engineer:       this._certsOf(sovereign_id, pioneer).has('relay_engineer'),
+          enrollment_agent:     this._certsOf(sovereign_id, pioneer).has('enrollment_agent'),
+          protocol_specialist:  this._certsOf(sovereign_id, pioneer).has('protocol_specialist'),
         },
         relay_engineer_at:      pioneer ? pioneer.relay_engineer_at      : null,
         enrollment_agent_at:    pioneer ? pioneer.enrollment_agent_at    : null,
@@ -152,6 +152,16 @@ class PioneerEngine {
       global.sovLog.error('[PIONEER] GetStatus error:', e.message);
       ws.send(JSON.stringify({ type: 'PIONEER_STATUS_RESULT', success: false, error: e.message }));
     }
+  }
+
+  // 1.4.93 (D16): certifications this node knows of, from the replicated facts plus the local row.
+  _certsOf(sovereignId, pioneer) {
+    const set = new Set();
+    try {
+      for (const r of this._db._db.prepare('SELECT specialisation FROM sov_certifications WHERE sovereign_id = ?').all(sovereignId)) set.add(r.specialisation);
+    } catch (_) {}
+    if (pioneer) for (const k of ['relay_engineer', 'enrollment_agent', 'protocol_specialist']) if (pioneer['cert_' + k]) set.add(k);
+    return set;
   }
 
   // ── PIONEER_START_ASSESSMENT — begin a specialisation quiz ────────────────
@@ -169,7 +179,7 @@ class PioneerEngine {
     try {
       const pioneer  = this._db._db.prepare('SELECT * FROM sov_pioneers WHERE sovereign_id = ?').get(sovereign_id);
       const certField = 'cert_' + specialisation;
-      if (pioneer && pioneer[certField]) {
+      if (this._certsOf(sovereign_id, pioneer).has(specialisation)) {   // D16: certified on ANY node
         return ws.send(JSON.stringify({ type: 'PIONEER_ASSESSMENT_STARTED', success: false, error: 'ALREADY_CERTIFIED', specialisation }));
       }
 
@@ -266,25 +276,26 @@ class PioneerEngine {
         const certAtField = spec + '_at';
 
         this._db._db.prepare(
-          `INSERT INTO sov_pioneers (sovereign_id, ${certField}, ${certAtField}, rank, referral_count, total_earned_seeds, pioneer_code)
-           VALUES (?, 1, ?, 'apprentice', 0, 0, ?)
+          `INSERT INTO sov_pioneers (sovereign_id, ${certField}, ${certAtField}, rank, referral_count, total_earned_seeds, pioneer_code, registered_at)
+           VALUES (?, 1, ?, 'apprentice', 0, 0, ?, ?)
            ON CONFLICT(sovereign_id) DO UPDATE SET ${certField} = 1, ${certAtField} = ?`
         ).run(
           sovereign_id,
           now,
           `PI-${crypto.createHash('sha256').update(sovereign_id).digest('hex').substring(0,8).toUpperCase()}`,
+          Math.floor(now / 1000),   // 1.4.93 (D15): NOT NULL, no default — its absence made every first pass throw
           now
         );
+        // 1.4.93 (D16): the replicated record of the pass — every node now knows this citizen is certified.
+        this._db._db.prepare('INSERT OR IGNORE INTO sov_certifications (sovereign_id, specialisation, certified_at) VALUES (?, ?, ?)')
+          .run(sovereign_id, spec, now);
 
-        // Update pioneer_badges on disc
-        const disc = this._db._db.prepare("SELECT pioneer_badges FROM sov_disc WHERE sovereign_id = ?").get(sovereign_id);
-        const currentBadges = ((disc && disc.pioneer_badges) ? disc.pioneer_badges : '').split(',').filter(Boolean);
-        if (!currentBadges.includes(spec)) currentBadges.push(spec);
-        this._db._db.prepare("UPDATE sov_disc SET pioneer_badges = ? WHERE sovereign_id = ?").run(currentBadges.join(','), sovereign_id);
+        // (1.4.93: the old sov_disc.pioneer_badges write is gone — nothing ever read it, and it wrote to
+        //  the money table outside the ledger. Certifications live in sov_certifications.)
 
         // Recalculate rank
         const pioneerRow = this._db._db.prepare('SELECT * FROM sov_pioneers WHERE sovereign_id = ?').get(sovereign_id);
-        const certs = [pioneerRow.cert_relay_engineer, pioneerRow.cert_enrollment_agent, pioneerRow.cert_protocol_specialist].filter(Boolean).length;
+        const certs = this._certsOf(sovereign_id, pioneerRow).size;   // D16
         const refs  = pioneerRow.referral_count || 0;
         let rank = 'apprentice';
         if (certs === 3)      rank = 'master';
