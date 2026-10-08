@@ -39,6 +39,7 @@ import 'document_viewer_screen.dart';
 import '../sov_node_sdk/relay_connector.dart';
 import '../sov_node_sdk/contacts_db.dart';
 import '../sov_node_sdk/conversation_utils.dart';
+import '../sov_node_sdk/speak_payload.dart';
 import '../sov_node_sdk/outbox_manager.dart';
 import '../sov_node_sdk/draft_manager.dart';
 import '../sov_node_sdk/draft_keys.dart';
@@ -105,6 +106,12 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
   // Blocking
   bool _isRecipientBlocked = false;
 
+  // 1.2.28: disappearing messages (seconds, 0 = off), reply target, countdown tick
+  int _ttl = 0;
+  LocalMessage? _replyTo;
+  Timer? _tick;
+  StreamSubscription<List<String>>? _goneSub;
+
   // Contacts cache (for display name)
   Contact? _contact;
 
@@ -156,6 +163,8 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
     _reactionSub?.cancel();
     _onlineSub?.cancel();
     _mediaSub?.cancel();
+    _goneSub?.cancel();
+    _tick?.cancel();
     _composeCtrl.dispose();
     _composeFocus.dispose();
     _scrollController.dispose();
@@ -182,6 +191,9 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
             RelayConnector.cachedPalmNameFor(widget.participantId);
       }); }
     });
+    final ttl = await DisappearingTimer.get(_conversationId());
+    if (mounted) setState(() => _ttl = ttl);
+    _tick = Timer.periodic(const Duration(seconds: 1), (_) => _onTick());
     await _loadThread();
     // Restore draft if citizen was composing before.
     final draft = await DraftManager.load(DraftKeys.sovSpeak(widget.participantId));
@@ -222,6 +234,21 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
     _readReceiptSub = RelayConnector.readReceipts.listen(_onReadReceipt);
     _reactionSub    = RelayConnector.reactionUpdates.listen(_onReactionUpdate); // [S9]
     _onlineSub      = OutboxManager.citizenOnlineStream.listen(_onCitizenOnline);
+    _goneSub        = DisappearingSweeper.removed.listen((ids) {
+      if (!mounted) return;
+      setState(() => _threadMessages = _threadMessages.where((m) => !ids.contains(m.id)).toList());
+    });
+  }
+
+  /// Once a second: refresh the countdowns, and drop anything whose time is up (the
+  /// sweeper deletes it from storage; this keeps the open thread in step).
+  void _onTick() {
+    if (!mounted) return;
+    if (!_threadMessages.any((m) => m.expiresAt != null)) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    setState(() {
+      _threadMessages = _threadMessages.where((m) => m.expiresAt == null || m.expiresAt! > now).toList();
+    });
   }
 
   void _onIncoming(Map<String, dynamic> msg) {
@@ -331,6 +358,24 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
     // Only handle messages for THIS conversation.
     if (fromId != widget.participantId) return;
 
+    // 1.2.28: a decrypted text may carry a timer, a reply, or a timer-change notice.
+    String? replyTo;
+    int? expiresAt;
+    String? decryptedRaw;
+    if (effectiveType == 'text' && displayText != null && !stillEncrypted) {
+      decryptedRaw = displayText;
+      final p = SpeakPayload.parse(displayText);
+      displayText = p.text;
+      replyTo = p.replyTo;
+      if (p.sys == 'ttl') {
+        effectiveType = 'system';
+        await DisappearingTimer.set(_conversationId(), p.ttl);
+        if (mounted) setState(() => _ttl = p.ttl);
+      } else if (p.ttl > 0) {
+        expiresAt = DateTime.now().millisecondsSinceEpoch + p.ttl * 1000;
+      }
+    }
+
     // Drop messages from blocked contacts.
     if (await ContactsDb.isContactBlocked(fromId)) return;
 
@@ -345,7 +390,16 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
       status:           'delivered',
       sentAt:           sentAt,
       deliveredAt:      DateTime.now().millisecondsSinceEpoch,
+      replyToId:        replyTo,
+      expiresAt:        expiresAt,
     );
+    // Persist the decrypted text (and its timer) so the message disappears on schedule
+    // even if this screen closes. main_shell stored the envelope; give it a moment.
+    if (decryptedRaw != null) {
+      final raw = decryptedRaw;
+      Future.delayed(const Duration(milliseconds: 800),
+          () => ContactsDb.updateMessageDecrypted(messageId, raw).catchError((_) => const SpeakPayload(text: '')));
+    }
 
     if (mounted) {
       setState(() => _threadMessages = [..._threadMessages, localMsg]);
@@ -401,11 +455,20 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
         myPrivKeyBytes:  myPriv,
       );
       if (decrypted == null) continue;
-      await ContactsDb.updateMessageDecrypted(messageId, decrypted);
+      final p = await ContactsDb.updateMessageDecrypted(messageId, decrypted);
       if (!mounted) return;
       setState(() {
+        if (p.sys == 'ttl') _ttl = p.ttl;
         final i = _threadMessages.indexWhere((m) => m.id == messageId);
-        if (i >= 0) _threadMessages[i].decryptedContent = decrypted;
+        if (i >= 0) {
+          final m = _threadMessages[i];
+          m.decryptedContent = p.text;
+          if (p.sys != null) m.contentType = 'system';
+          if (p.replyTo != null) m.replyToId = p.replyTo;
+          if (p.sys == null && p.ttl > 0) {
+            m.expiresAt ??= DateTime.now().millisecondsSinceEpoch + p.ttl * 1000;
+          }
+        }
       });
       return;
     }
@@ -519,61 +582,213 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
     }
   }
 
-  // [S9] Show emoji picker overlay on long-press
-  void _showEmojiPicker(LocalMessage msg) {
-    const emojis = ['ðŸ‘', 'â¤ï¸', 'ðŸ˜‚', 'ðŸ˜®', 'ðŸ˜¢', 'ðŸ”¥'];
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF0D1F3A),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+  // [S9] Reaction bar displayed below each bubble
+  // ── 1.2.28: message actions, replies, disappearing timer ─────────────────
+
+  static const _reactionEmojis = ['👍', '❤️', '😂', '😮', '😢', '🔥'];
+
+  /// Short one-line description of a message, for reply quotes.
+  String _snippet(LocalMessage m) {
+    if (m.contentType == 'text' || m.contentType == 'system') {
+      final t = m.decryptedContent ?? '';
+      return MessageEncryptor.isEncryptedEnvelope(t) ? 'Encrypted message' : t;
+    }
+    final kind = const {'image': '📷 Photo', 'audio': '🎤 Voice note', 'voice': '🎤 Voice note', 'video': '🎬 Video'}[m.contentType] ?? '📎 File';
+    return m.caption.isNotEmpty ? '$kind · ${m.caption}' : kind;
+  }
+
+  Widget _buildReplyQuote(String replyId, bool isMe) {
+    LocalMessage? orig;
+    for (final m in _threadMessages) {
+      if (m.id == replyId) { orig = m; break; }
+    }
+    final who = orig == null ? '' : (orig.fromSovereignId == widget.mySovId ? 'You' : _displayName);
+    return GestureDetector(
+      onTap: orig == null ? null : () {
+        final i = _threadMessages.indexOf(orig!);
+        if (i >= 0 && _scrollController.hasClients && _threadMessages.length > 1) {
+          final max = _scrollController.position.maxScrollExtent;
+          _scrollController.animateTo(max * i / (_threadMessages.length - 1),
+              duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
+        }
+      },
+      child: Container(
+        constraints: const BoxConstraints(maxWidth: 260),
+        margin: const EdgeInsets.only(bottom: 6),
+        padding: const EdgeInsets.fromLTRB(8, 5, 8, 5),
+        decoration: BoxDecoration(
+          color: Colors.black.withAlpha(50),
+          borderRadius: BorderRadius.circular(8),
+          border: const Border(left: BorderSide(color: _gold, width: 3)),
+        ),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+          if (who.isNotEmpty)
+            Text(who, style: const TextStyle(color: _gold, fontSize: 11, fontWeight: FontWeight.bold)),
+          Text(orig == null ? 'Original message is no longer on this device' : _snippet(orig),
+              maxLines: 2, overflow: TextOverflow.ellipsis,
+              style: TextStyle(color: Colors.white.withAlpha(170), fontSize: 12,
+                  fontStyle: orig == null ? FontStyle.italic : FontStyle.normal)),
+        ]),
       ),
-      builder: (_) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 16),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: emojis.map((emoji) {
-              final myId   = widget.mySovId;
-              final hasIt  = msg.reactions[emoji]?.contains(myId) ?? false;
-              return GestureDetector(
-                onTap: () async {
-                  Navigator.pop(context);
-                  if (hasIt) {
-                    await RelayConnector.unreactToMessage(
-                      messageId:        msg.id,
-                      otherSovereignId: widget.participantId,
-                      emoji:            emoji,
-                    );
-                  } else {
-                    await RelayConnector.reactToMessage(
-                      messageId:        msg.id,
-                      otherSovereignId: widget.participantId,
-                      emoji:            emoji,
-                      conversationId:   _conversationId(),
-                    );
-                  }
-                },
-                child: Container(
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    color: hasIt
-                        ? _teal.withAlpha(60)
-                        : Colors.transparent,
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Text(emoji,
-                      style: const TextStyle(fontSize: 28)),
-                ),
-              );
-            }).toList(),
-          ),
+    );
+  }
+
+  Widget _buildSystemNotice(LocalMessage msg) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Center(
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(color: Colors.white.withAlpha(12), borderRadius: BorderRadius.circular(12)),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.timer_outlined, color: Colors.white54, size: 13),
+            const SizedBox(width: 6),
+            Flexible(child: Text(
+              '${msg.fromSovereignId == widget.mySovId ? 'You' : _displayName}: ${msg.decryptedContent ?? ''}',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white54, fontSize: 11))),
+          ]),
         ),
       ),
     );
   }
 
-  // [S9] Reaction bar displayed below each bubble
+  /// Long-press (or right-click): react, reply, copy, delete for me.
+  void _showMessageActions(LocalMessage msg) {
+    final isText = msg.contentType == 'text' &&
+        !MessageEncryptor.isEncryptedEnvelope(msg.decryptedContent ?? msg.encryptedContent);
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF0D1F3A),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 14),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: _reactionEmojis.map((emoji) {
+                final hasIt = msg.reactions[emoji]?.contains(widget.mySovId) ?? false;
+                return GestureDetector(
+                  onTap: () async {
+                    Navigator.pop(ctx);
+                    if (hasIt) {
+                      await RelayConnector.unreactToMessage(
+                          messageId: msg.id, otherSovereignId: widget.participantId, emoji: emoji);
+                    } else {
+                      await RelayConnector.reactToMessage(
+                          messageId: msg.id, otherSovereignId: widget.participantId,
+                          emoji: emoji, conversationId: _conversationId());
+                    }
+                  },
+                  child: Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                        color: hasIt ? _teal.withAlpha(60) : Colors.transparent,
+                        borderRadius: BorderRadius.circular(12)),
+                    child: Text(emoji, style: const TextStyle(fontSize: 26)),
+                  ),
+                );
+              }).toList(),
+            ),
+          ),
+          const Divider(color: Colors.white12, height: 1),
+          ListTile(
+            leading: const Icon(Icons.reply_rounded, color: _gold),
+            title: const Text('Reply', style: TextStyle(color: Colors.white)),
+            onTap: () {
+              Navigator.pop(ctx);
+              setState(() => _replyTo = msg);
+              _composeFocus.requestFocus();
+            },
+          ),
+          if (isText || msg.caption.isNotEmpty)
+            ListTile(
+              leading: const Icon(Icons.copy_rounded, color: _gold),
+              title: Text(isText ? 'Copy text' : 'Copy caption', style: const TextStyle(color: Colors.white)),
+              onTap: () async {
+                Navigator.pop(ctx);
+                await Clipboard.setData(ClipboardData(text: isText ? (msg.decryptedContent ?? '') : msg.caption));
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                      content: Text('Copied'), behavior: SnackBarBehavior.floating, duration: Duration(seconds: 2)));
+                }
+              },
+            ),
+          ListTile(
+            leading: const Icon(Icons.delete_outline_rounded, color: Colors.redAccent),
+            title: const Text('Delete for me', style: TextStyle(color: Colors.redAccent)),
+            subtitle: const Text('Removes it from this device only',
+                style: TextStyle(color: Colors.white38, fontSize: 11)),
+            onTap: () async {
+              Navigator.pop(ctx);
+              await ContactsDb.deleteMessageLocal(msg.id);
+              MessageEvents.notifyConversationChanged();
+              if (mounted) setState(() => _threadMessages = _threadMessages.where((m) => m.id != msg.id).toList());
+            },
+          ),
+          const SizedBox(height: 8),
+        ]),
+      ),
+    );
+  }
+
+  /// Pick the disappearing-messages timer for this conversation and tell the other side.
+  Future<void> _chooseTimer() async {
+    final picked = await showDialog<int>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        backgroundColor: _navy,
+        title: const Text('Disappearing messages',
+            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        children: [
+          const Padding(
+            padding: EdgeInsets.fromLTRB(24, 0, 24, 8),
+            child: Text(
+              'New messages in this chat vanish from both devices this long after they arrive. '
+              'Nodes never keep messages, so once both devices delete them they are gone. '
+              'Someone can still take a screenshot.',
+              style: TextStyle(color: Colors.white60, fontSize: 12, height: 1.4)),
+          ),
+          ...DisappearingTimer.choices.entries.map((e) => SimpleDialogOption(
+                onPressed: () => Navigator.pop(ctx, e.value),
+                child: Row(children: [
+                  Icon(e.value == _ttl ? Icons.radio_button_checked : Icons.radio_button_unchecked,
+                      color: _gold, size: 20),
+                  const SizedBox(width: 12),
+                  Text(e.key, style: const TextStyle(color: Colors.white, fontSize: 15)),
+                ]),
+              )),
+        ],
+      ),
+    );
+    if (picked == null || picked == _ttl || !mounted) return;
+    await DisappearingTimer.set(_conversationId(), picked);
+    setState(() => _ttl = picked);
+
+    // A notice in this thread, and the same notice (encrypted) to the other side so
+    // their app switches to the same timer.
+    final id  = _generateId();
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final notice = LocalMessage(
+      id: id, conversationId: _conversationId(),
+      fromSovereignId: widget.mySovId, toSovereignId: widget.participantId,
+      contentType: 'system', encryptedContent: '',
+      decryptedContent: DisappearingTimer.noticeText(picked),
+      status: 'sending', sentAt: now,
+    );
+    await ContactsDb.saveMessage(notice);
+    MessageEvents.notifyConversationChanged();
+    if (mounted) setState(() => _threadMessages = [..._threadMessages, notice]);
+    final key  = await RelayConnector.lookupMessagingKey(widget.participantId);
+    final priv = await MessageKeyManager.getPrivateKeyBytes();
+    if (key == null || key.isEmpty || priv == null) return;
+    final env = await MessageEncryptor.encrypt(
+        plaintext: SpeakPayload.encodeTimerNotice(picked), recipientPubKeyHex: key, myPrivKeyBytes: priv);
+    if (env == null) return;
+    await _dispatchToRelay(messageId: id, envelope: env, contentType: 'text');
+  }
+
   Widget _buildReactionBar(LocalMessage msg) {
     if (msg.reactions.isEmpty) return const SizedBox.shrink();
     final myId = widget.mySovId;
@@ -654,6 +869,11 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
     final messageId = _generateId();
     final now       = DateTime.now().millisecondsSinceEpoch;
     final convId    = _conversationId();
+    // 1.2.28: timer and reply travel inside the encrypted text (bare text when neither).
+    final replyId   = _replyTo?.id;
+    final payload   = SpeakPayload.encode(text, ttl: _ttl, replyTo: replyId);
+    final expiresAt = _ttl > 0 ? now + _ttl * 1000 : null;
+    if (_replyTo != null) setState(() => _replyTo = null);
 
     // ── E2E encrypted send (v2 mandatory, 2026-05-21 hardening) ─────────────
     // Builds a v2 AES-256-GCM envelope using X25519 ECDH. The relay forwards
@@ -689,6 +909,8 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
           decryptedContent: text,
           status:           'queued',
           sentAt:           now,
+          replyToId:        replyId,
+          expiresAt:        expiresAt,
         );
         await ContactsDb.saveMessage(localMsg);
         await ContactsDb.upsertConversation(
@@ -698,7 +920,7 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
         await OutboxManager.queueAwaitingKey(
           messageId:     messageId,
           toSovereignId: widget.participantId,
-          plaintext:     text,
+          plaintext:     payload,
           contentType:   'text',
         );
         MessageEvents.notifyConversationChanged();
@@ -729,7 +951,7 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
       }
 
       final encrypted = await MessageEncryptor.encrypt(
-        plaintext:         text,
+        plaintext:         payload,
         recipientPubKeyHex: recipientKey,
         myPrivKeyBytes:    myPrivBytes,
       );
@@ -757,6 +979,8 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
       decryptedContent: displayText,
       status:           'sending',
       sentAt:           now,
+      replyToId:        replyId,
+      expiresAt:        expiresAt,
     );
     await ContactsDb.saveMessage(localMsg);
     await ContactsDb.recordInteraction(
@@ -787,7 +1011,7 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
 
   // â”€â”€ Media send â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-  Future<void> _sendMedia(MediaResult media) async {
+  Future<void> _sendMedia(MediaResult media, {String caption = ''}) async {
     if (media.sizeBytes > MediaTransfer.maxBytes) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -818,6 +1042,7 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
       localFilePath: media.file.path,
       mimeType:      media.mimeType,
       sizeBytes:     media.sizeBytes,
+      caption:       caption.trim(),
     );
   }
 
@@ -829,6 +1054,7 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
     required String localFilePath,
     String? mimeType,
     int sizeBytes = 0,
+    String caption = '',
   }) async {
     if (_isRecipientBlocked) {
       if (mounted) {
@@ -844,7 +1070,9 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
     try {
       final now    = DateTime.now().millisecondsSinceEpoch;
       final convId = _conversationId();
-      final label  = const {'image': '📷 Photo', 'audio': '🎤 Voice note', 'video': '🎬 Video'}[contentType] ?? '📎 File';
+      final kind   = const {'image': '📷 Photo', 'audio': '🎤 Voice note', 'voice': '🎤 Voice note', 'video': '🎬 Video'}[contentType] ?? '📎 File';
+      final label  = caption.isNotEmpty ? '$kind · $caption' : kind;
+      final ttl    = _ttl;
       final localMsg = LocalMessage(
         id:               messageId,
         conversationId:   convId,
@@ -855,6 +1083,8 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
         decryptedContent: localFilePath,
         status:           'sending',
         sentAt:           now,
+        caption:          caption,
+        expiresAt:        ttl > 0 ? now + ttl * 1000 : null,
       );
       await ContactsDb.saveMessage(localMsg);
       await ContactsDb.recordInteraction(
@@ -868,7 +1098,8 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
 
       final outcome = await MediaTransfer.send(
         toId: widget.participantId, messageId: messageId, file: File(localFilePath),
-        contentType: contentType, mimeType: mimeType ?? 'application/octet-stream');
+        contentType: contentType, mimeType: mimeType ?? 'application/octet-stream',
+        caption: caption, ttl: ttl);
       String status; String? note;
       switch (outcome) {
         case MediaSendOutcome.delivered: status = 'delivered'; break;
@@ -878,7 +1109,7 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
           note = 'They are offline. Kept on this device — it will be sent when they come online.';
           await MediaTransfer.keepPending(toId: widget.participantId, messageId: messageId,
               path: localFilePath, contentType: contentType,
-              mimeType: mimeType ?? 'application/octet-stream');
+              mimeType: mimeType ?? 'application/octet-stream', caption: caption, ttl: ttl);
           break;
         case MediaSendOutcome.noKey:
           // D21 (1.2.27): keep it, like an offline send — it goes as soon as their key is available.
@@ -887,7 +1118,7 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
               'sent once they do.';
           await MediaTransfer.keepPending(toId: widget.participantId, messageId: messageId,
               path: localFilePath, contentType: contentType,
-              mimeType: mimeType ?? 'application/octet-stream');
+              mimeType: mimeType ?? 'application/octet-stream', caption: caption, ttl: ttl);
           break;
         case MediaSendOutcome.tooLarge:
           status = 'failed';
@@ -1118,7 +1349,7 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
               MediaResult? m;
               try { m = await MediaHandler.pickImage(camera: true); }
               finally { RelayConnector.externalActivityOpen = false; }
-              if (m != null && mounted) await _sendMedia(m);
+              if (m != null && mounted) await _previewAndSend(m);
             }),
             _attachOption(Icons.image_outlined, 'Photo from Gallery', () async {
               RelayConnector.externalActivityOpen = true;
@@ -1126,7 +1357,7 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
               MediaResult? m;
               try { m = await MediaHandler.pickImage(); }
               finally { RelayConnector.externalActivityOpen = false; }
-              if (m != null && mounted) await _sendMedia(m);
+              if (m != null && mounted) await _previewAndSend(m);
             }),
             _attachOption(Icons.videocam_outlined, 'Video', () async {
               RelayConnector.externalActivityOpen = true;
@@ -1134,7 +1365,7 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
               MediaResult? m;
               try { m = await MediaHandler.pickVideo(); }
               finally { RelayConnector.externalActivityOpen = false; }
-              if (m != null && mounted) await _sendMedia(m);
+              if (m != null && mounted) await _previewAndSend(m);
             }),
             _attachOption(Icons.attach_file_outlined, 'File', () async {
               RelayConnector.externalActivityOpen = true;
@@ -1142,7 +1373,7 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
               MediaResult? m;
               try { m = await MediaHandler.pickFile(); }
               finally { RelayConnector.externalActivityOpen = false; }
-              if (m != null && mounted) await _sendMedia(m);
+              if (m != null && mounted) await _previewAndSend(m);
             }),
             const SizedBox(height: 16),
           ],
@@ -1151,6 +1382,91 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
     ).whenComplete(() {
       if (mounted) setState(() => _showAttachmentMenu = false);
     });
+  }
+
+  /// Show what is about to be sent, with a caption box — then send it (1.2.28).
+  Future<void> _previewAndSend(MediaResult media) async {
+    final ctrl = TextEditingController();
+    final isImage = media.contentType == 'image' ||
+        (media.contentType == 'file' && media.mimeType.toLowerCase().startsWith('image/'));
+    final name = media.file.path.split(RegExp(r'[\\/]')).last;
+    final send = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: _navy,
+        insetPadding: const EdgeInsets.all(16),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Text('Send to $_displayName',
+                style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+            if (isImage)
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 320),
+                child: ClipRRect(borderRadius: BorderRadius.circular(12),
+                    child: Image.file(media.file, fit: BoxFit.contain,
+                        errorBuilder: (_, __, ___) => _mediaErrorBox('Preview unavailable'))),
+              )
+            else
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(color: const Color(0xFF1A3A5C), borderRadius: BorderRadius.circular(12)),
+                child: Row(children: [
+                  Icon(media.contentType == 'video' ? Icons.videocam : Icons.insert_drive_file, color: _gold, size: 28),
+                  const SizedBox(width: 10),
+                  Expanded(child: Text(name, maxLines: 2, overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: Colors.white, fontSize: 13))),
+                  Text(MediaHandler.formatSize(media.sizeBytes),
+                      style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                ]),
+              ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: ctrl,
+              autofocus: true,
+              maxLines: 4, minLines: 1,
+              maxLength: 1000,
+              textCapitalization: TextCapitalization.sentences,
+              style: const TextStyle(color: Colors.white, fontSize: 14),
+              decoration: InputDecoration(
+                hintText: 'Add a caption\u2026',
+                hintStyle: const TextStyle(color: Colors.white38),
+                counterStyle: const TextStyle(color: Colors.white24, fontSize: 10),
+                filled: true, fillColor: _cardBg,
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide.none),
+              ),
+            ),
+            if (_ttl > 0)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Row(children: [
+                  const Icon(Icons.timer_outlined, color: Colors.white54, size: 14),
+                  const SizedBox(width: 4),
+                  Text('Disappears ${DisappearingTimer.label(_ttl)} after it arrives',
+                      style: const TextStyle(color: Colors.white54, fontSize: 11)),
+                ]),
+              ),
+            const SizedBox(height: 8),
+            Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false),
+                  child: const Text('Cancel', style: TextStyle(color: Colors.white54))),
+              const SizedBox(width: 8),
+              ElevatedButton.icon(
+                onPressed: () => Navigator.pop(ctx, true),
+                style: ElevatedButton.styleFrom(backgroundColor: _gold, foregroundColor: Colors.black),
+                icon: const Icon(Icons.send_rounded, size: 18),
+                label: const Text('Send', style: TextStyle(fontWeight: FontWeight.bold)),
+              ),
+            ]),
+          ]),
+        ),
+      ),
+    );
+    final caption = ctrl.text;
+    ctrl.dispose();
+    if (send == true && mounted) await _sendMedia(media, caption: caption);
   }
 
   Widget _attachOption(IconData icon, String label, Future<void> Function() onTap) {
@@ -1291,11 +1607,20 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
                     color: Colors.white,
                     fontSize: 16,
                     fontWeight: FontWeight.bold)),
-            Text(_truncateId(widget.participantId),
-                style: const TextStyle(
-                    color: Colors.white38,
-                    fontSize: 10,
-                    fontFamily: 'monospace')),
+            Row(mainAxisSize: MainAxisSize.min, children: [
+              Text(_truncateId(widget.participantId),
+                  style: const TextStyle(
+                      color: Colors.white38,
+                      fontSize: 10,
+                      fontFamily: 'monospace')),
+              if (_ttl > 0) ...[
+                const SizedBox(width: 6),
+                const Icon(Icons.timer_outlined, color: _gold, size: 11),
+                const SizedBox(width: 2),
+                Text(DisappearingTimer.label(_ttl),
+                    style: const TextStyle(color: _gold, fontSize: 10)),
+              ],
+            ]),
           ],
         ),
         actions: [
@@ -1346,6 +1671,9 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
                 case 'clear':
                   await _clearConversation();
                   break;
+                case 'timer':
+                  await _chooseTimer();
+                  break;
               }
             },
             itemBuilder: (_) => [
@@ -1378,6 +1706,15 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
                           : Colors.redAccent,
                     ),
                   ),
+                ]),
+              ),
+              PopupMenuItem(
+                value: 'timer',
+                child: Row(children: [
+                  const Icon(Icons.timer_outlined, color: Colors.white70, size: 18),
+                  const SizedBox(width: 10),
+                  Text(_ttl > 0 ? 'Disappearing: ${DisappearingTimer.label(_ttl)}' : 'Disappearing messages',
+                      style: const TextStyle(color: Colors.white)),
                 ]),
               ),
               const PopupMenuItem(
@@ -1671,9 +2008,11 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
   // â”€â”€ Chat bubble â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   Widget _buildBubble(LocalMessage msg) {
+    if (msg.contentType == 'system') return _buildSystemNotice(msg);
     final isMe      = msg.fromSovereignId == widget.mySovId;
     final isMedia   = msg.contentType != 'text';
     final timeLabel = _relativeTime(msg.sentAt);
+    final hasCaption = isMedia && msg.caption.isNotEmpty;
 
     return Padding(
       padding: EdgeInsets.only(
@@ -1688,7 +2027,8 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
           children: [
             // [S9] Long-press opens emoji picker
             GestureDetector(
-              onLongPress: () => _showEmojiPicker(msg),
+              onLongPress: () => _showMessageActions(msg),
+              onSecondaryTap: () => _showMessageActions(msg),   // right-click on desktop
               child: Container(
                 padding: isMedia
                     ? const EdgeInsets.all(4)
@@ -1707,7 +2047,23 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
                         : Colors.white.withAlpha(10),
                   ),
                 ),
-                child: _buildMessageContent(msg),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (msg.replyToId != null) _buildReplyQuote(msg.replyToId!, isMe),
+                    _buildMessageContent(msg),
+                    if (hasCaption)
+                      ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 260),
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(8, 6, 8, 4),
+                          child: Text(msg.caption,
+                              style: TextStyle(color: isMe ? _gold : Colors.white, fontSize: 14, height: 1.4)),
+                        ),
+                      ),
+                  ],
+                ),
               ),
             ),
             const SizedBox(height: 3),
@@ -1718,6 +2074,13 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
                 Text(timeLabel,
                     style: const TextStyle(
                         color: Colors.white24, fontSize: 10)),
+                if (msg.expiresAt != null) ...[
+                  const SizedBox(width: 4),
+                  const Icon(Icons.timer_outlined, size: 10, color: Colors.white38),
+                  const SizedBox(width: 1),
+                  Text(DisappearingTimer.shortLeft(msg.expiresAt!),
+                      style: const TextStyle(color: Colors.white38, fontSize: 10)),
+                ],
                 if (isMe) ...[
                   const SizedBox(width: 4),
                   _buildStatusTick(msg.status), // [S9] tick icons
@@ -1764,6 +2127,34 @@ class _SovLinkScreenState extends State<SovLinkScreen> {
       );
     }
 
+    final bar = _buildComposeRow();
+    if (_replyTo == null) return bar;
+    final r = _replyTo!;
+    return Column(mainAxisSize: MainAxisSize.min, children: [
+      Container(
+        color: _cardBg,
+        padding: const EdgeInsets.fromLTRB(12, 8, 4, 0),
+        child: Row(children: [
+          Container(width: 3, height: 34, color: _gold),
+          const SizedBox(width: 8),
+          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(r.fromSovereignId == widget.mySovId ? 'Replying to yourself' : 'Replying to $_displayName',
+                style: const TextStyle(color: _gold, fontSize: 11, fontWeight: FontWeight.bold)),
+            Text(_snippet(r), maxLines: 1, overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Colors.white60, fontSize: 12)),
+          ])),
+          IconButton(
+            icon: const Icon(Icons.close, color: Colors.white54, size: 18),
+            tooltip: 'Cancel reply',
+            onPressed: () => setState(() => _replyTo = null),
+          ),
+        ]),
+      ),
+      bar,
+    ]);
+  }
+
+  Widget _buildComposeRow() {
     return Container(
       padding: EdgeInsets.only(
         left: 4, right: 8, top: 8,

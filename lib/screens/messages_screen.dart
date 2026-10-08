@@ -1014,8 +1014,11 @@ class _MessagesScreenState extends State<MessagesScreen>
                           'type':        'ENCLAVE_POST',
                           'sovereign_id': widget.sovereignId,
                           'channel':     'general',
+                          // D47 (1.2.28): the node reads post_id + body. The app sent `content` and no
+                          // id, so every post was refused MISSING_FIELDS — the Enclave never worked.
+                          'post_id':     'ep-${DateTime.now().millisecondsSinceEpoch}-${widget.sovereignId.hashCode.toUnsigned(32)}',
                           'title':       title,
-                          'content':     content,
+                          'body':        content,
                         },
                         responseType: 'ENCLAVE_POST_RESULT',
                         timeout: const Duration(seconds: 10),
@@ -1089,18 +1092,10 @@ class _MessagesScreenState extends State<MessagesScreen>
                             fontWeight: FontWeight.bold)),
                     const SizedBox(height: 10),
                     const Text(
-                      'SOV Enclave is activated by citizen governance.\n'
-                      'Visit the Constitution tab and vote to bring it live.',
+                      'The SOV Enclave is switched off right now — citizens turned it off by vote,\n'
+                      'or your node could not be reached. A vote in the Constitution tab can bring it back.',
                       textAlign: TextAlign.center,
                       style: TextStyle(color: Colors.white38, fontSize: 13, height: 1.55),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      'Only 2 citizens needed to activate.',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                          color: _gold.withAlpha(200), fontSize: 12,
-                          fontWeight: FontWeight.w600),
                     ),
                     const SizedBox(height: 24),
                     TextButton.icon(
@@ -1322,7 +1317,9 @@ class _ForumThreadPageState extends State<_ForumThreadPage> {
           'type':         'ENCLAVE_REPLY',
           'sovereign_id': widget.mySovId,
           'post_id':      widget.post['post_id'],
-          'content':      text,
+          // D47: the node reads reply_id + body.
+          'reply_id':     'er-${DateTime.now().millisecondsSinceEpoch}-${widget.mySovId.hashCode.toUnsigned(32)}',
+          'body':         text,
         },
         responseType: 'ENCLAVE_REPLY_RESULT',
         timeout: const Duration(seconds: 10),
@@ -1358,7 +1355,7 @@ class _ForumThreadPageState extends State<_ForumThreadPage> {
   @override
   Widget build(BuildContext context) {
     final title   = widget.post['title']   as String? ?? '';
-    final content = widget.post['content'] as String? ?? '';
+    final content = (widget.post['body'] ?? widget.post['content']) as String? ?? '';   // D47: node rows hold `body`
     final author  = widget.post['author_id'] as String? ?? '';
     final createdAt = (widget.post['created_at'] as num?)?.toInt();
 
@@ -1498,7 +1495,7 @@ class _ForumThreadPageState extends State<_ForumThreadPage> {
                                             color: Colors.white38, fontSize: 10)),
                                   ]),
                                   const SizedBox(height: 8),
-                                  Text(r['content'] as String? ?? '',
+                                  Text((r['body'] ?? r['content']) as String? ?? '',
                                       style: const TextStyle(
                                           color: Colors.white70,
                                           fontSize: 13,

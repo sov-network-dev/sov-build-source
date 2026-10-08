@@ -35,3 +35,16 @@ Future<String> sovDatabasesDir() async {
   // Android/iOS: the default is already an app-private, stable location.
   return getDatabasesPath();
 }
+
+/// Where SOV keeps received chat media. On a phone the app's documents folder is already
+/// private to the app. On a desktop that folder is the user's own visible Documents, so
+/// received photos and files would sit where any program or person browsing the PC could
+/// open them (D51, 1.2.28) — there they go beside the databases instead.
+Future<Directory> sovMediaDir() async {
+  final base = (Platform.isWindows || Platform.isLinux || Platform.isMacOS)
+      ? await getApplicationSupportDirectory()
+      : await getApplicationDocumentsDirectory();
+  final dir = Directory(p.join(base.path, 'sov_speak_media'));
+  if (!await dir.exists()) await dir.create(recursive: true);
+  return dir;
+}

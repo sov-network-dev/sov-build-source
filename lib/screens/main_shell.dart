@@ -37,6 +37,7 @@ import 'governance_screen.dart';
 import 'messages_screen.dart';
 import 'profile_screen.dart';
 import 'sov_link_screen.dart';
+import '../sov_node_sdk/speak_payload.dart';
 import '../sov_node_sdk/palm_name_engine.dart';
 
 class MainShell extends StatefulWidget {
@@ -72,6 +73,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     MainShell._instance = this;
     WidgetsBinding.instance.addObserver(this);
     MediaTransfer.init();   // resend media kept on this device when its recipient comes online
+    DisappearingSweeper.start();   // 1.2.28: remove messages whose timer has run out
     _init();
   }
 
@@ -474,7 +476,8 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
       if (exchangeOId.isEmpty && MediaTransfer.isMediaType(contentType)) {
         final m = await MediaTransfer.acceptChunk(msg, mySovId);
         if (m == null) return;
-        final label = const {'image': '📷 Photo', 'audio': '🎤 Voice note', 'video': '🎬 Video'}[m.contentType] ?? '📎 File';
+        final kind = const {'image': '📷 Photo', 'audio': '🎤 Voice note', 'voice': '🎤 Voice note', 'video': '🎬 Video'}[m.contentType] ?? '📎 File';
+        final label = m.caption.isNotEmpty ? '$kind · ${m.caption}' : kind;
         try {
           await ContactsDb.recordInteraction(
             sovereignId: fromId,

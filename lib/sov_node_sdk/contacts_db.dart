@@ -15,7 +15,9 @@
 import 'dart:convert';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
+import 'dart:io';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'speak_payload.dart';
 import 'palm_name_engine.dart';
 import 'sov_db_path.dart';
 
@@ -71,16 +73,20 @@ class LocalMessage {
   final String  conversationId;
   final String  fromSovereignId;
   final String? toSovereignId;
-  final String  contentType;
+  String        contentType;
   final String  encryptedContent;
   String?       decryptedContent;
   String        status;
   final int     sentAt;
   int?          deliveredAt;
   int?          readAt;
-  final String? replyToId;
+  String?       replyToId;
   /// [S9] Emoji reactions — emoji → list of reactor SOV IDs
   Map<String, List<String>> reactions;
+  /// Caption under a photo, video or file ('' = none). 1.2.28.
+  String caption;
+  /// When this message disappears from this device (ms since epoch); null = never. 1.2.28.
+  int? expiresAt;
 
   LocalMessage({
     required this.id,
@@ -96,6 +102,8 @@ class LocalMessage {
     this.readAt,
     this.replyToId,
     Map<String, List<String>>? reactions,
+    this.caption = '',
+    this.expiresAt,
   }) : reactions = reactions ?? {};
 
   /// Human-readable status for display under message bubble.
@@ -140,6 +148,8 @@ class LocalMessage {
     'read_at':             readAt,
     'reply_to_id':         replyToId,
     'reactions':           jsonEncode(reactions),
+    'caption':             caption,
+    'expires_at':          expiresAt,
   };
 
   /// Parse the reactions JSON column: {"👍": ["SOV-A", "SOV-B"], ...}
@@ -165,6 +175,8 @@ class LocalMessage {
     readAt:           m['read_at']            as int?,
     replyToId:        m['reply_to_id']        as String?,
     reactions:        LocalMessage._parseReactions(m['reactions'] as String?),
+    caption:          (m['caption'] as String?) ?? '',
+    expiresAt:        m['expires_at'] as int?,
   );
 }
 
@@ -213,7 +225,7 @@ class ContactsDb {
     final dbPath = join(await sovDatabasesDir(), 'sov_contacts.db');
     return openDatabase(
       dbPath,
-      version: 7,
+      version: 8,
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
           await db.execute(
@@ -256,6 +268,11 @@ class ContactsDb {
             await db.execute(
               'ALTER TABLE outbox ADD COLUMN channel TEXT DEFAULT ''');
           } catch (_) {}
+        }
+        if (oldVersion < 8) {
+          // 1.2.28: captions on media, and disappearing messages (both device-only).
+          try { await db.execute("ALTER TABLE messages ADD COLUMN caption TEXT DEFAULT ''"); } catch (_) {}
+          try { await db.execute('ALTER TABLE messages ADD COLUMN expires_at INTEGER'); } catch (_) {}
         }
         if (oldVersion < 3) {
           // ── Deduplicate conversations ────────────────────────────────────
@@ -326,7 +343,9 @@ class ContactsDb {
             delivered_at      INTEGER,
             read_at           INTEGER,
             reply_to_id       TEXT,
-            reactions         TEXT DEFAULT '{}'
+            reactions         TEXT DEFAULT '{}',
+            caption           TEXT DEFAULT '',
+            expires_at        INTEGER
           )
         ''');
 
@@ -624,6 +643,7 @@ class ContactsDb {
 
   static Future<void> saveMessage(LocalMessage message) async {
     final database = await db;
+    await _applySpeakPayload(message);
     await database.insert(
       'messages',
       message.toMap(),
@@ -657,13 +677,102 @@ class ContactsDb {
   /// Persist a newly-decrypted plaintext for a message whose first delivery
   /// arrived before the sender's messaging key was available. Used by the
   /// re-decrypt retry so a "🔒 syncing…" placeholder resolves to real text.
-  static Future<void> updateMessageDecrypted(
+  static Future<SpeakPayload> updateMessageDecrypted(
       String messageId, String decrypted) async {
     final database = await db;
-    await database.update(
-      'messages', {'decrypted_content': decrypted},
-      where: 'id = ?', whereArgs: [messageId],
-    );
+    final p = SpeakPayload.parse(decrypted);
+    final rows = await database.query('messages',
+        columns: ['conversation_id', 'expires_at'], where: 'id = ?', whereArgs: [messageId]);
+    final update = <String, dynamic>{'decrypted_content': p.text};
+    if (p.replyTo != null) update['reply_to_id'] = p.replyTo;
+    if (p.sys != null) {
+      update['content_type'] = 'system';
+      if (rows.isNotEmpty) await DisappearingTimer.set(rows.first['conversation_id'] as String, p.ttl);
+    } else if (p.ttl > 0 && (rows.isEmpty || rows.first['expires_at'] == null)) {
+      update['expires_at'] = DateTime.now().millisecondsSinceEpoch + p.ttl * 1000;
+    }
+    await database.update('messages', update, where: 'id = ?', whereArgs: [messageId]);
+    return p;
+  }
+
+  /// A decrypted text that carries SOV Speak extras (timer, reply, timer notice) is
+  /// stored as its plain text plus columns, never as the raw JSON. 1.2.28.
+  static Future<void> _applySpeakPayload(LocalMessage m) async {
+    final raw = m.decryptedContent;
+    if (m.contentType != 'text' || raw == null) return;
+    final p = SpeakPayload.parse(raw);
+    if (identical(p.text, raw)) return;   // ordinary text
+    m.decryptedContent = p.text;
+    if (p.sys != null) {
+      m.contentType = 'system';
+      await DisappearingTimer.set(m.conversationId, p.ttl);
+      return;
+    }
+    if (p.ttl > 0) m.expiresAt ??= DateTime.now().millisecondsSinceEpoch + p.ttl * 1000;
+    if (p.replyTo != null) m.replyToId = p.replyTo;
+  }
+
+  /// Delete every message whose disappearing timer has run out, with any received media
+  /// file SOV saved for it. Never touches a file the citizen picked from their own storage.
+  /// Returns the ids removed.
+  static Future<List<String>> deleteExpired() async {
+    final database = await db;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final rows = await database.query('messages',
+        columns: ['id', 'conversation_id', 'decrypted_content'],
+        where: 'expires_at IS NOT NULL AND expires_at <= ?', whereArgs: [now]);
+    if (rows.isEmpty) return const [];
+    final convs = <String>{};
+    for (final r in rows) {
+      _deleteSavedMedia(r['decrypted_content'] as String?);
+      convs.add(r['conversation_id'] as String);
+    }
+    final ids = rows.map((r) => r['id'] as String).toList();
+    await database.delete('messages',
+        where: 'id IN (${List.filled(ids.length, '?').join(',')})', whereArgs: ids);
+    for (final c in convs) {
+      await _refreshPreview(database, c, emptyText: 'Messages disappeared');
+    }
+    return ids;
+  }
+
+  /// Remove one message from THIS device only ("Delete for me"), with any media SOV saved.
+  static Future<void> deleteMessageLocal(String messageId) async {
+    final database = await db;
+    final rows = await database.query('messages',
+        columns: ['conversation_id', 'decrypted_content'], where: 'id = ?', whereArgs: [messageId]);
+    if (rows.isEmpty) return;
+    _deleteSavedMedia(rows.first['decrypted_content'] as String?);
+    await database.delete('messages', where: 'id = ?', whereArgs: [messageId]);
+    await _refreshPreview(database, rows.first['conversation_id'] as String, emptyText: '');
+  }
+
+  static void _deleteSavedMedia(String? path) {
+    if (path == null || !path.contains('sov_speak_media')) return;
+    try {
+      final f = File(path);
+      if (f.existsSync()) f.deleteSync();
+      final dir = f.parent;
+      if (dir.existsSync() && dir.listSync().isEmpty) dir.deleteSync();
+    } catch (_) {}
+  }
+
+  static Future<void> _refreshPreview(Database database, String convId, {required String emptyText}) async {
+    final last = await database.query('messages',
+        columns: ['decrypted_content', 'content_type', 'caption'], where: 'conversation_id = ?',
+        whereArgs: [convId], orderBy: 'sent_at DESC', limit: 1);
+    String preview;
+    if (last.isEmpty) {
+      preview = emptyText;
+    } else {
+      final ct = last.first['content_type'] as String? ?? 'text';
+      final cap = last.first['caption'] as String? ?? '';
+      preview = (ct == 'text' || ct == 'system')
+          ? (last.first['decrypted_content'] as String? ?? '')
+          : (cap.isNotEmpty ? cap : '[$ct]');
+    }
+    await database.update('conversations', {'last_message_preview': preview},
+        where: 'id = ?', whereArgs: [convId]);
   }
 
   /// [S9] Persist reactions JSON for a single message row.

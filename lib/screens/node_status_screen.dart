@@ -1283,9 +1283,10 @@ class _NodeStatusScreenState extends State<NodeStatusScreen> {
           ),
           const SizedBox(height: 10),
           const Text(
-            'Turn your computer into a sovereign citizen node. '
-            'Earn SOV for every citizen you serve. '
-            'Download the SOV Node software from sov-node.network.',
+            'A node runs on a computer, not on a phone. Install the SOV app on a '
+            'Windows, Mac or Linux computer, then open Home → SOV Network · View '
+            'Dashboard → Full Node. The download is in the Academy tab under '
+            '"Get SOV from the network".',
             style: TextStyle(color: Colors.white60, fontSize: 13, height: 1.5),
           ),
           const SizedBox(height: 14),
@@ -1295,9 +1296,11 @@ class _NodeStatusScreenState extends State<NodeStatusScreen> {
                 'Learn More',
                 Icons.open_in_new,
                 () {
-                  // Future: open SOV Academy article about running a node
+                  // D48 (1.2.28): this used to send citizens to sov-node.network — a domain
+                  // nobody owns, which anyone could register to serve a fake node download.
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Visit sov-node.network to download')),
+                    const SnackBar(content: Text(
+                        'Open the Academy tab → "Get SOV from the network" for the computer download')),
                   );
                 },
               ),

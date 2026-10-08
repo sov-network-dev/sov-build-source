@@ -29,6 +29,8 @@ import 'message_events.dart';
 import 'message_key_manager.dart';
 import 'outbox_manager.dart';
 import 'relay_connector.dart';
+import 'sov_db_path.dart';
+import 'speak_payload.dart';
 
 enum MediaSendOutcome { delivered, relayed, offline, noKey, tooLarge, failed }
 
@@ -48,6 +50,7 @@ class MediaTransfer {
 
   static final Map<String, Map<int, String>> _parts = {};
   static final Map<String, int> _partsStarted = {};
+  static final Map<String, Map<String, Object>> _meta = {};
   static final Set<String> _done = {};
   static StreamSubscription<String>? _onlineSub;
 
@@ -93,6 +96,8 @@ class MediaTransfer {
     required File file,
     required String contentType,
     required String mimeType,
+    String caption = '',
+    int ttl = 0,
   }) async {
     final bytes = await _prepareBytes(file, contentType);
     if (bytes.length > maxBytes) return MediaSendOutcome.tooLarge;
@@ -106,6 +111,9 @@ class MediaTransfer {
       final plain = jsonEncode({
         'mc': 2, 'mid': messageId, 'i': i, 'n': n, 'ct': contentType, 'mime': mimeType,
         'size': bytes.length, 'name': safeName(file.path.split(RegExp(r'[\\/]')).last),
+        // 1.2.28: caption and disappearing timer ride inside the encrypted chunk.
+        if (caption.isNotEmpty) 'cap': caption,
+        if (ttl > 0) 'ttl': ttl,
         'd': base64Encode(part),
       });
       final env = await MessageEncryptor.encrypt(
@@ -139,11 +147,13 @@ class MediaTransfer {
   static Future<void> keepPending({
     required String toId, required String messageId, required String path,
     required String contentType, required String mimeType,
+    String caption = '', int ttl = 0,
   }) async {
     final p = await SharedPreferences.getInstance();
     final list = (p.getStringList(_pendingKey) ?? [])
       ..removeWhere((s) => (jsonDecode(s) as Map)['mid'] == messageId)
-      ..add(jsonEncode({'to': toId, 'mid': messageId, 'path': path, 'ct': contentType, 'mime': mimeType}));
+      ..add(jsonEncode({'to': toId, 'mid': messageId, 'path': path, 'ct': contentType, 'mime': mimeType,
+          'cap': caption, 'ttl': ttl}));
     await p.setStringList(_pendingKey, list);
     await OutboxManager.watch(toId);
   }
@@ -158,7 +168,8 @@ class MediaTransfer {
       final f = File(e['path'] as String);
       if (!await f.exists()) continue;
       final out = await send(toId: toId, messageId: e['mid'] as String, file: f,
-          contentType: e['ct'] as String, mimeType: e['mime'] as String);
+          contentType: e['ct'] as String, mimeType: e['mime'] as String,
+          caption: e['cap'] as String? ?? '', ttl: (e['ttl'] as num?)?.toInt() ?? 0);
       if (out == MediaSendOutcome.delivered || out == MediaSendOutcome.relayed) {
         await ContactsDb.updateMessageStatus(e['mid'] as String,
             out == MediaSendOutcome.delivered ? 'delivered' : 'relayed',
@@ -201,9 +212,16 @@ class MediaTransfer {
     _evictStale();
     _partsStarted.putIfAbsent(slot, () => DateTime.now().millisecondsSinceEpoch);
     (_parts[slot] ??= {})[i] = c['d'] as String? ?? '';
+    if (c['cap'] is String || c['ttl'] is num) {
+      _meta[slot] = {'cap': c['cap'] is String ? c['cap'] as String : '', 'ttl': (c['ttl'] as num?)?.toInt() ?? 0};
+    }
     if (_parts[slot]!.length < n) return null;
     _done.add(slot);
     final parts = _parts.remove(slot)!; _partsStarted.remove(slot);
+    final meta = _meta.remove(slot) ?? const {'cap': '', 'ttl': 0};
+    final ttl = ((meta['ttl'] as int?) ?? 0).clamp(0, DisappearingTimer.maxSeconds);
+    var caption = (meta['cap'] as String?) ?? '';
+    if (caption.length > 2000) caption = caption.substring(0, 2000);
     final b = BytesBuilder(copy: false);
     for (var k = 0; k < n; k++) {
       final d = parts[k];
@@ -215,8 +233,7 @@ class MediaTransfer {
     final name = c['name'] is String && (c['name'] as String).isNotEmpty
         ? safeName(c['name'] as String)
         : '$mid${MediaHandler.extensionForMime(mime)}';
-    final docs = await getApplicationDocumentsDirectory();
-    final dir = Directory('${docs.path}/sov_speak_media/$mid');   // one folder per message: names never collide
+    final dir = Directory('${(await sovMediaDir()).path}/$mid');   // D51: private app folder on desktop   // one folder per message: names never collide
     await dir.create(recursive: true);
     final saved = File('${dir.path}/$name');
     await saved.writeAsBytes(b.takeBytes(), flush: true);
@@ -226,6 +243,7 @@ class MediaTransfer {
       fromSovereignId: fromId, toSovereignId: mySovId, contentType: ct,
       encryptedContent: '', decryptedContent: saved.path,
       status: 'delivered', sentAt: (msg['sent_at'] as num?)?.toInt() ?? now, deliveredAt: now,
+      caption: caption, expiresAt: ttl > 0 ? now + ttl * 1000 : null,
     );
     await ContactsDb.saveMessage(m);
     _assembledCtrl.add(m);
@@ -235,7 +253,7 @@ class MediaTransfer {
   static void _evictStale() {
     final cutoff = DateTime.now().millisecondsSinceEpoch - 15 * 60 * 1000;
     for (final k in _partsStarted.keys.where((k) => _partsStarted[k]! < cutoff).toList()) {
-      _parts.remove(k); _partsStarted.remove(k);
+      _parts.remove(k); _partsStarted.remove(k); _meta.remove(k);
     }
   }
 }

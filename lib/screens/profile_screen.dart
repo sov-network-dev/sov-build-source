@@ -450,7 +450,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 _buildRow(
                   icon:    Icons.article_outlined,
                   title:   'Seed Phrase',
-                  sub:     'View your 12-word recovery phrase',
+                  sub:     'SOV never stores your 12 words — keep them safe',
                   onTap:   _showSeedReminder,
                 ),
               ]),
@@ -853,9 +853,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
         title: const Text('Seed Phrase',
             style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
         content: const Text(
-          'Your 12-word seed phrase is the master key to your wallet. '
-          'It is stored only on this device. Write it down and keep it safe — '
-          'no one else has a copy and it cannot be recovered if lost.',
+          'Your 12-word seed phrase is the master key to your wallet. SOV showed '
+          'it to you once, when you joined, and does not keep it — not on this '
+          'device, not on any node. So it cannot be shown again here. Keep your '
+          'written copy safe: with it you can restore your wallet on any device.',
           style: TextStyle(color: Colors.white60, height: 1.5),
         ),
         actions: [

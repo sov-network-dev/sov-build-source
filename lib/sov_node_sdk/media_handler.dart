@@ -17,6 +17,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:mime/mime.dart';
+import 'sov_db_path.dart';
 
 // ── Data model ────────────────────────────────────────────────────────────────
 
@@ -191,9 +192,7 @@ class MediaHandler {
   static Future<File> saveReceivedMedia(
       String base64Data, String filename) async {
     try {
-      final dir      = await getApplicationDocumentsDirectory();
-      final mediaDir = Directory('${dir.path}/sov_speak_media');
-      await mediaDir.create(recursive: true);
+      final mediaDir = await sovMediaDir();   // D51: private app folder on desktop
       final file  = File('${mediaDir.path}/$filename');
       final bytes = base64Decode(base64Data);
       await file.writeAsBytes(bytes);
