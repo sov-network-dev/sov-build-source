@@ -120,6 +120,14 @@ const MSG_TYPE = {
   RECOVERY_REQUEST:       'UI',  // Initiate guardian recovery
   GUARDIAN_APPROVE:       'UP',  // Approve a recovery request
   GUARDIAN_REJECT:        'UJ',  // Reject a recovery request
+  // 1.4.94 (D59): node->app guardian PUSH codes, registered so _send carries the English type
+  // (via _opToType) instead of the raw code — the app matched no handler on a raw code, so guardian
+  // recovery was dead end to end. 3-char, distinct from every 2-char op.
+  GUARDIAN_INVITE:            'GIN',
+  GUARDIAN_APPROVAL_REQUEST:  'GAP',
+  GUARDIAN_APPROVAL_UPDATE:   'GAU',
+  GUARDIAN_RECOVERY_COMPLETE: 'GCO',
+  GUARDIAN_RECOVERY_REJECTED: 'GRJ',
 
   // ── Exchange engine — inbound op codes (phone → node) ───────────────────
   EXCHANGE_LIST_ORDER:    'XL',  // Seller lists SOV for sale

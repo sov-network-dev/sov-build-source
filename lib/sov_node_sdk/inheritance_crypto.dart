@@ -8,6 +8,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
+import 'package:cryptography/cryptography.dart' as sovc;
 
 class InheritanceCrypto {
   // ── Claim-key alphabet: unambiguous uppercase alphanumerics ─────────────────
@@ -26,6 +27,35 @@ class InheritanceCrypto {
   /// SHA-256 hex of the raw claim key string.  This is what goes to the relay.
   static String hashClaimKey(String claimKey) =>
       sha256.convert(utf8.encode(claimKey.trim())).toString();
+
+  // ── claim keypair (1.4.94 D53) ───────────────────────────────────────────────
+  // The claim is proved by a SIGNATURE, never by sending a hash the network broadcasts. An Ed25519
+  // keypair is derived deterministically from the claim key; the allocation stores only the public
+  // key, and a claim signs 'SOV-ALLOC-CLAIM-v1|<pubkey>|<claimant>|<ts>'. Must match the node
+  // (protocol/allocation_engine.js allocClaimString) and the test client exactly.
+  static final _ed = sovc.Ed25519();
+
+  static Future<sovc.SimpleKeyPair> _claimKeyPair(String claimKey) {
+    final seed = sha256.convert(utf8.encode('SOV-ALLOC-CLAIM-v1|' + claimKey.trim())).bytes;
+    return _ed.newKeyPairFromSeed(seed);
+  }
+
+  /// The public key stored with the allocation (hex). Derived from the claim key.
+  static Future<String> claimPubkey(String claimKey) async {
+    final kp = await _claimKeyPair(claimKey);
+    final pub = await kp.extractPublicKey();
+    return pub.bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  }
+
+  /// Sign a claim. Returns {pubkey, ts, sig} the app sends with ALLOCATION_CLAIM_STAGE1.
+  static Future<Map<String, dynamic>> signClaim(String claimKey, String claimantId) async {
+    final kp  = await _claimKeyPair(claimKey);
+    final pub = await claimPubkey(claimKey);
+    final ts  = DateTime.now().millisecondsSinceEpoch;
+    final sig = await _ed.sign(utf8.encode('SOV-ALLOC-CLAIM-v1|$pub|$claimantId|$ts'), keyPair: kp);
+    final sigHex = sig.bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    return {'claim_pubkey': pub, 'claim_ts': ts, 'claim_sig': sigHex};
+  }
 
   // ── hashBeneficiaryName ─────────────────────────────────────────────────────
   /// Normalise (trim + lowercase) then SHA-256 hash the beneficiary name.

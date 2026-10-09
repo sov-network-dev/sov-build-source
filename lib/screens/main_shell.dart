@@ -174,12 +174,14 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
     _refreshBalance();
 
-    // Intelligent full-node auto-start (desktop only). A restored wallet means the
-    // operator is already a biometrically-verified citizen — no re-scan needed — so
-    // if auto-run is on (default) bring the node up on its own in the saved
-    // reachability mode. Fire-and-forget; never blocks the UI or throws.
+    // Full-node auto-start (desktop only), OPT-IN since 1.2.29. It only runs when the
+    // citizen has switched Full Node on themselves (Node Status writes node_auto_run).
+    // It used to default ON, so every restored desktop wallet silently became a node
+    // and an OPERATOR on the live mesh; when such PCs went offline the ledger could not
+    // reach its operator majority and every transfer stopped (incident 2026-10-09).
+    // Fire-and-forget; never blocks the UI or throws.
     if (NodeController.isDesktopPlatform && sovId.isNotEmpty) {
-      final autoRun    = prefs.getBool('node_auto_run') ?? true;
+      final autoRun    = prefs.getBool('node_auto_run') ?? false;   // opt-in (1.2.29)
       final reachIdx   = (prefs.getInt('node_reach_mode') ?? 0)
           .clamp(0, ReachMode.values.length - 1);
       final staticHost = prefs.getString('node_static_host');

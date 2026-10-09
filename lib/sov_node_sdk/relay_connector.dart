@@ -2016,6 +2016,7 @@ class RelayConnector {
         _incomingMessageController.add(decoded);
         _messageController?.add(decoded);
         return;
+      case 'GUARDIAN_APPROVAL_UPDATE':
       case 'GUARDIAN_RECOVERY_COMPLETE':
       case 'GUARDIAN_RECOVERY_REJECTED':
         _guardianRecoveryController.add(decoded);
@@ -3471,8 +3472,11 @@ class RelayConnector {
     required String citizenId,
     required String guardianId,
   }) async {
+    // 1.4.94 (D59): the node requires the CITIZEN to sign the appointment, so a peer cannot forge it.
+    final ts = DateTime.now().millisecondsSinceEpoch;
+    final sig = await KeyManager.signChallenge('SOV-GUARDIAN-SET-v1|$citizenId|$guardianId|add|$ts');
     return sendAndWait(
-      request: {'type': 'GUARDIAN_ADD', 'citizen_id': citizenId, 'guardian_id': guardianId},
+      request: {'type': 'GUARDIAN_ADD', 'citizen_id': citizenId, 'guardian_id': guardianId, 'ts': ts, 'sig': sig},
       responseType: 'GUARDIAN_ADD_RESULT',
       timeout: const Duration(seconds: 10),
     );
@@ -3483,8 +3487,10 @@ class RelayConnector {
     required String citizenId,
     required String guardianId,
   }) async {
+    final ts = DateTime.now().millisecondsSinceEpoch;
+    final sig = await KeyManager.signChallenge('SOV-GUARDIAN-SET-v1|$citizenId|$guardianId|remove|$ts');
     return sendAndWait(
-      request: {'type': 'GUARDIAN_REMOVE', 'citizen_id': citizenId, 'guardian_id': guardianId},
+      request: {'type': 'GUARDIAN_REMOVE', 'citizen_id': citizenId, 'guardian_id': guardianId, 'ts': ts, 'sig': sig},
       responseType: 'GUARDIAN_REMOVE_RESULT',
       timeout: const Duration(seconds: 10),
     );
@@ -3511,12 +3517,14 @@ class RelayConnector {
     required String newPubKeyHex,
     required String requestId,
   }) async {
+    // 1.4.94 (D59): 'GUARDIAN_RECOVERY_REQUEST' maps to op UI (handleRecoveryRequest); the node reads
+    // new_pub_key. 'GUARDIAN_RECOVERY_INIT' matched no handler.
     return sendAndWait(
       request: {
-        'type':            'GUARDIAN_RECOVERY_INIT',
-        'citizen_id':      citizenId,
-        'new_pub_key_hex': newPubKeyHex,
-        'request_id':      requestId,
+        'type':        'GUARDIAN_RECOVERY_REQUEST',
+        'citizen_id':  citizenId,
+        'new_pub_key': newPubKeyHex,
+        'request_id':  requestId,
       },
       responseType: 'GUARDIAN_RECOVERY_INIT_RESULT',
       timeout: const Duration(seconds: 10),
@@ -3525,12 +3533,22 @@ class RelayConnector {
 
   /// Approve a guardian recovery request. Call this when the guardian
   /// confirms the request is legitimate.
+  /// Approve a guardian recovery request. The fields [citizenId], [oldPubKey], [newPubKey] come from the
+  /// GUARDIAN_APPROVAL_REQUEST push; the guardian signs over them so a node cannot forge or replay the
+  /// approval, and it can never be replayed once the citizen's key has changed (1.4.94 D56/D59).
   static Future<Map<String, dynamic>?> approveGuardianRecovery({
     required String requestId,
     required String guardianId,
+    required String citizenId,
+    required String oldPubKey,
+    required String newPubKey,
   }) async {
+    final ts = DateTime.now().millisecondsSinceEpoch;
+    final o = oldPubKey.toLowerCase(), n = newPubKey.toLowerCase();
+    final sig = await KeyManager.signChallenge(
+        'SOV-GUARDIAN-APPROVE-v2|$requestId|$citizenId|$o|$n|$guardianId|$ts');
     return sendAndWait(
-      request: {'type': 'GUARDIAN_APPROVE', 'request_id': requestId, 'guardian_id': guardianId},
+      request: {'type': 'GUARDIAN_APPROVE', 'request_id': requestId, 'guardian_id': guardianId, 'ts': ts, 'sig': sig},
       responseType: 'GUARDIAN_APPROVE_RESULT',
       timeout: const Duration(seconds: 10),
     );
@@ -4104,13 +4122,17 @@ class RelayConnector {
   }
 
   /// Stage 1 claim: direct claim key — no allocation_id required.
-  /// Relay looks up the allocation by claim_key_hash.
+  /// Claim an allocation (1.4.94 D53). [signed] = InheritanceCrypto.signClaim(claimKey, sovereignId):
+  /// {claim_pubkey, claim_sig, claim_ts}. The node finds the allocation by the claim public key and
+  /// verifies the signature — the claim key itself never leaves the device, and the public key leaks nothing.
   static Future<Map<String, dynamic>> claimStage1(
-      String sovereignId, String claimKeyHash) async {
+      String sovereignId, Map<String, dynamic> signed) async {
     final resp = await sendAndWait(
       request: {
         'type':                  'ALLOCATION_CLAIM_STAGE1',
-        'claim_key_hash':        claimKeyHash,
+        'claim_pubkey':          signed['claim_pubkey'],
+        'claim_sig':             signed['claim_sig'],
+        'claim_ts':              signed['claim_ts'],
         'claimant_sovereign_id': sovereignId,
       },
       responseType: 'ALLOCATION_CLAIMED',

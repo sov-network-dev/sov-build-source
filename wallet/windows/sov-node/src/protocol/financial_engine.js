@@ -27,6 +27,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const nacl   = require('tweetnacl');
 
 // Maximum optimistic concurrency retries for balance operations
 const MAX_RETRIES = 3;
@@ -51,6 +52,8 @@ class FinancialEngine {
     peerMesh.on('GUARDIAN_INVITE_BROADCAST',  (msg) => this._handleGuardianInviteBroadcast(msg));
     peerMesh.on('GUARDIAN_RECOVERY_BROADCAST',(msg) => this._handleGuardianRecoveryBroadcast(msg));
     peerMesh.on('GUARDIAN_APPROVAL_BROADCAST',(msg) => this._handleGuardianApprovalBroadcast(msg));
+    peerMesh.on('GUARDIAN_SET_BROADCAST',     (msg) => this._handleGuardianSetBroadcast(msg));   // 1.4.94 D56
+    this._requesters = new Map();   // recovery request_id -> the requesting connection (it has no key yet)
 
     // Start hourly maintenance
     setTimeout(() => this._runMaintenance(), 15000);
@@ -168,6 +171,13 @@ class FinancialEngine {
         VALUES (?, ?, 0)
       `).run(key, val);
     }
+    // 1.4.94 (D56): signed, replicated guardian appointments; recovery requests remember the key they replace.
+    for (const sql of [
+      "ALTER TABLE sov_guardians ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+      'ALTER TABLE sov_guardians ADD COLUMN ts INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE sov_guardians ADD COLUMN sig TEXT',
+      'ALTER TABLE sov_recovery_requests ADD COLUMN old_pub_key TEXT',
+    ]) { try { this._db._db.exec(sql); } catch (_) { /* already there */ } }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -513,13 +523,21 @@ class FinancialEngine {
     } catch (_) {}
   }
 
-  _handleVaultClaimBroadcast(msg) {
-    const { vault_id, claimant_id, origin_node } = msg;
+  _handleVaultClaimBroadcast(msg, attempt = 0) {
+    const { vault_id, origin_node } = msg;
     if (!vault_id || origin_node === this._identity.nodeId) return;
-
-    this._db._db.prepare(
-      "UPDATE sov_vaults SET status = 'claimed' WHERE vault_id = ? AND status = 'locked'"
-    ).run(vault_id);
+    // 1.4.94 (D58): a peer's word is not evidence. Before, this unsigned message alone marked the vault
+    // 'claimed' on every node, freezing it with the money still in its holding. Now the vault is marked
+    // claimed only once THIS node holds the once-only ledger op that actually paid it out.
+    const paid = this._db._db.prepare('SELECT 1 FROM sov_ledger_ops WHERE op_id = ?').get('vault-claim:' + vault_id);
+    if (paid) {
+      this._db._db.prepare(
+        "UPDATE sov_vaults SET status = 'claimed' WHERE vault_id = ? AND status IN ('locked', 'stewarded')"
+      ).run(vault_id);
+      return;
+    }
+    // The op may simply not have arrived yet — look again a few times, then drop it.
+    if (attempt < 4) setTimeout(() => this._handleVaultClaimBroadcast(msg, attempt + 1), 30000 * (attempt + 1)).unref?.();
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -547,286 +565,295 @@ class FinancialEngine {
   // ═══════════════════════════════════════════════════════════════════════════
   //  SUBSYSTEM 4 — GUARDIAN RECOVERY
   // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // 1.4.94 (D56, D59). Two kinds of evidence, both signed, so EVERY node can check them itself:
+  //   appointment: the CITIZEN signs  SOV-GUARDIAN-SET-v1|citizen|guardian|add|remove|ts
+  //   approval:    the GUARDIAN signs SOV-GUARDIAN-APPROVE-v2|request|citizen|old_pub_key|new_pub_key|guardian|ts
+  // old_pub_key is the citizen's key when the request was opened: once a recovery executes, every earlier
+  // approval names a key that is no longer current and can never be replayed (Gemini review 2026-10-08).
+  // A node re-keys a citizen only when IT has verified >= guardian_approval_threshold distinct signed
+  // approvals from guardians whose appointment it holds. Before 1.4.94 a peer's unsigned list of ids
+  // was taken as given, so one dishonest node could re-key anyone with an open request.
 
-  handleGuardianAdd(ws, msg) {
-    const { guardian_id } = msg;
-    const citizen_id      = ws._sovereignId;
-
-    if (!guardian_id) {
-      this._send(ws, 'GAR', { success: false, error: 'MISSING_GUARDIAN_ID' });
-      return;
-    }
-
-    const maxCount = parseInt(this._db.getGovParam('guardian_max_count', '5'));
-    const current  = this._db._db.prepare(
-      'SELECT COUNT(*) as c FROM sov_guardians WHERE citizen_id = ?'
-    ).get(citizen_id).c;
-
-    if (current >= maxCount) {
-      this._send(ws, 'GAR', { success: false, error: 'GUARDIAN_LIMIT_REACHED' });
-      return;
-    }
-
-    this._db._db.prepare(`
-      INSERT OR IGNORE INTO sov_guardians (citizen_id, guardian_id, added_at)
-      VALUES (?, ?, ?)
-    `).run(citizen_id, guardian_id, Date.now());
-
-    // Notify the guardian if online
-    const now = Date.now();
-    if (this._gateway) {
-      this._gateway.push(guardian_id, 'GIN', {  // GUARDIAN_INVITE
-        citizen_id, ts: now,
-      });
-    }
-
-    // Broadcast to peers so they can deliver the invite cross-node
-    this._peerMesh.broadcast('GUARDIAN_INVITE_BROADCAST', {
-      citizen_id, guardian_id, ts: now,
-      origin_node: this._identity.nodeId,
-    });
-
-    this._send(ws, 'GAR', { success: true, guardian_id, ts: now });
+  static guardianSetString(citizenId, guardianId, action, ts) {
+    return `SOV-GUARDIAN-SET-v1|${citizenId}|${guardianId}|${action}|${ts}`;
   }
 
-  handleGuardianRemove(ws, msg) {
-    const { guardian_id } = msg;
-    const citizen_id      = ws._sovereignId;
+  static guardianApproveString(requestId, citizenId, oldPubKey, newPubKey, guardianId, ts) {
+    return `SOV-GUARDIAN-APPROVE-v2|${requestId}|${citizenId}|${String(oldPubKey).toLowerCase()}|${String(newPubKey).toLowerCase()}|${guardianId}|${ts}`;
+  }
 
-    if (!guardian_id) return;
-    this._db._db.prepare(
-      'DELETE FROM sov_guardians WHERE citizen_id = ? AND guardian_id = ?'
-    ).run(citizen_id, guardian_id);
+  _enrolledKey(sovereignId) {
+    try {
+      const r = this._db._db.prepare('SELECT public_key_hex FROM sov_enrollments WHERE sovereign_id = ?').get(sovereignId);
+      return r && /^[0-9a-f]{64}$/i.test(r.public_key_hex || '') ? r.public_key_hex.toLowerCase() : null;
+    } catch (_) { return null; }
+  }
 
-    this._send(ws, 'GRR', { success: true, guardian_id, ts: Date.now() });
+  _verifyBy(sovereignId, text, sigHex) {
+    const pub = this._enrolledKey(sovereignId);
+    if (!pub || !/^[0-9a-f]{128}$/i.test(sigHex || '')) return false;
+    try {
+      return nacl.sign.detached.verify(Buffer.from(text, 'utf8'), Buffer.from(sigHex, 'hex'), Buffer.from(pub, 'hex'));
+    } catch (_) { return false; }
+  }
+
+  _isGuardian(citizenId, guardianId) {
+    return !!this._db._db.prepare(
+      "SELECT 1 FROM sov_guardians WHERE citizen_id = ? AND guardian_id = ? AND status = 'active'"
+    ).get(citizenId, guardianId);
+  }
+
+  /** Apply a signed appointment change (local or from a peer). Newer ts wins; replays are ignored. */
+  _applyGuardianSet({ citizen_id, guardian_id, action, ts, sig }) {
+    if (!citizen_id || !guardian_id || citizen_id === guardian_id) return 'MISSING_FIELDS';
+    if (action !== 'add' && action !== 'remove') return 'BAD_ACTION';
+    ts = Number(ts);
+    if (!Number.isFinite(ts) || ts <= 0 || ts > Date.now() + 5 * 60 * 1000) return 'BAD_TIMESTAMP';
+    if (!this._verifyBy(citizen_id, FinancialEngine.guardianSetString(citizen_id, guardian_id, action, ts), sig)) {
+      return 'INVALID_SIGNATURE';
+    }
+    const cur = this._db._db.prepare('SELECT ts FROM sov_guardians WHERE citizen_id = ? AND guardian_id = ?').get(citizen_id, guardian_id);
+    if (cur && Number(cur.ts || 0) >= ts) return 'STALE';
+    if (action === 'add') {
+      const maxCount = parseInt(this._db.getGovParam('guardian_max_count', '5'));
+      const n = this._db._db.prepare("SELECT COUNT(*) AS c FROM sov_guardians WHERE citizen_id = ? AND status = 'active' AND guardian_id != ?")
+        .get(citizen_id, guardian_id).c;
+      if (n >= maxCount) return 'GUARDIAN_LIMIT_REACHED';
+    }
+    this._db._db.prepare(`
+      INSERT INTO sov_guardians (citizen_id, guardian_id, added_at, status, ts, sig) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(citizen_id, guardian_id) DO UPDATE SET status = excluded.status, ts = excluded.ts, sig = excluded.sig
+    `).run(citizen_id, guardian_id, ts, action === 'add' ? 'active' : 'removed', ts, sig);
+    return 'OK';
+  }
+
+  handleGuardianAdd(ws, msg)    { this._guardianSet(ws, msg, 'add', 'GAR'); }
+  handleGuardianRemove(ws, msg) { this._guardianSet(ws, msg, 'remove', 'GRR'); }
+
+  _guardianSet(ws, msg, action, op) {
+    const citizen_id = ws._sovereignId;
+    const { guardian_id, ts, sig } = msg;
+    if (!guardian_id) { this._send(ws, op, { success: false, error: 'MISSING_GUARDIAN_ID' }); return; }
+    if (!sig || !ts) { this._send(ws, op, { success: false, error: 'SIGNATURE_REQUIRED' }); return; }
+    if (action === 'add' && !this._enrolledKey(guardian_id)) {
+      this._send(ws, op, { success: false, error: 'GUARDIAN_NOT_ENROLLED' }); return;
+    }
+    const r = this._applyGuardianSet({ citizen_id, guardian_id, action, ts, sig });
+    if (r !== 'OK') { this._send(ws, op, { success: false, error: r }); return; }
+    this._peerMesh.broadcast('GUARDIAN_SET_BROADCAST', {
+      citizen_id, guardian_id, action, ts: Number(ts), sig, origin_node: this._identity.nodeId,
+    });
+    if (action === 'add' && this._gateway) this._gateway.push(guardian_id, 'GIN', { citizen_id, ts: Date.now() });
+    this._send(ws, op, { success: true, guardian_id, ts: Date.now() });
+  }
+
+  _handleGuardianSetBroadcast(msg) {
+    if (!msg || msg.origin_node === this._identity.nodeId) return;
+    const r = this._applyGuardianSet(msg);
+    if (r === 'OK' && msg.action === 'add' && this._gateway) {
+      this._gateway.push(msg.guardian_id, 'GIN', { citizen_id: msg.citizen_id, ts: Date.now() });
+    }
   }
 
   handleGuardianList(ws, msg) {
     const citizen_id = ws._sovereignId;
     const rows = this._db._db.prepare(
-      'SELECT guardian_id, added_at FROM sov_guardians WHERE citizen_id = ? ORDER BY added_at ASC'
+      "SELECT guardian_id, added_at FROM sov_guardians WHERE citizen_id = ? AND status = 'active' ORDER BY added_at ASC"
     ).all(citizen_id);
-
     this._send(ws, 'GRL', { guardians: rows, ts: Date.now() });
   }
 
-  handleRecoveryRequest(ws, msg) {
-    const { request_id, citizen_id, new_pub_key } = msg;
+  /** Store a recovery request (from the requesting device or a peer). Anyone may OPEN one — the
+   *  guardians decide. Returns the row. */
+  _storeRecoveryRequest({ request_id, citizen_id, old_pub_key, new_pub_key, created_at, expires_at }) {
+    const cur = this._enrolledKey(citizen_id);
+    if (!cur || (old_pub_key && String(old_pub_key).toLowerCase() !== cur)) return null;   // stale: key already changed
+    this._db._db.prepare(`
+      INSERT OR IGNORE INTO sov_recovery_requests (request_id, citizen_id, old_pub_key, new_pub_key, status, created_at, expires_at)
+      VALUES (?, ?, ?, ?, 'pending', ?, ?)
+    `).run(request_id, citizen_id, cur, String(new_pub_key).toLowerCase(), created_at, expires_at);
+    return this._db._db.prepare('SELECT * FROM sov_recovery_requests WHERE request_id = ?').get(request_id);
+  }
 
+  handleRecoveryRequest(ws, msg) {
+    const request_id  = msg.request_id;
+    const citizen_id  = msg.citizen_id;
+    const new_pub_key = msg.new_pub_key || msg.new_pub_key_hex;   // D59: the app sent new_pub_key_hex
     if (!request_id || !citizen_id || !new_pub_key) {
       this._send(ws, 'GRC', { success: false, error: 'MISSING_FIELDS' });
       return;
     }
-
     if (!/^[0-9a-f]{64}$/i.test(new_pub_key)) {
       this._send(ws, 'GRC', { success: false, error: 'INVALID_PUBLIC_KEY' });
       return;
     }
-
+    if (!this._enrolledKey(citizen_id)) {
+      this._send(ws, 'GRC', { success: false, error: 'CITIZEN_NOT_ENROLLED' });
+      return;
+    }
+    const guardians = this._db._db.prepare(
+      "SELECT guardian_id FROM sov_guardians WHERE citizen_id = ? AND status = 'active'"
+    ).all(citizen_id).map(r => r.guardian_id);
+    if (!guardians.length) {
+      this._send(ws, 'GRC', { success: false, error: 'NO_GUARDIANS' });
+      return;
+    }
     const now       = Date.now();
     const windowHrs = parseInt(this._db.getGovParam('guardian_recovery_window_hours', '72'));
     const expiresAt = now + windowHrs * 60 * 60 * 1000;
-
-    try {
-      this._db._db.prepare(`
-        INSERT OR IGNORE INTO sov_recovery_requests
-          (request_id, citizen_id, new_pub_key, status, created_at, expires_at)
-        VALUES (?, ?, ?, 'pending', ?, ?)
-      `).run(request_id, citizen_id, new_pub_key, now, expiresAt);
-    } catch (_) {
+    if (this._db._db.prepare('SELECT 1 FROM sov_recovery_requests WHERE request_id = ?').get(request_id)) {
       this._send(ws, 'GRC', { success: false, error: 'REQUEST_EXISTS' });
       return;
     }
+    this._storeRecoveryRequest({ request_id, citizen_id, new_pub_key, created_at: now, expires_at: expiresAt });
+    this._requesters.set(request_id, ws);   // progress goes back to THIS connection (it has no key yet)
 
-    // Find all guardians and push GUARDIAN_APPROVAL_REQUEST to them
-    const guardians = this._db._db.prepare(
-      'SELECT guardian_id FROM sov_guardians WHERE citizen_id = ?'
-    ).all(citizen_id);
-
-    const approvalPayload = { request_id, citizen_id, expires_at: expiresAt, ts: now };
-
-    for (const { guardian_id } of guardians) {
-      if (this._gateway) {
-        this._gateway.push(guardian_id, 'GAP', approvalPayload);  // GUARDIAN_APPROVAL_REQUEST
-      }
+    const oldKey = this._enrolledKey(citizen_id);
+    const approvalPayload = { request_id, citizen_id, old_pub_key: oldKey, new_pub_key: new_pub_key.toLowerCase(), expires_at: expiresAt, ts: now };
+    for (const gid of guardians) {
+      if (this._gateway) this._gateway.push(gid, 'GAP', approvalPayload);   // GUARDIAN_APPROVAL_REQUEST
     }
-
-    // Broadcast to peers for cross-node guardian notification
+    // The citizen's own devices hear about it too — a request they did not make is an attack warning.
+    if (this._gateway) this._gateway.push(citizen_id, 'GAP', Object.assign({ about_you: true }, approvalPayload));
     this._peerMesh.broadcast('GUARDIAN_RECOVERY_BROADCAST', {
-      request_id, citizen_id,
-      guardian_ids: guardians.map(r => r.guardian_id),
-      expires_at:   expiresAt,
-      origin_node:  this._identity.nodeId,
+      request_id, citizen_id, old_pub_key: oldKey, new_pub_key: new_pub_key.toLowerCase(), created_at: now, expires_at: expiresAt,
+      guardian_ids: guardians, origin_node: this._identity.nodeId,
     });
-
     this._send(ws, 'GRC', {
-      success:    true,
-      request_id,
-      citizen_id,
-      guardian_count: guardians.length,
-      expires_at: expiresAt,
-      ts:         now,
+      success: true, request_id, citizen_id, guardian_count: guardians.length,
+      threshold: parseInt(this._db.getGovParam('guardian_approval_threshold', '2')), expires_at: expiresAt, ts: now,
     });
   }
 
-  handleGuardianApprove(ws, msg) {
-    const { request_id } = msg;
-    const guardian_id    = ws._sovereignId;
-
-    if (!request_id) return;
-
-    const req = this._db._db.prepare(
-      'SELECT * FROM sov_recovery_requests WHERE request_id = ? AND status = ?'
-    ).get(request_id, 'pending');
-
-    if (!req) {
-      this._send(ws, 'GAA', { success: false, error: 'REQUEST_NOT_FOUND' });
-      return;
+  /** Verified approvals of a request, distinct guardians only. */
+  _verifiedApprovals(req) {
+    let list;
+    try { list = JSON.parse(req.approvals || '[]'); } catch (_) { list = []; }
+    const seen = new Map();
+    for (const a of list) {
+      if (!a || typeof a !== 'object' || seen.has(a.guardian_id)) continue;   // pre-1.4.94 bare ids never count
+      if (!this._isGuardian(req.citizen_id, a.guardian_id)) continue;
+      const text = FinancialEngine.guardianApproveString(req.request_id, req.citizen_id, req.old_pub_key, req.new_pub_key, a.guardian_id, a.ts);
+      if (this._verifyBy(a.guardian_id, text, a.sig)) seen.set(a.guardian_id, { guardian_id: a.guardian_id, ts: a.ts, sig: a.sig });
     }
+    return [...seen.values()];
+  }
 
-    if (req.expires_at < Date.now()) {
-      this._send(ws, 'GAA', { success: false, error: 'REQUEST_EXPIRED' });
-      return;
-    }
-
-    // Verify this citizen is actually a guardian
-    const isGuardian = this._db._db.prepare(
-      'SELECT 1 FROM sov_guardians WHERE citizen_id = ? AND guardian_id = ?'
-    ).get(req.citizen_id, guardian_id);
-
-    if (!isGuardian) {
-      this._send(ws, 'GAA', { success: false, error: 'NOT_A_GUARDIAN' });
-      return;
-    }
-
-    // Add approval
-    let approvals;
-    try { approvals = JSON.parse(req.approvals); } catch (_) { approvals = []; }
-    if (approvals.includes(guardian_id)) {
-      this._send(ws, 'GAA', { success: false, error: 'ALREADY_APPROVED' });
-      return;
-    }
-    approvals.push(guardian_id);
-
-    this._db._db.prepare(
-      'UPDATE sov_recovery_requests SET approvals = ? WHERE request_id = ?'
-    ).run(JSON.stringify(approvals), request_id);
-
+  /** Add one signed approval to a request; re-key if the threshold is met. Returns a status. */
+  _addApproval(req, approval) {
+    if (!req || req.status !== 'pending') return 'REQUEST_NOT_FOUND';
+    if (req.expires_at < Date.now()) return 'REQUEST_EXPIRED';
+    if (!approval || !this._isGuardian(req.citizen_id, approval.guardian_id)) return 'NOT_A_GUARDIAN';
+    const text = FinancialEngine.guardianApproveString(req.request_id, req.citizen_id, req.old_pub_key, req.new_pub_key, approval.guardian_id, approval.ts);
+    if (!this._verifyBy(approval.guardian_id, text, approval.sig)) return 'INVALID_SIGNATURE';
+    const have = this._verifiedApprovals(req);
+    if (have.some(a => a.guardian_id === approval.guardian_id)) return 'ALREADY_APPROVED';
+    have.push({ guardian_id: approval.guardian_id, ts: approval.ts, sig: approval.sig });
+    this._db._db.prepare('UPDATE sov_recovery_requests SET approvals = ? WHERE request_id = ?')
+      .run(JSON.stringify(have), req.request_id);
     const threshold = parseInt(this._db.getGovParam('guardian_approval_threshold', '2'));
+    this._pushRequesterUpdate(req.request_id, { approvals_received: have.length, threshold });
+    if (have.length >= threshold) this._executeGuardianRecovery(req, have.map(a => a.guardian_id));
+    return 'OK';
+  }
 
-    if (approvals.length >= threshold) {
-      // Threshold met — execute recovery
-      this._executeGuardianRecovery(req, approvals);
-    }
-
-    // Broadcast approval to peers
+  handleGuardianApprove(ws, msg) {
+    const { request_id, ts, sig } = msg;
+    const guardian_id = ws._sovereignId;
+    if (!request_id) return;
+    if (!sig || !ts) { this._send(ws, 'GAA', { success: false, error: 'SIGNATURE_REQUIRED' }); return; }
+    const req = this._db._db.prepare('SELECT * FROM sov_recovery_requests WHERE request_id = ?').get(request_id);
+    const approval = { guardian_id, ts: Number(ts), sig };
+    const r = this._addApproval(req, approval);
+    if (r !== 'OK') { this._send(ws, 'GAA', { success: false, error: r }); return; }
     this._peerMesh.broadcast('GUARDIAN_APPROVAL_BROADCAST', {
-      request_id, guardian_id, approvals,
+      request_id, approval,
+      request: { citizen_id: req.citizen_id, old_pub_key: req.old_pub_key, new_pub_key: req.new_pub_key, created_at: req.created_at, expires_at: req.expires_at },
       origin_node: this._identity.nodeId,
     });
-
-    this._send(ws, 'GAA', {
-      success:      true,
-      request_id,
-      approvals:    approvals.length,
-      threshold,
-      threshold_met: approvals.length >= threshold,
-      ts:           Date.now(),
-    });
+    const threshold = parseInt(this._db.getGovParam('guardian_approval_threshold', '2'));
+    const n = this._verifiedApprovals(this._db._db.prepare('SELECT * FROM sov_recovery_requests WHERE request_id = ?').get(request_id)).length;
+    this._send(ws, 'GAA', { success: true, request_id, approvals: n, threshold, threshold_met: n >= threshold, ts: Date.now() });
   }
 
   handleGuardianReject(ws, msg) {
     const { request_id } = msg;
     const guardian_id    = ws._sovereignId;
-
     if (!request_id) return;
-
     const req = this._db._db.prepare(
       "SELECT citizen_id FROM sov_recovery_requests WHERE request_id = ? AND status = 'pending'"
     ).get(request_id);
-
-    if (!req) return;
-
-    // Notify recovering citizen of rejection
+    if (!req || !this._isGuardian(req.citizen_id, guardian_id)) return;
     if (this._gateway) {
-      this._gateway.push(req.citizen_id, 'GRJ', {  // GUARDIAN_REJECTION
-        request_id, rejected_by: guardian_id, ts: Date.now(),
-      });
+      this._gateway.push(req.citizen_id, 'GRJ', { request_id, rejected_by: guardian_id, ts: Date.now() });
     }
-
+    this._pushRequesterUpdate(request_id, { rejected_by: guardian_id });
     this._send(ws, 'GRJ', { success: true, request_id, ts: Date.now() });
   }
 
-  _executeGuardianRecovery(req, approvals) {
+  _pushRequesterUpdate(requestId, extra) {
+    const ws = this._requesters.get(requestId);
+    if (ws && ws.readyState === 1) {
+      this._send(ws, 'GAU', Object.assign({ request_id: requestId, ts: Date.now() }, extra));   // GUARDIAN_APPROVAL_UPDATE
+    }
+  }
+
+  _executeGuardianRecovery(req, approvedBy) {
     const now = Date.now();
-
-    // Update disc entry with new public key
-    this._db._db.prepare(
-      'UPDATE sov_enrollments SET public_key_hex = ? WHERE sovereign_id = ?'
-    ).run(req.new_pub_key, req.citizen_id);
-
-    // Mark request approved
-    this._db._db.prepare(
-      "UPDATE sov_recovery_requests SET status = 'approved' WHERE request_id = ?"
+    if (this._enrolledKey(req.citizen_id) !== String(req.old_pub_key || '').toLowerCase()) {
+      this._db._db.prepare("UPDATE sov_recovery_requests SET status = 'stale' WHERE request_id = ?").run(req.request_id);
+      return;   // the key it would replace is no longer current — never revert to an older key
+    }
+    const done = this._db._db.prepare(
+      "UPDATE sov_recovery_requests SET status = 'approved' WHERE request_id = ? AND status = 'pending'"
     ).run(req.request_id);
-
-    // Notify recovering citizen
+    if (!done.changes) return;   // already executed
+    this._db._db.prepare('UPDATE sov_enrollments SET public_key_hex = ? WHERE sovereign_id = ?')
+      .run(req.new_pub_key, req.citizen_id);
     if (this._gateway) {
       this._gateway.push(req.citizen_id, 'GCO', {  // GUARDIAN_RECOVERY_COMPLETE
-        request_id:  req.request_id,
-        new_pub_key: req.new_pub_key,
-        approved_by: approvals,
-        ts:          now,
+        request_id: req.request_id, new_pub_key: req.new_pub_key, approved_by: approvedBy, ts: now,
       });
     }
-
-    global.sovLog.info(
-      `      [FINANCE] Guardian recovery completed for ${req.citizen_id} — ${approvals.length} approvals`
-    );
+    this._pushRequesterUpdate(req.request_id, { approvals_received: approvedBy.length, complete: true });
+    global.sovLog.info(`      [FINANCE] Guardian recovery completed for ${req.citizen_id} — ${approvedBy.length} signed approvals`);
   }
 
   _handleGuardianInviteBroadcast(msg) {
+    // Pre-1.4.94 peers announce an appointment unsigned: deliver the invite, record nothing.
     const { citizen_id, guardian_id, origin_node } = msg;
     if (!citizen_id || !guardian_id || origin_node === this._identity.nodeId) return;
-
-    // Push invite to guardian if they are on this node
-    if (this._gateway) {
-      this._gateway.push(guardian_id, 'GIN', { citizen_id, ts: Date.now() });
-    }
+    if (this._gateway) this._gateway.push(guardian_id, 'GIN', { citizen_id, ts: Date.now() });
   }
 
   _handleGuardianRecoveryBroadcast(msg) {
-    const { request_id, citizen_id, guardian_ids, expires_at, origin_node } = msg;
+    const { request_id, citizen_id, old_pub_key, new_pub_key, created_at, expires_at, origin_node } = msg;
     if (!request_id || origin_node === this._identity.nodeId) return;
-
-    // Push approval request to any guardians online on this node
-    if (this._gateway && Array.isArray(guardian_ids)) {
-      const payload = { request_id, citizen_id, expires_at, ts: Date.now() };
-      for (const gid of guardian_ids) {
-        this._gateway.push(gid, 'GAP', payload);
-      }
+    if (!citizen_id || !/^[0-9a-f]{64}$/i.test(new_pub_key || '') || !/^[0-9a-f]{64}$/i.test(old_pub_key || '')) return;
+    if (!(Number(expires_at) > Date.now()) || Number(expires_at) - Date.now() > 31 * 24 * 3600 * 1000) return;
+    if (!this._storeRecoveryRequest({ request_id, citizen_id, old_pub_key, new_pub_key, created_at: Number(created_at) || Date.now(), expires_at: Number(expires_at) })) return;
+    if (this._gateway) {
+      const guardians = this._db._db.prepare(
+        "SELECT guardian_id FROM sov_guardians WHERE citizen_id = ? AND status = 'active'"
+      ).all(citizen_id);
+      const payload = { request_id, citizen_id, old_pub_key: old_pub_key.toLowerCase(), new_pub_key: new_pub_key.toLowerCase(), expires_at, ts: Date.now() };
+      for (const { guardian_id } of guardians) this._gateway.push(guardian_id, 'GAP', payload);
+      this._gateway.push(citizen_id, 'GAP', Object.assign({ about_you: true }, payload));
     }
   }
 
   _handleGuardianApprovalBroadcast(msg) {
-    const { request_id, guardian_id, approvals, origin_node } = msg;
-    if (!request_id || origin_node === this._identity.nodeId) return;
-
-    const req = this._db._db.prepare(
-      "SELECT * FROM sov_recovery_requests WHERE request_id = ? AND status = 'pending'"
-    ).get(request_id);
-    if (!req) return;
-
-    // Sync approvals list
-    this._db._db.prepare(
-      'UPDATE sov_recovery_requests SET approvals = ? WHERE request_id = ?'
-    ).run(JSON.stringify(approvals || [guardian_id]), request_id);
-
-    const threshold = parseInt(this._db.getGovParam('guardian_approval_threshold', '2'));
-    if (Array.isArray(approvals) && approvals.length >= threshold) {
-      this._executeGuardianRecovery(req, approvals);
+    const { request_id, approval, request, origin_node } = msg;
+    if (!request_id || origin_node === this._identity.nodeId || !approval) return;   // bare id lists are ignored
+    let req = this._db._db.prepare('SELECT * FROM sov_recovery_requests WHERE request_id = ?').get(request_id);
+    if (!req && request && /^[0-9a-f]{64}$/i.test(request.new_pub_key || '') && /^[0-9a-f]{64}$/i.test(request.old_pub_key || '')
+        && Number(request.expires_at) > Date.now() && Number(request.expires_at) - Date.now() <= 31 * 24 * 3600 * 1000) {
+      req = this._storeRecoveryRequest(Object.assign({ request_id }, request));
     }
+    this._addApproval(req, { guardian_id: approval.guardian_id, ts: Number(approval.ts), sig: approval.sig });
   }
+
 
   // ── Maintenance ───────────────────────────────────────────────────────────
 
@@ -944,6 +971,7 @@ class FinancialEngine {
       'GRC': 'GUARDIAN_RECOVERY_INIT_RESULT',
       'GAA': 'GUARDIAN_APPROVE_RESULT',
       'GRJ': 'GUARDIAN_REJECT_RESULT',
+      'GAU': 'GUARDIAN_APPROVAL_UPDATE',   // 1.4.94 (D59): progress to the recovering device
     };
   }
 

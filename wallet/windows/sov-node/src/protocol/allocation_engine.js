@@ -17,13 +17,24 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 const crypto = require('crypto');
+const nacl   = require('tweetnacl');
+
+// 1.4.94 (D53): the message a claimant signs with the keypair derived from their claim key.
+function allocClaimString(claimPubkey, claimantId, ts) {
+  return `SOV-ALLOC-CLAIM-v1|${String(claimPubkey).toLowerCase()}|${claimantId}|${ts}`;
+}
 
 class AllocationEngine {
-  constructor(identity, db) {
+  constructor(identity, db, peerMesh) {
     this._identity = identity;
     this._db       = db;
+    this._peerMesh = peerMesh || null;
     this._gateway  = null;
     this._initSchema();
+    if (this._peerMesh && this._peerMesh.on) {
+      this._peerMesh.on('ALLOCATION_BROADCAST',        (m) => this._handleAllocBroadcast(m));
+      this._peerMesh.on('ALLOCATION_STATUS_BROADCAST', (m) => this._handleAllocStatusBroadcast(m));
+    }
   }
 
   setGateway(gateway) { this._gateway = gateway; }
@@ -94,6 +105,7 @@ class AllocationEngine {
         );
         CREATE INDEX IF NOT EXISTS idx_council_votes_council ON sov_council_votes (council_id);
       `);
+      try { this._db._db.exec('ALTER TABLE sov_allocations ADD COLUMN claim_pubkey TEXT'); } catch (_) { /* exists */ }
       global.sovLog && global.sovLog.info('[Alloc] Schema ready');
     } catch (e) {
       global.sovLog && global.sovLog.error('[Alloc] Schema init error:', e.message);
@@ -102,10 +114,10 @@ class AllocationEngine {
 
   // ── ALLOCATION_CREATE ──────────────────────────────────────────────────────
 
-  handleCreate(ws, msg) {
+  async handleCreate(ws, msg) {
     const {
       beneficiary_name_hash, beneficiary_name_encrypted,
-      amount_seeds, release_date, claim_key_hash,
+      amount_seeds, release_date, claim_pubkey,
       family_key_1_hash, family_key_1_hint,
       family_key_2_hash, family_key_2_hint,
       family_key_3_hash, family_key_3_hint,
@@ -114,60 +126,125 @@ class AllocationEngine {
     } = msg;
     const sovereignId = ws._sovereignId;
     const RESP = 'ALLOCATION_CREATED';
-
     if (!sovereignId || !beneficiary_name_hash || !beneficiary_name_encrypted ||
-        !amount_seeds || !release_date || !claim_key_hash) {
+        !amount_seeds || !release_date || !claim_pubkey) {
       return this._send(ws, { type: RESP, success: false, error: 'Missing required fields' });
     }
-
+    if (!/^[0-9a-f]{64}$/i.test(claim_pubkey)) {
+      return this._send(ws, { type: RESP, success: false, error: 'Invalid claim key' });
+    }
+    const amt = Math.trunc(Number(amount_seeds));
+    if (!(amt > 0)) return this._send(ws, { type: RESP, success: false, error: 'Bad amount' });
     try {
       const disc = this._db.readDisc(sovereignId);
       if (!disc) return this._send(ws, { type: RESP, success: false, error: 'Citizen not found' });
-
-      const escrowRow   = this._db._db.prepare('SELECT locked_seeds FROM sov_inheritance_escrow WHERE sovereign_id = ?').get(sovereignId);
-      const alreadyLocked = escrowRow ? (escrowRow.locked_seeds || 0) : 0;
-      const available   = disc.balance_seeds - alreadyLocked;
-
-      if (amount_seeds > available) {
-        return this._send(ws, { type: RESP, success: false,
-          error: `Insufficient available balance. Available: ${available} seeds` });
-      }
-
       const allocationId = 'ALLOC-' + crypto.randomBytes(8).toString('hex').toUpperCase();
       const nowSec = Math.floor(Date.now() / 1000);
-
+      // 1.4.94 (D53): the lock is a REAL ledger holding, not a soft counter. The amount leaves the
+      // donor's spendable balance now, via an OWNER op (majority-granted, serialised with the donor's
+      // own spends), into holding alloc:<id>. Before, balance_seeds was untouched and the donor could
+      // still spend the "locked" funds, and the claim took money from the donor's wallet at claim time.
+      const locked = await this._db.ledger.commitOwnerOp({
+        kind: 'alloc_lock', ref: allocationId, owner: { acct: sovereignId },
+        moves: [{ acct: sovereignId, d: -amt }],
+        holds: [{ id: 'alloc:' + allocationId, d: amt }],
+      });
+      if (!locked.ok) {
+        return this._send(ws, { type: RESP, success: false,
+          error: locked.error === 'LEDGER_INSUFFICIENT' ? 'Insufficient available balance' : locked.error });
+      }
       this._db._db.prepare(`
         INSERT INTO sov_allocations
           (id, citizen_sovereign_id, beneficiary_name_hash, beneficiary_name_encrypted,
-           amount_seeds, release_date, claim_key_hash,
+           amount_seeds, release_date, claim_key_hash, claim_pubkey,
            family_key_1_hash, family_key_1_hint, family_key_2_hash, family_key_2_hint,
            family_key_3_hash, family_key_3_hint,
            public_statement, publish_after_years, personal_note_encrypted, status, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `).run(
         allocationId, sovereignId, beneficiary_name_hash, beneficiary_name_encrypted,
-        amount_seeds, release_date, claim_key_hash,
+        amt, release_date, '', claim_pubkey.toLowerCase(),
         family_key_1_hash || null, family_key_1_hint || null,
         family_key_2_hash || null, family_key_2_hint || null,
         family_key_3_hash || null, family_key_3_hint || null,
         public_statement || null, publish_after_years || 10,
         personal_note_encrypted || null, 'locked', nowSec
       );
-
-      // Update inheritance escrow (upsert)
-      this._db._db.prepare(`
-        INSERT INTO sov_inheritance_escrow (sovereign_id, locked_seeds, updated_at) VALUES (?,?,?)
-        ON CONFLICT(sovereign_id) DO UPDATE SET
-          locked_seeds = locked_seeds + excluded.locked_seeds,
-          updated_at   = excluded.updated_at
-      `).run(sovereignId, amount_seeds, nowSec);
-
-      global.sovLog && global.sovLog.info(`[Alloc] Created ${allocationId} for ${sovereignId} | ${amount_seeds} seeds`);
+      this._broadcastAlloc(allocationId);
+      global.sovLog && global.sovLog.info(`[Alloc] Created ${allocationId} for ${sovereignId} | ${amt} seeds (holding alloc:${allocationId})`);
       this._send(ws, { type: RESP, success: true, allocation_id: allocationId, timestamp: Date.now() });
     } catch (e) {
       global.sovLog && global.sovLog.error('[Alloc] CREATE error:', e.message);
       this._send(ws, { type: RESP, success: false, error: e.message });
     }
+  }
+
+  // 1.4.94 (D53): send an allocation's metadata to peers so every node holds it (money rides the ledger).
+  _broadcastAlloc(allocationId) {
+    if (!this._peerMesh || !this._peerMesh.broadcast) return;
+    const a = this._db._db.prepare('SELECT * FROM sov_allocations WHERE id = ?').get(allocationId);
+    if (!a) return;
+    this._peerMesh.broadcast('ALLOCATION_BROADCAST', { alloc: a, origin_node: this._identity.nodeId });
+  }
+
+  _broadcastAllocStatus(allocationId) {
+    if (!this._peerMesh || !this._peerMesh.broadcast) return;
+    const a = this._db._db.prepare('SELECT status, claimed_by, claimed_at, justice_status FROM sov_allocations WHERE id = ?').get(allocationId);
+    if (!a) return;
+    this._peerMesh.broadcast('ALLOCATION_STATUS_BROADCAST',
+      { allocation_id: allocationId, status: a.status, claimed_by: a.claimed_by, claimed_at: a.claimed_at, justice_status: a.justice_status, origin_node: this._identity.nodeId });
+  }
+
+  _handleAllocBroadcast(msg) {
+    if (!msg || !msg.alloc || msg.origin_node === this._identity.nodeId) return;
+    const a = msg.alloc;
+    if (!a.id || !a.citizen_sovereign_id) return;
+    try {
+      // Metadata only; INSERT OR IGNORE so a status we already advanced is not reverted. The money is
+      // applied by the ledger op that rides separately — nothing here touches a balance or a holding.
+      this._db._db.prepare(`
+        INSERT OR IGNORE INTO sov_allocations
+          (id, citizen_sovereign_id, beneficiary_name_hash, beneficiary_name_encrypted, amount_seeds,
+           release_date, claim_key_hash, claim_pubkey, family_key_1_hash, family_key_1_hint,
+           family_key_2_hash, family_key_2_hint, family_key_3_hash, family_key_3_hint,
+           public_statement, publish_after_years, personal_note_encrypted, status, created_at)
+        VALUES (@id,@citizen_sovereign_id,@beneficiary_name_hash,@beneficiary_name_encrypted,@amount_seeds,
+           @release_date,@claim_key_hash,@claim_pubkey,@family_key_1_hash,@family_key_1_hint,
+           @family_key_2_hash,@family_key_2_hint,@family_key_3_hash,@family_key_3_hint,
+           @public_statement,@publish_after_years,@personal_note_encrypted,@status,@created_at)
+      `).run({
+        id: a.id, citizen_sovereign_id: a.citizen_sovereign_id,
+        beneficiary_name_hash: a.beneficiary_name_hash || '', beneficiary_name_encrypted: a.beneficiary_name_encrypted || '',
+        amount_seeds: Math.trunc(Number(a.amount_seeds) || 0), release_date: Math.trunc(Number(a.release_date) || 0),
+        claim_key_hash: a.claim_key_hash || '', claim_pubkey: a.claim_pubkey || null,
+        family_key_1_hash: a.family_key_1_hash || null, family_key_1_hint: a.family_key_1_hint || null,
+        family_key_2_hash: a.family_key_2_hash || null, family_key_2_hint: a.family_key_2_hint || null,
+        family_key_3_hash: a.family_key_3_hash || null, family_key_3_hint: a.family_key_3_hint || null,
+        public_statement: a.public_statement || null, publish_after_years: Math.trunc(Number(a.publish_after_years) || 10),
+        personal_note_encrypted: a.personal_note_encrypted || null, status: a.status || 'locked',
+        created_at: Math.trunc(Number(a.created_at) || Math.floor(Date.now() / 1000)),
+      });
+    } catch (e) { global.sovLog && global.sovLog.warn('[Alloc] broadcast apply: ' + e.message); }
+  }
+
+  _handleAllocStatusBroadcast(msg) {
+    if (!msg || !msg.allocation_id || msg.origin_node === this._identity.nodeId) return;
+    try {
+      this._db._db.prepare(
+        "UPDATE sov_allocations SET status=?, claimed_by=COALESCE(?,claimed_by), claimed_at=COALESCE(?,claimed_at), justice_status=COALESCE(?,justice_status) WHERE id=? AND status NOT IN ('claimed','cancelled')"
+      ).run(msg.status || 'locked', msg.claimed_by || null, msg.claimed_at || null, msg.justice_status || null, msg.allocation_id);
+    } catch (_) {}
+  }
+
+  // 1.4.94 (D53): release a locked allocation's holding to the claimant. ONE system op, at most once
+  // per allocation (deterministic id), applied on every node — the money comes from alloc:<id>, which
+  // was funded at create time, so a dead or inactive donor's wallet is never touched.
+  _releaseAllocation(alloc, claimantId, kind) {
+    return this._db.ledger.commitSystemOp({
+      op_id: `alloc-claim:${alloc.id}`, kind, ref: String(alloc.id),
+      holds: [{ id: 'alloc:' + alloc.id, d: -alloc.amount_seeds }],
+      moves: [{ acct: claimantId, d: alloc.amount_seeds }],
+    });
   }
 
   // ── ALLOCATION_LIST ────────────────────────────────────────────────────────
@@ -231,7 +308,7 @@ class AllocationEngine {
 
   // ── ALLOCATION_CANCEL ──────────────────────────────────────────────────────
 
-  handleCancel(ws, msg) {
+  async handleCancel(ws, msg) {
     const { allocation_id } = msg;
     const sovereignId = ws._sovereignId;
     const RESP = 'ALLOCATION_CANCELLED';
@@ -251,13 +328,16 @@ class AllocationEngine {
           error: `Cannot cancel allocation with status: ${alloc.status}` });
       }
 
-      const nowSec = Math.floor(Date.now() / 1000);
+      // 1.4.94 (D53): return the locked holding to the donor — ONE system op, at most once.
+      const back = await this._db.ledger.commitSystemOp({
+        op_id: `alloc-cancel:${alloc.id}`, kind: 'alloc_cancel', ref: String(alloc.id),
+        holds: [{ id: 'alloc:' + alloc.id, d: -alloc.amount_seeds }],
+        moves: [{ acct: sovereignId, d: alloc.amount_seeds }],
+      });
+      if (!back.ok) return this._send(ws, { type: RESP, success: false, error: back.error });
       this._db._db.prepare("UPDATE sov_allocations SET status='cancelled' WHERE id=?").run(allocation_id);
-      this._db._db.prepare(
-        'UPDATE sov_inheritance_escrow SET locked_seeds=MAX(0,locked_seeds-?), updated_at=? WHERE sovereign_id=?'
-      ).run(alloc.amount_seeds, nowSec, sovereignId);
-
-      global.sovLog && global.sovLog.info(`[Alloc] Cancelled ${allocation_id} | ${alloc.amount_seeds} seeds unlocked`);
+      this._broadcastAllocStatus(allocation_id);
+      global.sovLog && global.sovLog.info(`[Alloc] Cancelled ${allocation_id} | ${alloc.amount_seeds} seeds returned to donor`);
       this._send(ws, { type: RESP, success: true, allocation_id, timestamp: Date.now() });
     } catch (e) {
       global.sovLog && global.sovLog.error('[Alloc] CANCEL error:', e.message);
@@ -268,20 +348,23 @@ class AllocationEngine {
   // ── ALLOCATION_CLAIM_STAGE1 (direct claim — claim key + release date) ──────
 
   async handleClaimStage1(ws, msg) {
-    const { allocation_id, claim_key_hash } = msg;
+    const { allocation_id, claim_pubkey, claim_sig, claim_ts } = msg;
     const claimantId = ws._sovereignId || msg.claimant_id || msg.claimant_sovereign_id || msg.sovereign_id;
     const RESP = 'ALLOCATION_CLAIMED';
 
-    if (!claim_key_hash || !claimantId) {
+    if ((!allocation_id && !claim_pubkey) || !claim_sig || !claim_ts || !claimantId) {
       return this._send(ws, { type: RESP, success: false, error: 'Missing fields' });
     }
 
     try {
+      // The claimant holds only their claim KEY, not the allocation id — so they present the claim
+      // PUBLIC key (derived from it) and the node finds the allocation by it. The signature proves
+      // possession of the private claim key; the public key leaks nothing.
       const alloc = allocation_id
         ? this._db._db.prepare('SELECT * FROM sov_allocations WHERE id = ?').get(allocation_id)
         : this._db._db.prepare(
-            "SELECT * FROM sov_allocations WHERE claim_key_hash = ? AND status NOT IN ('claimed','cancelled')"
-          ).get(claim_key_hash);
+            "SELECT * FROM sov_allocations WHERE claim_pubkey = ? AND status NOT IN ('claimed','cancelled')"
+          ).get(String(claim_pubkey).toLowerCase());
 
       if (!alloc) return this._send(ws, { type: RESP, success: false, error: 'Allocation not found' });
       if (alloc.status === 'claimed')    return this._send(ws, { type: RESP, success: false, error: 'Already claimed' });
@@ -293,29 +376,34 @@ class AllocationEngine {
         return this._send(ws, { type: RESP, success: false,
           error: `Release date not reached. Unlocks: ${releaseDate}` });
       }
-      if (alloc.claim_key_hash !== claim_key_hash) {
-        return this._send(ws, { type: RESP, success: false, error: 'Invalid claim key' });
+      // 1.4.94 (D53): prove the claim KEY with a SIGNATURE, not a hash the broadcast exposes. The
+      // claimant signs SOV-ALLOC-CLAIM-v1|id|claimant|ts with the keypair derived from the claim key;
+      // the allocation stores only the public key, so knowing the (public) pubkey lets no one claim.
+      const ts = Math.trunc(Number(claim_ts));
+      if (!alloc.claim_pubkey || !/^[0-9a-f]{64}$/i.test(alloc.claim_pubkey)) {
+        return this._send(ws, { type: RESP, success: false, error: 'This allocation cannot be claimed by key' });
       }
-
-      // Transfer funds from donor to claimant
-      const donorDisc = this._db.readDisc(alloc.citizen_sovereign_id);
-      if (!donorDisc) return this._send(ws, { type: RESP, success: false, error: 'Donor account not found' });
-      if (donorDisc.balance_seeds < alloc.amount_seeds) {
-        return this._send(ws, { type: RESP, success: false, error: 'Insufficient donor balance' });
+      if (!Number.isFinite(ts) || Math.abs(Date.now() - ts) > 5 * 60 * 1000) {
+        return this._send(ws, { type: RESP, success: false, error: 'Stale claim' });
       }
+      let sigOk = false;
+      try {
+        sigOk = /^[0-9a-f]{128}$/i.test(claim_sig) && nacl.sign.detached.verify(
+          Buffer.from(allocClaimString(alloc.claim_pubkey, claimantId, ts), 'utf8'),
+          Buffer.from(claim_sig, 'hex'), Buffer.from(alloc.claim_pubkey, 'hex'));
+      } catch (_) { sigOk = false; }
+      if (!sigOk) return this._send(ws, { type: RESP, success: false, error: 'Invalid claim key' });
 
-      // 1.4.90: donor -> claimant as ONE op on the DONOR's slot (it spends the donor's money, so
-      // it is serialised with the donor's own spends by a majority of nodes), at most once per
-      // allocation, applied on every node. It used to change this node's ledger only.
-      const moved = await this._payAllocation(alloc, claimantId, 'alloc_claim');
+      // 1.4.94 (D53): pay the claimant from the allocation's HOLDING (funded at create time) — ONE
+      // system op, at most once per allocation, applied on every node. The donor's wallet is not
+      // touched (they may be dead or inactive — the whole point of inheritance).
+      const moved = await this._releaseAllocation(alloc, claimantId, 'alloc_claim');
       if (!moved.ok) return this._send(ws, { type: RESP, success: false, error: moved.error });
 
       this._db._db.prepare(
         "UPDATE sov_allocations SET status='claimed', claimed_by=?, claimed_at=? WHERE id=?"
       ).run(claimantId, nowSec, alloc.id);
-      this._db._db.prepare(
-        'UPDATE sov_inheritance_escrow SET locked_seeds=MAX(0,locked_seeds-?), updated_at=? WHERE sovereign_id=?'
-      ).run(alloc.amount_seeds, nowSec, alloc.citizen_sovereign_id);
+      this._broadcastAllocStatus(alloc.id);
 
       try { this._db.computeMerkleRoot(); } catch (_) {}
 
@@ -512,30 +600,19 @@ class AllocationEngine {
   // ── Internal: execute approved council claim ──────────────────────────────
 
   // donor -> claimant, one op on the donor's slot, at most once per allocation.
-  _payAllocation(alloc, claimantId, kind) {
-    return this._db.ledger.commitOwnerOp({
-      op_id: `alloc:${alloc.id}`, kind, ref: String(alloc.id), owner: { acct: alloc.citizen_sovereign_id },
-      moves: [{ acct: alloc.citizen_sovereign_id, d: -alloc.amount_seeds }, { acct: claimantId, d: alloc.amount_seeds }],
-    }).then((r) => r.ok ? r : { ok: false, error: r.error === 'LEDGER_INSUFFICIENT' ? 'Insufficient donor balance' : r.error });
-  }
-
   async _executeCouncilApproval(councilId, allocationId, claimantId) {
     const alloc = this._db._db.prepare('SELECT * FROM sov_allocations WHERE id=?').get(allocationId);
-    if (!alloc || alloc.status === 'claimed') return;
+    if (!alloc || alloc.status === 'claimed' || alloc.status === 'cancelled') return;
 
-    const donorDisc = this._db.readDisc(alloc.citizen_sovereign_id);
-    if (!donorDisc || donorDisc.balance_seeds < alloc.amount_seeds) return;
-
-    const moved = await this._payAllocation(alloc, claimantId, 'alloc_council');
+    // 1.4.94 (D53): pay from the allocation's holding (funded at create), never the donor's wallet.
+    const moved = await this._releaseAllocation(alloc, claimantId, 'alloc_council');
     if (!moved.ok) { global.sovLog && global.sovLog.error(`[Alloc] council ${councilId}: not paid: ${moved.error}`); return; }
 
     const nowSec = Math.floor(Date.now() / 1000);
     this._db._db.prepare(
       "UPDATE sov_allocations SET status='claimed', claimed_by=?, claimed_at=?, justice_status='council_approved' WHERE id=?"
     ).run(claimantId, nowSec, allocationId);
-    this._db._db.prepare(
-      'UPDATE sov_inheritance_escrow SET locked_seeds=MAX(0,locked_seeds-?), updated_at=? WHERE sovereign_id=?'
-    ).run(alloc.amount_seeds, nowSec, alloc.citizen_sovereign_id);
+    this._broadcastAllocStatus(allocationId);
     this._db._db.prepare(
       "UPDATE sov_justice_councils SET status='approved', resolved_at=? WHERE id=?"
     ).run(nowSec, councilId);

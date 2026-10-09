@@ -1518,11 +1518,50 @@ class NodeDB {
         admitted_at INTEGER NOT NULL      -- last time this peer PASSED admission (not mere gossip)
       );
     `);
+    // 1.4.94: when each validator was FIRST admitted, and its public key (ledger certificates).
+    for (const sql of ['ALTER TABLE sov_validator_seen ADD COLUMN first_seen INTEGER',
+                       'ALTER TABLE sov_validator_seen ADD COLUMN pubkey TEXT']) {
+      try { this._db.exec(sql); } catch (_) { /* already there */ }
+    }
+    // A validator recorded before 1.4.94 counts as first seen at its last admission.
+    try { this._db.exec('UPDATE sov_validator_seen SET first_seen = admitted_at WHERE first_seen IS NULL'); } catch (_) {}
   }
 
-  recordValidatorSeen(nodeId) {
-    this._db.prepare('INSERT INTO sov_validator_seen (node_id, admitted_at) VALUES (?, ?) ON CONFLICT(node_id) DO UPDATE SET admitted_at = excluded.admitted_at')
-      .run(nodeId, Date.now());
+  recordValidatorSeen(nodeId, pubHex) {
+    const now = Date.now();
+    this._db.prepare(`INSERT INTO sov_validator_seen (node_id, admitted_at, first_seen, pubkey) VALUES (?, ?, ?, ?)
+      ON CONFLICT(node_id) DO UPDATE SET admitted_at = excluded.admitted_at,
+        first_seen = COALESCE(sov_validator_seen.first_seen, excluded.first_seen),
+        pubkey = COALESCE(excluded.pubkey, sov_validator_seen.pubkey)`).run(nodeId, now, now, pubHex || null);
+    // The first time this node has a validator peer, it becomes a validator itself (ledger certificates
+    // must then count it: an origin may not leave it out of the set).
+    this._db.prepare("INSERT OR IGNORE INTO sov_ledger_meta (k, v) VALUES ('self_validator_since', ?)").run(String(now));
+  }
+
+  /** 1.4.94: the public key of an admitted validator this node knows (null if unknown). */
+  validatorPub(nodeId) {
+    const r = this._db.prepare('SELECT pubkey FROM sov_validator_seen WHERE node_id = ?').get(String(nodeId).toLowerCase());
+    return r && r.pubkey ? r.pubkey : null;
+  }
+
+  /** 1.4.94: validators this node knows were active at time ts (first seen before it, seen within 14 days of it). */
+  validatorsActiveAt(ts, selfId) {
+    return this._db.prepare(`SELECT node_id FROM sov_validator_seen
+        WHERE first_seen IS NOT NULL AND first_seen <= ? AND admitted_at >= ? AND node_id != ?`)
+      .all(ts - 60 * 1000, ts - 14 * 24 * 3600 * 1000, selfId || '').map(r => r.node_id.toLowerCase());
+  }
+
+  selfValidatorSince() {
+    const r = this._db.prepare("SELECT v FROM sov_ledger_meta WHERE k = 'self_validator_since'").get();
+    return r ? Number(r.v) || 0 : 0;
+  }
+
+  /** 1.4.94: the operator (enrolled human) behind a node, from the admitted registry ('' if unknown). */
+  operatorOfNode(nodeId) {
+    try {
+      const r = this._db.prepare("SELECT operator_id FROM sov_operator_registry WHERE node_id = ? AND status = 'active'").get(nodeId);
+      return r && r.operator_id ? String(r.operator_id) : '';
+    } catch (_) { return ''; }
   }
 
   validatorsSeenSince(sinceMs, selfId) {

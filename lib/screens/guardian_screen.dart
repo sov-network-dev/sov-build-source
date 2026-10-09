@@ -139,6 +139,9 @@ class _GuardianScreenState extends State<GuardianScreen>
     final res = await RelayConnector.approveGuardianRecovery(
       requestId:  req['request_id'] as String,
       guardianId: _sovereignId,
+      citizenId:  (req['citizen_id'] as String?) ?? '',
+      oldPubKey:  (req['old_pub_key'] as String?) ?? '',
+      newPubKey:  (req['new_pub_key'] as String?) ?? '',
     );
     if (!mounted) return;
     if (res != null && res['success'] == true) {

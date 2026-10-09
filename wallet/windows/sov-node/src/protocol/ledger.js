@@ -26,6 +26,25 @@
 'use strict';
 
 const crypto = require('crypto');
+const cert   = require('./ledger_cert');
+const { isFrozenHistory } = require('./ledger_frozen');
+
+// Kinds that were allowed to break the zero-sum rule for the 1.4.90 upgrade. From 1.4.94 a peer's op
+// of these kinds is accepted ONLY if it is part of the frozen pre-1.4.94 history (D60): otherwise a
+// dishonest node could create SOV on every other node by announcing a made-up "baseline".
+const LEGACY_KINDS = new Set(['baseline', 'escrow_adopt', 'holding_adopt']);
+
+// D57: every op kind the node knows. A peer's op of any OTHER kind is refused outright — a future or
+// rogue kind cannot slip money through on an old node that does not understand it. Owner ops are further
+// checked by their certificate (D61/D62); the system-op kinds here still apply on the origin's say-so
+// until per-kind re-derivation lands (SOV_LEDGER_V2_DESIGN §5.2), which matters once a second operator runs.
+const KNOWN_KINDS = new Set([
+  'transfer', 'baseline', 'escrow_adopt', 'holding_adopt',
+  'escrow_list', 'escrow_confirm', 'escrow_refund', 'escrow_cancel', 'escrow_expire', 'escrow_list_undo',
+  'vault_lock', 'vault_claim', 'vault_steward', 'dispute_bond', 'verdict', 'platform_fee',
+  'enroll_grant', 'operator_payout', 'alloc_lock', 'alloc_cancel', 'alloc_claim', 'alloc_council',
+  'academy_article_bond', 'academy_upvote_bond',
+]);
 
 const VOTE_TIMEOUT_MS    = 3000;
 const DIGEST_INTERVAL_MS = 60 * 1000;
@@ -53,7 +72,7 @@ class Ledger {
   start() {
     const m = this._mesh;
     m.on('LEDGER_VOTE_REQUEST', (msg) => this._onVoteRequest(msg));
-    m.on('LEDGER_VOTE_REPLY',   (msg) => this._onVoteReply(msg));
+    m.on('LEDGER_VOTE_REPLY',   (msg, ws) => this._onVoteReply(msg, ws));
     m.on('LEDGER_VOTE_RELEASE', (msg) => this._onVoteRelease(msg));
     m.on('LEDGER_OP',           (msg) => this._onOp(msg));
     m.on('LEDGER_DIGEST',       (msg) => this._onDigest(msg));
@@ -107,6 +126,8 @@ class Ledger {
       this._abort(op);
       return { ok: false, error: q.error, expected_nonce: q.expected_nonce };
     }
+    // 1.4.94: the signed grants travel with the op, so every node can re-check the majority itself.
+    op.cert = { vset: q.vset, grants: q.grants };
     return this._commitLocal(op, true);
   }
 
@@ -154,38 +175,65 @@ class Ledger {
 
   // ── Majority ──────────────────────────────────────────────────────────────
 
+  /** The validator set this node counts right now: itself, every validator seen in the last 14 days, live peers. */
+  _currentVset() {
+    const ids = new Set([this.nodeId]);
+    try { for (const v of this._db.validatorsActiveAt(Date.now() + 61 * 1000, this.nodeId)) ids.add(v); } catch (_) {}
+    for (const p of this._mesh.activePeers()) { const id = p.ws && p.ws._nodeId; if (id) ids.add(String(id).toLowerCase()); }
+    return [...ids];
+  }
+
+  _opOf(nodeId) { return (this._db.operatorOfNode ? this._db.operatorOfNode(nodeId) : '') || ('node:' + nodeId); }
+
   _gatherMajority(op) {
     const { acct, nonce } = op.owner;
     const self = this._db.ledgerVote(acct, nonce, op.op_id, this.nodeId);
     if (!self.granted) return Promise.resolve({ ok: false, error: self.reason, expected_nonce: (self.committed_nonce | 0) + 1 });
+    const selfGrant = cert.signGrant(this._identity, op);
 
-    const N = this._mesh.validatorSetSize ? this._mesh.validatorSetSize() : 1 + this._mesh.activePeers().length;
+    const vset = this._currentVset();
+    const N = vset.length;
     const need = Math.floor(N / 2) + 1;
+    // D62: a majority of OPERATORS as well as of nodes — one person's many nodes are one weight.
+    // Only operators the registry has actually resolved count; a not-yet-propagated peer (a 'node:'
+    // placeholder) does not inflate the requirement. With fewer than 2 resolved operators (the
+    // single-operator bootstrap) there is no operator constraint — node-majority is the model until a
+    // second independent operator exists (SOV_LEDGER_V2_DESIGN §5).
+    const resolvedOp = (v) => { const o = this._opOf(v).toUpperCase(); return o.startsWith('NODE:') ? null : o; };
+    const vsetOps = new Set(vset.map(resolvedOp).filter(Boolean));
+    const needOps = vsetOps.size >= 2 ? Math.floor(vsetOps.size / 2) + 1 : 0;
     const live = this._mesh.activePeers().length;
     if (need <= 1) {
       if (this._mesh.everHadVerifiedPeer && this._mesh.everHadVerifiedPeer()) {
         return Promise.resolve({ ok: false, error: 'QUORUM_UNAVAILABLE' });
       }
-      return Promise.resolve({ ok: true, grants: [this.nodeId] });     // never had a second node
+      return Promise.resolve({ ok: true, vset, grants: [selfGrant] });     // never had a second node
     }
     if (1 + live < need) return Promise.resolve({ ok: false, error: 'QUORUM_UNAVAILABLE' });
 
     return new Promise((resolve) => {
-      const grants = new Set([this.nodeId]);
+      const grants = new Map([[this.nodeId, selfGrant]]);
       const denies = [];
       let done = false;
+      const enough = () => {
+        if (grants.size < need) return false;
+        if (needOps === 0) return true;
+        return new Set([...grants.keys()].map(resolvedOp).filter(Boolean)).size >= needOps;
+      };
       const finish = (res) => {
         if (done) return; done = true;
         clearTimeout(timer); this._waiters.delete(op.op_id);
         resolve(res);
       };
-      const timer = setTimeout(() => finish(grants.size >= need ? { ok: true, grants: [...grants] }
+      const ok = () => ({ ok: true, vset, grants: [...grants.values()] });
+      const timer = setTimeout(() => finish(enough() ? ok()
         : { ok: false, error: denies.length ? 'QUORUM_DENIED:' + denies.join(',') : 'QUORUM_UNAVAILABLE' }), VOTE_TIMEOUT_MS);
       this._waiters.set(op.op_id, {
+        op,
         onReply: (msg) => {
-          if (msg.granted) grants.add(msg.voter);
+          if (msg.granted) grants.set(msg.voter, msg.grant);
           else denies.push(msg.reason || 'DENIED');
-          if (grants.size >= need) return finish({ ok: true, grants: [...grants] });
+          if (enough()) return finish(ok());
           if (grants.size + Math.max(0, N - 1 - (grants.size - 1) - denies.length) < need) {
             finish({ ok: false, error: 'QUORUM_DENIED:' + denies.join(',') });
           }
@@ -200,20 +248,43 @@ class Ledger {
   _onVoteRequest(msg) {
     const { from_id, nonce, op_id, origin_node, op } = msg || {};
     if (!from_id || !op_id || !origin_node || origin_node === this.nodeId) return;
+    // 1.4.94: the request must describe the op it asks about — a grant is a signature over that content.
+    if (!op || op.op_id !== op_id || !op.owner || op.owner.acct !== from_id || op.owner.nonce !== nonce) return;
+    if (!KNOWN_KINDS.has(op.kind)) return;                              // D57: never grant a slot to an unknown kind
     let r;
-    const v = op && this._validators.get(op.kind);
+    const v = this._validators.get(op.kind);
     const why = v ? v(op) : null;
     if (why) r = { granted: false, reason: why };
     else r = this._db.ledgerVote(from_id, nonce, op_id, origin_node);
     this._mesh.sendTo(origin_node, 'LEDGER_VOTE_REPLY', {
       op_id, voter: this.nodeId, granted: !!r.granted, reason: r.reason || null, committed_nonce: r.committed_nonce,
+      grant: r.granted ? cert.signGrant(this._identity, op) : null,
     });
     if (!r.granted && r.reason === 'NONCE_BEHIND') this._sendDigest(origin_node);   // we are behind: catch up
   }
 
-  _onVoteReply(msg) {
+  _onVoteReply(msg, ws) {
     const w = msg && this._waiters.get(msg.op_id);
-    if (w) w.onReply(msg);
+    if (!w) return;
+    // D61: a reply counts only for the node on the authenticated link it arrived on — before 1.4.94
+    // the `voter` field was taken from the message body, so one peer could pose as many voters.
+    const linkId = ws && ws._nodeId ? String(ws._nodeId).toLowerCase() : null;
+    if (!linkId || String(msg.voter).toLowerCase() !== linkId) {
+      global.sovLog.warn(`[LEDGER] vote reply for ${msg.op_id} claims voter ${String(msg.voter).slice(0, 12)} but came from ${String(linkId).slice(0, 12)} — ignored`);
+      return;
+    }
+    if (msg.granted) {
+      const g = msg.grant;
+      const known = this._mesh.peerPublicKey ? this._mesh.peerPublicKey(linkId) : null;
+      if (!g || String(g.voter).toLowerCase() !== linkId || !known || String(known).toLowerCase() !== String(g.pub).toLowerCase()
+          || !cert.grantValid(w.op, g)) {
+        global.sovLog.warn(`[LEDGER] unsigned or invalid grant for ${msg.op_id} from ${linkId.slice(0, 12)} — ignored`);
+        return;
+      }
+      w.onReply({ granted: true, voter: linkId, grant: g });
+    } else {
+      w.onReply({ granted: false, voter: linkId, reason: msg.reason });
+    }
   }
 
   _onVoteRelease(msg) {
@@ -231,7 +302,31 @@ class Ledger {
     this._retryHeld();
   }
 
+  /** 1.4.94: why a peer's op must not be applied (null = it may be). */
+  _trustCheck(op) {
+    if (!KNOWN_KINDS.has(op.kind)) return 'UNKNOWN_OP_KIND';           // D57: a kind this node does not understand
+    if (isFrozenHistory(op)) return null;                              // pre-1.4.94 history, fingerprinted
+    if (LEGACY_KINDS.has(op.kind)) return 'LEGACY_OP_NOT_IN_HISTORY';  // D60: no new baselines / adoptions
+    if (op.owner) {
+      return cert.verifyCertificate(op, {
+        selfId: this.nodeId,
+        selfPub: Buffer.from(this._identity.publicKey).toString('hex'),
+        knownPub: (n) => (this._db.validatorPub ? this._db.validatorPub(n) : null)
+                         || (this._mesh.peerPublicKey ? this._mesh.peerPublicKey(n) : null),
+        activeAt: (ts) => (this._db.validatorsActiveAt ? this._db.validatorsActiveAt(ts, this.nodeId) : []),
+        selfActiveSince: this._db.selfValidatorSince ? this._db.selfValidatorSince() : 0,
+        operatorOf: (n) => this._opOf(n),
+      });
+    }
+    return null;
+  }
+
   _applyRemote(op) {
+    const trust = this._trustCheck(op);
+    if (trust) {
+      global.sovLog.error(`[LEDGER] refused op ${op.op_id} (${op.kind}) from ${String(op.origin_node).slice(0, 12)}: ${trust}`);
+      return 'refused';
+    }
     const v = this._validators.get(op.kind);
     const why = v ? v(op) : null;
     if (why) {

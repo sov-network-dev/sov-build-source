@@ -155,8 +155,8 @@ class _InheritanceScreenState extends State<InheritanceScreen>
     setState(() { _claimLoading = true; _claimError = ''; _claimSuccess = ''; });
     try {
       if (!RelayConnector.isConnected) await RelayConnector.connect();
-      final hash = InheritanceCrypto.hashClaimKey(claimKey);
-      final resp = await RelayConnector.claimStage1(widget.sovereignId, hash);
+      final signed = await InheritanceCrypto.signClaim(claimKey, widget.sovereignId);
+      final resp = await RelayConnector.claimStage1(widget.sovereignId, signed);
       if (!mounted) return;
       if (resp['success'] == true) {
         setState(() {
@@ -1446,7 +1446,7 @@ class _AddAllocationSheetState extends State<_AddAllocationSheet> {
       final nameHash         = InheritanceCrypto.hashBeneficiaryName(beneficiaryName);
       final nameEncrypted    = InheritanceCrypto.encryptBeneficiaryName(
           beneficiaryName, claimKey);
-      final claimKeyHash     = InheritanceCrypto.hashClaimKey(claimKey);
+      final claimPubkey      = await InheritanceCrypto.claimPubkey(claimKey);
       final noteEncrypted    = personalNote.isNotEmpty
           ? InheritanceCrypto.encryptPersonalNote(personalNote, claimKey)
           : null;
@@ -1470,7 +1470,7 @@ class _AddAllocationSheetState extends State<_AddAllocationSheet> {
         'beneficiary_name_encrypted': nameEncrypted,
         'amount_seeds':              amountSeeds,
         'release_date':              releaseDate,
-        'claim_key_hash':            claimKeyHash,
+        'claim_pubkey':              claimPubkey,
         'public_statement':
             _stmtCtrl.text.trim().isNotEmpty ? _stmtCtrl.text.trim() : null,
         'publish_after_years':       _releaseYears > 0 ? _releaseYears : 10,

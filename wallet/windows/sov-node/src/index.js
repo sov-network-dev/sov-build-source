@@ -471,7 +471,7 @@ global.sovLog.info(`      [VERSION] sov-relay v${process.env.SOV_RELAY_VERSION |
   const pioneerEngine = new PioneerEngine(identity, db);
 
   const { AllocationEngine } = require('./protocol/allocation_engine');
-  const allocationEngine = new AllocationEngine(identity, db);
+  const allocationEngine = new AllocationEngine(identity, db, peerMesh);
 
   // ── Step 8 — Citizen gateway ──────────────────────────────────────────────
   log.info('[8/9] Opening citizen gateway...');

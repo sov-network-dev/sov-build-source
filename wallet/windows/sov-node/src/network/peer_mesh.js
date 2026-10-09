@@ -166,7 +166,12 @@ class PeerMesh {
   // anything an unverified peer sends — so an immediate catch-up message is silently lost
   // (measured on the test mesh, 2026-10-03). A handshake completes well within this delay.
   _firePeerAdmitted(nodeId) {
-    try { if (this._db && this._db.recordValidatorSeen) this._db.recordValidatorSeen(nodeId); } catch (_) {}
+    // 1.4.94: the validator's public key is kept, so its signed ledger grants can be checked later.
+    try {
+      const peer = this._peers.get(nodeId);
+      const pub = peer && peer.publicKey ? String(peer.publicKey).toLowerCase() : null;
+      if (this._db && this._db.recordValidatorSeen) this._db.recordValidatorSeen(nodeId, pub);
+    } catch (_) {}
     const cbs = this._admittedCbs || [];
     if (!cbs.length) return;
     const t = setTimeout(() => { for (const cb of cbs) { try { cb(nodeId); } catch (_) {} } }, 5000);
