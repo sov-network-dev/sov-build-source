@@ -18,6 +18,7 @@
 
 const crypto = require('crypto');
 const nacl   = require('tweetnacl');
+const ownerAuth = require('./owner_auth');   // 1.4.95: the citizen's signed request travels with their money ops
 
 // 1.4.94 (D53): the message a claimant signs with the keypair derived from their claim key.
 function allocClaimString(claimPubkey, claimantId, ts) {
@@ -146,6 +147,7 @@ class AllocationEngine {
       // still spend the "locked" funds, and the claim took money from the donor's wallet at claim time.
       const locked = await this._db.ledger.commitOwnerOp({
         kind: 'alloc_lock', ref: allocationId, owner: { acct: sovereignId },
+        auth: ownerAuth.fromAppRequest(msg),   // 1.4.95: every node checks the citizen's own signed request
         moves: [{ acct: sovereignId, d: -amt }],
         holds: [{ id: 'alloc:' + allocationId, d: amt }],
       });
@@ -260,16 +262,20 @@ class AllocationEngine {
         'SELECT * FROM sov_allocations WHERE citizen_sovereign_id = ? ORDER BY created_at DESC'
       ).all(sovereignId);
 
-      const escrowRow = this._db._db.prepare(
-        'SELECT locked_seeds FROM sov_inheritance_escrow WHERE sovereign_id = ?'
-      ).get(sovereignId);
+      // D71: since 1.4.94 a vault's money sits in a ledger holding ('alloc:<id>'), and
+      // sov_inheritance_escrow is never written — reading it reported 0 in the vault.
+      // The citizen's locked total is the sum of their vaults whose holding is still open
+      // ('locked', or 'pending_council' — a council claim releases it only on approval).
+      const lockedSeeds = allocations
+        .filter(a => a.status === 'locked' || a.status === 'pending_council')
+        .reduce((s, a) => s + (Number(a.amount_seeds) || 0), 0);
 
       this._send(ws, {
         type:               RESP,
         success:            true,
         sovereign_id:       sovereignId,
         allocations,
-        total_locked_seeds: escrowRow ? (escrowRow.locked_seeds || 0) : 0,
+        total_locked_seeds: lockedSeeds,
         timestamp:          Date.now(),
       });
     } catch (e) {
@@ -372,9 +378,11 @@ class AllocationEngine {
 
       const nowSec = Math.floor(Date.now() / 1000);
       if (alloc.release_date > nowSec) {
-        const releaseDate = new Date(alloc.release_date * 1000).toISOString().slice(0, 10);
-        return this._send(ws, { type: RESP, success: false,
-          error: `Release date not reached. Unlocks: ${releaseDate}` });
+        // D72: the app sets the release at the owner's LOCAL midnight, so a bare UTC date read as
+        // "today" (00:00 BST on the 10th = 23:00 UTC on the 9th). Give the time and zone.
+        const releaseDate = new Date(alloc.release_date * 1000).toISOString().slice(0, 16).replace('T', ' ');
+        return this._send(ws, { type: RESP, success: false, release_date: alloc.release_date,
+          error: `Release date not reached. Unlocks: ${releaseDate} UTC` });
       }
       // 1.4.94 (D53): prove the claim KEY with a SIGNATURE, not a hash the broadcast exposes. The
       // claimant signs SOV-ALLOC-CLAIM-v1|id|claimant|ts with the keypair derived from the claim key;

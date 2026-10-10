@@ -971,6 +971,12 @@ class CitizenGateway {
   _handleMessage(ws, raw) {
     let msg;
     try { msg = JSON.parse(raw); } catch (_) { return; }
+    // 1.4.95 (owner_auth.js): keep the exact text the wallet signed, so a money op can carry the
+    // citizen's own signed request to every other node. Not enumerable: JSON.stringify(msg) and every
+    // existing signature check see the message exactly as before.
+    if (msg && typeof msg === 'object') {
+      Object.defineProperty(msg, '_rawRequest', { value: String(raw), enumerable: false });
+    }
 
     // ── Backward compat — old relay_connector.dart sends msg.type (full string).
     // SOV Node protocol uses msg.op (2-char code). Normalise here so the switch

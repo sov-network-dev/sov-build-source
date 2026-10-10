@@ -26,6 +26,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const ownerAuth = require('./owner_auth');   // 1.4.95: the citizen's signed request travels with their money ops
 
 class JusticeEngine {
 
@@ -159,6 +160,7 @@ class JusticeEngine {
     if (bondSeeds > 0) {
       const res = await this._db.ledger.commitOwnerOp({
         kind: 'dispute_bond', ref: case_id, owner: { acct: plaintiff_id },
+        auth: ownerAuth.fromAppRequest(msg),   // 1.4.95: every node checks the citizen's own signed request
         moves: [{ acct: plaintiff_id, d: -bondSeeds }],
         holds: [{ id: 'bond:' + case_id, d: bondSeeds }],
       });

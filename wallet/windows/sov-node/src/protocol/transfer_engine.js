@@ -41,6 +41,7 @@ class TransferEngine {
     // HERE when the op applies here.
     if (db.ledger) {
       db.ledger.setValidator('transfer', (op) => this._validateTransferOp(op));
+      db.ledger.setPolicyResolver((acct) => this._resolveAutomationPolicy(acct));   // 1.4.95 (D70)
       db.ledger.onApplied((op, local) => { if (!local && op.kind === 'transfer') this._notifyRecipient(op.transfer); });
     }
   }
@@ -159,7 +160,9 @@ class TransferEngine {
         return;
       }
       if (autoPol.daily_cap > 0) {
-        const spent24h = this._db.sumAutomationSpend24h(from_id);
+        // 1.4.95 (D70): the replicated ledger's figure (every node, every kind of spend); the ledger
+        // re-checks it on every node before granting — this is only the early, friendly refusal.
+        const spent24h = this._db.ledgerOwnerDebit24h ? this._db.ledgerOwnerDebit24h(from_id) : this._db.sumAutomationSpend24h(from_id);
         if (spent24h + amount_seeds > autoPol.daily_cap) {
           gateway.push(ws._sovereignId, MSG_TYPE.SOV_TRANSFER_RESULT, {
             tx_id, success: false, error: 'OVER_DAILY_CAP',

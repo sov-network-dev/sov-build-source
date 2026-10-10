@@ -988,7 +988,7 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         onSeedsChanged: (s) => setState(() => _seeds = s),
       ),
       MessagesScreen(sovereignId: _sovereignId),
-      InheritanceScreen(sovereignId: _sovereignId, seeds: _seeds),
+      InheritanceScreen(sovereignId: _sovereignId, seeds: _seeds, onFundsChanged: _refreshBalance),
       GovernanceScreen(sovereignId: _sovereignId),
       AcademyScreen(sovereignId: _sovereignId),
       ProfileScreen(sovereignId: _sovereignId),

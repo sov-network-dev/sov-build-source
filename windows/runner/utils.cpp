@@ -21,6 +21,27 @@ void CreateAndAttachConsole() {
   }
 }
 
+void ReopenStdStreamsToAttachedConsole() {
+  const auto unredirected = [](DWORD which) {
+    HANDLE h = ::GetStdHandle(which);
+    return h == nullptr || h == INVALID_HANDLE_VALUE || ::GetFileType(h) == FILE_TYPE_UNKNOWN;
+  };
+  bool changed = false;
+  FILE *unused;
+  if (unredirected(STD_OUTPUT_HANDLE) && freopen_s(&unused, "CONOUT$", "w", stdout) == 0) {
+    _dup2(_fileno(stdout), 1);
+    changed = true;
+  }
+  if (unredirected(STD_ERROR_HANDLE) && freopen_s(&unused, "CONOUT$", "w", stderr) == 0) {
+    _dup2(_fileno(stderr), 2);
+    changed = true;
+  }
+  if (changed) {
+    std::ios::sync_with_stdio();
+    FlutterDesktopResyncOutputStreams();
+  }
+}
+
 std::vector<std::string> GetCommandLineArguments() {
   // Convert the UTF-16 command line arguments to UTF-8 for the Engine to use.
   int argc;

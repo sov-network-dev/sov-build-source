@@ -1919,6 +1919,25 @@ class NodeDB {
     ).run(sovereignId, Date.now(), amountSeeds);
   }
 
+  /** 1.4.95 (D70): what an account's OWNER ops took from it in the last 24 h, read from the replicated
+   *  ledger — every node computes the same figure, whichever node each spend went through, and every
+   *  kind of spend counts (transfer + fee, vault, listing, bond, platform fee), not only transfers. */
+  ledgerOwnerDebit24h(acct, excludeOpId = null) {
+    const cutoff = Date.now() - 86400000;
+    let rows = [];
+    try {
+      rows = this._db.prepare('SELECT op_id, op_json FROM sov_ledger_ops WHERE owner_acct = ? AND applied_at >= ?').all(acct, cutoff);
+    } catch (_) { return 0; }
+    let s = 0;
+    for (const r of rows) {
+      if (r.op_id === excludeOpId) continue;
+      let op; try { op = JSON.parse(r.op_json); } catch (_) { continue; }
+      if (op.kind === 'verdict') continue;                       // a court order is not the owner's own spend
+      for (const m of op.moves || []) if (m.acct === acct && m.d < 0) s += -m.d;
+    }
+    return s;
+  }
+
   sumAutomationSpend24h(sovereignId) {
     const cutoff = Date.now() - 86400000;
     // Opportunistically prune rows older than the window.

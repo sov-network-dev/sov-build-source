@@ -27,6 +27,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const ownerAuth = require('./owner_auth');   // 1.4.95: the citizen's signed request travels with their money ops
 
 class SocialEngine {
 
@@ -156,7 +157,7 @@ class SocialEngine {
     // 1.4.90: the bond is an OWNER op (author -> bonds_held pool) on every node.
     const bondSeeds = parseInt(this._getGovParam('academy_article_bond', '5')) * 1_000_000;
     if (bondSeeds > 0) {
-      const r = await this._bond(author_id, bondSeeds, 'academy_article_bond', article_id);
+      const r = await this._bond(author_id, bondSeeds, 'academy_article_bond', article_id, msg);
       if (!r.ok) {
         this._send(ws, 'AD', { type: 'ACADEMY_PUBLISH_RESULT', success: false,
           error: r.error === 'LEDGER_INSUFFICIENT' ? 'INSUFFICIENT_BALANCE_FOR_BOND' : r.error });
@@ -226,7 +227,7 @@ class SocialEngine {
     // 1.4.90: optional upvote bond, an OWNER op (voter -> bonds_held pool).
     const bondSeeds = parseInt(this._getGovParam('academy_upvote_bond', '1')) * 1_000_000;
     if (bondSeeds > 0) {
-      const r = await this._bond(voter_id, bondSeeds, 'academy_upvote_bond', `${article_id}:${voter_id}`);
+      const r = await this._bond(voter_id, bondSeeds, 'academy_upvote_bond', `${article_id}:${voter_id}`, msg);
       if (!r.ok) {
         this._send(ws, 'AU', { type: 'ACADEMY_UPVOTE_RESULT', success: false,
           error: r.error === 'LEDGER_INSUFFICIENT' ? 'INSUFFICIENT_BALANCE' : r.error });
@@ -576,9 +577,10 @@ class SocialEngine {
 
   // 1.4.90: a bond is an OWNER op — citizen -> bonds_held pool, majority-granted on the citizen's
   // slot and applied on every node (the pool side used to replicate, the wallet side did not).
-  _bond(citizenId, seeds, kind, ref) {
+  // 1.4.95: `msg` is the citizen's signed request, carried in the op so every node checks it.
+  _bond(citizenId, seeds, kind, ref, msg) {
     return this._db.ledger.commitOwnerOp({
-      kind, ref, owner: { acct: citizenId },
+      kind, ref, owner: { acct: citizenId }, auth: ownerAuth.fromAppRequest(msg),
       moves: [{ acct: citizenId, d: -seeds }],
       pools: [{ pool: 'bonds_held', d: seeds }],
     });

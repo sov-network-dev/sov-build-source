@@ -328,10 +328,12 @@ class SovCLI {
     // Connect to relay for balance + node info (retry-resilient)
     String relayNode = '';
     int balSeeds = 0;
+    bool reached = false;
     try {
       final r = await _fetchBalance(sovId, nodeUrl, prefs);
       relayNode = r.nodeId;
       balSeeds  = r.seeds;
+      reached   = true;
     } catch (e) {
       if (!json) stderr.writeln('warning: relay unreachable ($e) — balance unavailable');
     }
@@ -344,14 +346,15 @@ class SovCLI {
         'name':         name,
         'balance_sov':  balSov,
         'balance_seeds': balSeeds,
-        'relay':        nodeUrl,
+        // D69: never a node ADDRESS (no-node-address rule — output lands in screenshots and tutorials).
+        'relay':        reached ? 'connected' : 'unreachable',
         'relay_node_id': relayNode,
       }));
     } else {
       print('sovereign_id : $sovId');
       if (name.isNotEmpty) print('name         : $name');
       print('balance      : ${_fmtSov(balSeeds)} SOV');
-      print('relay        : $nodeUrl');
+      print('relay        : ${reached ? 'connected' : 'unreachable'}');   // D69: no node address
       if (relayNode.isNotEmpty) print('node_id      : ${relayNode.substring(0, 16)}…');
     }
     return 0;
@@ -512,12 +515,19 @@ class SovCLI {
       final dtStr  = ts > 0
           ? DateTime.fromMillisecondsSinceEpoch(ts).toLocal().toString().substring(0, 19)
           : '?';
-      final from   = tx['from_sovereign_id'] as String? ?? tx['from_id'] as String? ?? '';
       final amt    = (tx['amount_seeds'] as num?)?.toInt() ?? 0;
-      final dir    = from == sovId ? 'OUT' : 'IN ';
-      final party  = from == sovId
-          ? (tx['to_sovereign_id'] as String? ?? tx['to_id'] as String? ?? '?')
-          : from;
+      // D68: TransactionStore keeps `type` ('sent' | 'received' | 'enrollment_reward') and
+      // `counterparty_id`; it does NOT keep from/to ids. Reading `from_sovereign_id` (always empty in
+      // the store) printed every outgoing payment as IN with no party after a restore.
+      final from   = tx['from_sovereign_id'] as String? ?? tx['from_id'] as String? ?? '';
+      final type   = tx['type'] as String? ?? '';
+      final out    = type.isNotEmpty ? type == 'sent' : from == sovId;
+      final dir    = out ? 'OUT' : 'IN ';
+      final party  = (tx['counterparty_id'] as String? ?? '').isNotEmpty
+          ? tx['counterparty_id'] as String
+          : type == 'enrollment_reward'
+              ? 'network (enrolment grant)'
+              : (out ? (tx['to_sovereign_id'] as String? ?? tx['to_id'] as String? ?? '?') : (from.isEmpty ? '?' : from));
       print('${dtStr.padRight(22)} $dir   ${_fmtSov(amt).padRight(16)} $party');
     }
     return 0;

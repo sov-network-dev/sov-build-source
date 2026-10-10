@@ -19,10 +19,15 @@ import '../sov_node_sdk/draft_keys.dart';
 class InheritanceScreen extends StatefulWidget {
   final String sovereignId;
   final int    seeds;
+  /// D74 (1.2.30): called after a vault is created, claimed or cancelled, so the shell re-reads the
+  /// balance — before, Home and the Vault summary kept the pre-lock / pre-claim figure until a
+  /// manual pull-to-refresh, though the network had already moved the SOV.
+  final VoidCallback? onFundsChanged;
   const InheritanceScreen({
     super.key,
     required this.sovereignId,
     required this.seeds,
+    this.onFundsChanged,
   });
 
   @override
@@ -140,6 +145,7 @@ class _InheritanceScreenState extends State<InheritanceScreen>
       if (!mounted) return;
       if (resp['success'] == true) {
         await _loadAllocations();
+        widget.onFundsChanged?.call();
         _showSnack('Vault cancelled — seeds unlocked', isError: false);
       } else {
         _showSnack(resp['error'] as String? ?? 'Cancel failed', isError: true);
@@ -164,6 +170,7 @@ class _InheritanceScreenState extends State<InheritanceScreen>
           _claimLoading = false;
         });
         _loadAllocations();
+        widget.onFundsChanged?.call();
       } else {
         setState(() {
           _claimError   = resp['error'] as String? ?? 'Claim failed';
@@ -817,7 +824,7 @@ class _InheritanceScreenState extends State<InheritanceScreen>
       builder: (_) => _AddAllocationSheet(
         sovereignId:    widget.sovereignId,
         availableSeeds: widget.seeds - _lockedSeeds,
-        onCreated: () { _loadAllocations(); Navigator.pop(context); },
+        onCreated: () { _loadAllocations(); widget.onFundsChanged?.call(); Navigator.pop(context); },
       ),
     );
   }

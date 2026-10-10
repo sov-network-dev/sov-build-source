@@ -739,6 +739,7 @@ async function _doPlatformRegister(db, identity, broadcast, input) {
   if (feeSeeds > 0) {
     const fee = await db.ledger.commitOwnerOp({
       kind: 'platform_fee', ref: platformId, owner: { acct: registering_sovereign_id },
+      auth: require('../protocol/owner_auth').fromPlatformRegister(input),   // 1.4.95: checked by every node
       moves: [{ acct: registering_sovereign_id, d: -feeSeeds }],
       pools: [{ pool: 'witness_operator', d: feeSeeds }],
     });

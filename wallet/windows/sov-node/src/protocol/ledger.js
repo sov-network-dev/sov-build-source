@@ -28,6 +28,12 @@
 const crypto = require('crypto');
 const cert   = require('./ledger_cert');
 const { isFrozenHistory } = require('./ledger_frozen');
+const ownerAuth = require('./owner_auth');
+
+// 1.4.95: an owner op of a citizen-requested kind committed from this moment on must carry the citizen's
+// signed request when a node APPLIES it. Earlier ops were granted under the old rule and stay valid by
+// their majority certificate (every grant given after the upgrade already required the request).
+const AUTH_REQUIRED_FROM = Date.parse('2026-10-10T06:00:00Z');
 
 // Kinds that were allowed to break the zero-sum rule for the 1.4.90 upgrade. From 1.4.94 a peer's op
 // of these kinds is accepted ONLY if it is part of the frozen pre-1.4.94 history (D60): otherwise a
@@ -68,6 +74,87 @@ class Ledger {
 
   /** Called after any op is applied on this node (origin or replica). */
   onApplied(fn) { this._appliedCbs.push(fn); }
+
+  // ── 1.4.95: the citizen's own signed request (owner_auth.js) ─────────────────
+  /** 'reject' refuses an op whose request does not check out; anything else only logs. Same switch as
+   *  transfer signatures — one rule for every way a citizen's own money moves. */
+  _authMode() {
+    try {
+      const r = this._db._db.prepare("SELECT param_value FROM sov_governance_params WHERE param_key = 'tx_signature_enforce'").get();
+      return r && r.param_value != null ? String(r.param_value) : 'reject';
+    } catch (_) { return 'reject'; }
+  }
+
+  _authParam(key, fallback) {
+    try {
+      const r = this._db._db.prepare('SELECT param_value FROM sov_governance_params WHERE param_key = ?').get(key);
+      return r && r.param_value != null ? String(r.param_value) : fallback;
+    } catch (_) { return fallback; }
+  }
+
+  /** Why the citizen did not ask for exactly this op (null = they did, or the kind needs no request). */
+  _authCheck(op, now, atApply = false) {
+    if (!op.owner || !ownerAuth.RULES[op.kind]) return null;
+    const why = ownerAuth.check(op, {
+      now, atApply,
+      param: (k, f) => this._authParam(k, f),
+      pubKeyOf: (acct) => {
+        const e = this._db.getEnrollment ? this._db.getEnrollment(acct) : null;
+        return e && e.public_key_hex ? e.public_key_hex : null;
+      },
+    });
+    if (!why) return null;
+    const mode = this._authMode();
+    global.sovLog.warn(`[LEDGER] owner-auth ${op.op_id} (${op.kind}) for ${String(op.owner.acct).slice(0, 16)}: ${why} mode=${mode}`);
+    return mode === 'reject' ? why : null;
+  }
+
+  /** 1.4.95 (D70): set by transfer_engine — the account's automated-wallet policy, resolved. */
+  setPolicyResolver(fn) { this._policyOf = fn; }
+
+  /**
+   * 1.4.95 (D70): a citizen's automated-wallet limits bind EVERY way their own SOV moves, and every node
+   * enforces them before granting — not only the connected node, and not only for transfers.
+   *   per_tx_cap  the op's debit (amount + fee) may not exceed it
+   *   daily_cap   the last 24 h of owner debits, read from the REPLICATED ledger, plus this one
+   *   allowlist   a transfer must go to a listed account; any other money op is refused while an
+   *               allowlist is set — a vault, a listing or a fee would otherwise route SOV past it
+   * A verdict is not the owner's own spend and is not limited here.
+   */
+  _policyCheck(op) {
+    if (!op.owner || op.kind === 'verdict' || !this._policyOf) return null;
+    let pol = null; try { pol = this._policyOf(op.owner.acct); } catch (_) { pol = null; }
+    if (!pol || !pol.enabled) return null;
+    const acct = op.owner.acct;
+    const debit = (op.moves || []).reduce((s, m) => s + (m.acct === acct && m.d < 0 ? -m.d : 0), 0);
+    // For a transfer the cap is on the amount SENT (the fee is the network's, and the wallet's own
+    // early check compares the amount) — so a payment exactly at the cap is not refused by peers only.
+    const amount = op.kind === 'transfer' && op.transfer ? Math.trunc(Number(op.transfer.amount_seeds) || 0) : debit;
+    const allow = Array.isArray(pol.allowlist) ? pol.allowlist : [];
+    if (allow.length > 0) {
+      if (op.kind !== 'transfer') return 'AUTOMATION_TRANSFERS_ONLY';
+      const to = op.transfer && op.transfer.to_id;
+      if (!to || !allow.includes(to)) return 'DEST_NOT_ALLOWLISTED';
+    }
+    if (pol.per_tx_cap > 0 && amount > pol.per_tx_cap) return 'OVER_PER_TX_CAP';
+    if (pol.daily_cap > 0 && this._db.ledgerOwnerDebit24h &&
+        this._db.ledgerOwnerDebit24h(acct, op.op_id) + amount > pol.daily_cap) return 'OVER_DAILY_CAP';
+    return null;
+  }
+
+  /** One signed request moves money once: its op id may not be committed, or granted, on another slot. */
+  _authReplay(op) {
+    if (!op.auth) return null;
+    const { acct, nonce } = op.owner;
+    if (this._db.ledgerHasOp(op.op_id)) {
+      const s = this._db.ledgerSlot(acct, nonce);
+      if (!s || s.op_id !== op.op_id) return 'AUTH_REQUEST_ALREADY_USED';
+    }
+    const other = this._db._db.prepare(
+      'SELECT 1 FROM sov_spend_votes WHERE op_id = ? AND released = 0 AND NOT (from_id = ? AND nonce = ?) LIMIT 1'
+    ).get(op.op_id, acct, nonce);
+    return other ? 'AUTH_REQUEST_ALREADY_USED' : null;
+  }
 
   start() {
     const m = this._mesh;
@@ -118,8 +205,12 @@ class Ledger {
       return { ok: false, error: nonce <= disc.nonce ? 'NONCE_ALREADY_USED' : 'NONCE_FUTURE', expected_nonce: disc.nonce + 1 };
     }
     op.owner = { acct, nonce };
-    op.op_id = op.op_id || `op-${this.nodeId.slice(0, 8)}-${crypto.randomBytes(8).toString('hex')}`;
+    // 1.4.95: an op that carries the citizen's signed request takes its id FROM that request.
+    op.op_id = op.auth ? ownerAuth.opIdFor(op.auth)
+                       : (op.op_id || `op-${this.nodeId.slice(0, 8)}-${crypto.randomBytes(8).toString('hex')}`);
     if (this._db.ledgerIsAborted(op.op_id)) return { ok: false, error: 'OP_ABORTED', expected_nonce: nonce };
+    const authWhy = this._authCheck(op, Date.now()) || this._authReplay(op) || this._policyCheck(op);
+    if (authWhy) return { ok: false, error: authWhy };
 
     const q = await this._gatherMajority(op);
     if (!q.ok) {
@@ -253,7 +344,8 @@ class Ledger {
     if (!KNOWN_KINDS.has(op.kind)) return;                              // D57: never grant a slot to an unknown kind
     let r;
     const v = this._validators.get(op.kind);
-    const why = v ? v(op) : null;
+    // 1.4.95: grant only what the citizen signed for — checked HERE, not taken from the origin's word.
+    const why = this._authCheck(op, Date.now()) || this._authReplay(op) || this._policyCheck(op) || (v ? v(op) : null);
     if (why) r = { granted: false, reason: why };
     else r = this._db.ledgerVote(from_id, nonce, op_id, origin_node);
     this._mesh.sendTo(origin_node, 'LEDGER_VOTE_REPLY', {
@@ -328,7 +420,10 @@ class Ledger {
       return 'refused';
     }
     const v = this._validators.get(op.kind);
-    const why = v ? v(op) : null;
+    // 1.4.95: the citizen's signed request, checked against the time the op was committed (an op
+    // replayed from history days later is judged as of its own commit, not as of today).
+    const authNeeded = !isFrozenHistory(op) && (op.auth || Number(op.committed_at) >= AUTH_REQUIRED_FROM);
+    const why = (authNeeded ? this._authCheck(op, Number(op.committed_at) || Date.now(), true) : null) || (v ? v(op) : null);
     if (why) {
       global.sovLog.error(`[LEDGER] refused op ${op.op_id} (${op.kind}) from ${String(op.origin_node).slice(0, 12)}: ${why}`);
       return 'refused';

@@ -26,6 +26,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const ownerAuth = require('./owner_auth');   // 1.4.95: the citizen's signed request travels with their money ops
 
 // Order status values
 const STATUS = {
@@ -312,6 +313,7 @@ class ExchangeEngine {
     // so a listing and a transfer can never spend the same SOV, wherever each was sent.
     const res = await this._db.ledger.commitOwnerOp({
       kind: 'escrow_list', ref: order_id, owner: { acct: seller_id },
+      auth: ownerAuth.fromAppRequest(msg),     // 1.4.95: every node checks the citizen's own signed request
       moves: [{ acct: seller_id, d: -sov_amount }],
       holds: [{ id: 'escrow:' + order_id, d: sov_amount }],
     });
@@ -724,13 +726,26 @@ class ExchangeEngine {
     });
   }
 
+  // D66 (1.4.95): a citizen's own orders, whichever node they were listed on. An order lives on its home
+  // node and every peer keeps a replica (EXCHANGE_ORDER_BROADCAST / EXCHANGE_STATE_REPLICATE carry status
+  // and filled_by), but the "my" views read only the home table — so a buyer connected to another node saw
+  // "You haven't filled any orders yet" right after filling one. Local rows win; otherwise the newest replica.
+  _ownOrders(where, params, limit) {
+    const local = this._db._db.prepare(
+      `SELECT * FROM sov_exchange_orders WHERE ${where} ORDER BY updated_at DESC LIMIT ${limit}`).all(...params);
+    let replicas = [];
+    try {
+      replicas = this._db._db.prepare(
+        `SELECT *, 'replica' AS _src FROM sov_exchange_replicas WHERE ${where} ORDER BY updated_at DESC LIMIT ${limit}`).all(...params);
+    } catch (_) { /* no replicas table on this node — local orders only */ }
+    const seen = new Set(local.map(o => o.order_id));
+    return [...local, ...replicas.filter(r => !seen.has(r.order_id))]
+      .sort((a, b) => b.updated_at - a.updated_at).slice(0, limit);
+  }
+
   handleMyOrders(ws, msg) {
     const citizen_id = ws._sovereignId;
-    const orders     = this._db._db.prepare(`
-      SELECT * FROM sov_exchange_orders
-      WHERE seller_id = ? OR filled_by = ?
-      ORDER BY updated_at DESC LIMIT 50
-    `).all(citizen_id, citizen_id);
+    const orders     = this._ownOrders('seller_id = ? OR filled_by = ?', [citizen_id, citizen_id], 50);
 
     this._send(ws, 'XM', { orders, ts: Date.now() });
   }
@@ -780,11 +795,7 @@ class ExchangeEngine {
   handleViewMyListings(ws, msg) {
     try {
       const seller_id = msg.sovereign_id || ws._sovereignId;
-      const orders    = this._db._db.prepare(`
-        SELECT * FROM sov_exchange_orders
-        WHERE seller_id = ?
-        ORDER BY updated_at DESC LIMIT 100
-      `).all(seller_id);
+      const orders    = this._ownOrders('seller_id = ?', [seller_id], 100);   // D66: listings made on any node
       global.sovLog.debug(`[Exchange] VIEW_MY_LISTINGS for ${seller_id} → ${orders.length}`);
       this._send(ws, 'XY', { orders, ts: Date.now() });
     } catch (err) {
@@ -799,11 +810,7 @@ class ExchangeEngine {
   handleViewMyFills(ws, msg) {
     try {
       const buyer_id = msg.sovereign_id || ws._sovereignId;
-      const orders   = this._db._db.prepare(`
-        SELECT * FROM sov_exchange_orders
-        WHERE filled_by = ?
-        ORDER BY updated_at DESC LIMIT 100
-      `).all(buyer_id);
+      const orders   = this._ownOrders('filled_by = ?', [buyer_id], 100);     // D66: fills of orders listed on any node
       global.sovLog.debug(`[Exchange] VIEW_MY_FILLS for ${buyer_id} → ${orders.length}`);
       this._send(ws, 'XW', { orders, ts: Date.now() });
     } catch (err) {

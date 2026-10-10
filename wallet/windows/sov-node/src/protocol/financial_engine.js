@@ -28,6 +28,7 @@
 
 const crypto = require('crypto');
 const nacl   = require('tweetnacl');
+const ownerAuth = require('./owner_auth');   // 1.4.95: the citizen's signed request travels with their money ops
 
 // Maximum optimistic concurrency retries for balance operations
 const MAX_RETRIES = 3;
@@ -366,6 +367,7 @@ class FinancialEngine {
     // transfer), applied atomically on every node. Before, peers never debited the owner at all.
     const res = await this._db.ledger.commitOwnerOp({
       kind: 'vault_lock', ref: vault_id, owner: { acct: owner_id },
+      auth: ownerAuth.fromAppRequest(msg),     // 1.4.95: every node checks the citizen's own signed request
       moves: [{ acct: owner_id, d: -amount_seeds }],
       holds: [{ id: 'vault:' + vault_id, d: amount_seeds }],
     });

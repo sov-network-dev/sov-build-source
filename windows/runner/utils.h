@@ -8,6 +8,11 @@
 // it for both the runner and the Flutter library.
 void CreateAndAttachConsole();
 
+// D67 (v1.2.30): after AttachConsole(ATTACH_PARENT_PROCESS), point stdout/stderr at that console when
+// they are not already redirected (a GUI-subsystem exe starts with no usable std handles, so a CLI
+// command typed at a prompt printed nothing; piped output was unaffected and is left alone).
+void ReopenStdStreamsToAttachedConsole();
+
 // Takes a null-terminated wchar_t* encoded in UTF-16 and returns a std::string
 // encoded in UTF-8. Returns an empty std::string on failure.
 std::string Utf8FromUtf16(const wchar_t* utf16_string);
