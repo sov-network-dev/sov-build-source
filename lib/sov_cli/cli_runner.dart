@@ -926,6 +926,7 @@ class SovCLI {
     final env = Map<String, String>.from(Platform.environment)
       ..['OPERATOR_SOVEREIGN_ID'] = sovId
       ..['SOV_NO_TRAY'] = '1'
+      ..['SOV_NODE_ROLE'] = 'serving'   // node 1.4.96: desktop nodes serve, never vote on payments
       ..['SOV_DATA_DIR'] = dataDir;
     try {
       final proc = await Process.start(nodeBin, [entry],

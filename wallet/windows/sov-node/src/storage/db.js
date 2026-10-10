@@ -1534,8 +1534,11 @@ class NodeDB {
         first_seen = COALESCE(sov_validator_seen.first_seen, excluded.first_seen),
         pubkey = COALESCE(excluded.pubkey, sov_validator_seen.pubkey)`).run(nodeId, now, now, pubHex || null);
     // The first time this node has a validator peer, it becomes a validator itself (ledger certificates
-    // must then count it: an origin may not leave it out of the set).
-    this._db.prepare("INSERT OR IGNORE INTO sov_ledger_meta (k, v) VALUES ('self_validator_since', ?)").run(String(now));
+    // must then count it: an origin may not leave it out of the set) — unless it is a SERVING node
+    // (1.4.96), which never votes and so must never demand to be included.
+    if (global.sovNodeRole !== 'serving') {
+      this._db.prepare("INSERT OR IGNORE INTO sov_ledger_meta (k, v) VALUES ('self_validator_since', ?)").run(String(now));
+    }
   }
 
   /** 1.4.94: the public key of an admitted validator this node knows (null if unknown). */

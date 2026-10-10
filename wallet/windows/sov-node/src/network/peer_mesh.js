@@ -72,6 +72,14 @@ const NETWORK_MASTER_PUBLIC_KEY_HEX =
 function _hostOf(a) {
   return String(a || '').replace(/^wss?:\/\//, '').replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase();
 }
+// 1.4.96: a node is either a VOTING validator (server operators; the default) or a SERVING node (the
+// desktop app's opt-in node): it relays, serves citizens and keeps the ledger, but its approval does not
+// count toward a payment and nobody waits for it. A home PC that goes offline can then never freeze
+// payments (the 2026-10-09 outage: two demo desktops had become voting operators, then went offline).
+// Declared in PEER_HELLO and signed with the identity key; every node records it the same way.
+const NODE_ROLE = process.env.SOV_NODE_ROLE === 'serving' ? 'serving' : 'voting';
+if (typeof global !== 'undefined') global.sovNodeRole = NODE_ROLE;
+
 class PeerMesh {
 
   constructor(identity, network, db, relayPool) {
@@ -170,7 +178,10 @@ class PeerMesh {
     try {
       const peer = this._peers.get(nodeId);
       const pub = peer && peer.publicKey ? String(peer.publicKey).toLowerCase() : null;
-      if (this._db && this._db.recordValidatorSeen) this._db.recordValidatorSeen(nodeId, pub);
+      // 1.4.96: only a VOTING peer becomes a validator here. A serving node is never recorded, so no
+      // certificate ever has to include it and its absence can never stall a payment.
+      const voting = !(peer && peer.ws && peer.ws._peerRole === 'serving');
+      if (voting && this._db && this._db.recordValidatorSeen) this._db.recordValidatorSeen(nodeId, pub);
     } catch (_) {}
     const cbs = this._admittedCbs || [];
     if (!cbs.length) return;
@@ -232,6 +243,12 @@ class PeerMesh {
   // never had a second node may.
   everHadVerifiedPeer() {
     try { return !!(this._db && this._db.validatorsSeenSince(0, this._identity.nodeId) > 0); } catch (_) { return false; }
+  }
+
+  /** 1.4.96: 'voting' | 'serving' as the peer declared (and signed) at its HELLO; null if not connected. */
+  peerRole(nodeId) {
+    const p = this._peers.get(nodeId);
+    return p && p.ws ? (p.ws._peerRole || 'voting') : null;
   }
 
   activePeers() {
@@ -485,6 +502,9 @@ class PeerMesh {
       circuit_relay:   true,
       link_pub:        linkPub,
       link_sig:        linkSig,
+      // 1.4.96: voting validator or serving node, signed so it cannot be flipped in transit.
+      node_role:       NODE_ROLE,
+      role_sig:        this._identity.signMessage(Buffer.from(`SOV-ROLE-v1|${nodeId}|${timestamp}|${NODE_ROLE}`)).toString('hex'),
     };
 
     return payload; // PEER_HELLO is not signed with node key — it IS the handshake
@@ -695,6 +715,22 @@ class PeerMesh {
       ws.close(4009, 'HELLO_LINK_KEY_REQUIRED');
       return;
     }
+    // ── Check 8 (1.4.96): the node's role, signed by the identity key just proven ──
+    // Required: a HELLO whose role was stripped or altered is refused rather than defaulted, because
+    // treating a serving node as voting would bring back the outage this role exists to prevent.
+    const { node_role, role_sig } = msg;
+    let _roleOk = false;
+    try {
+      _roleOk = (node_role === 'voting' || node_role === 'serving') && NodeIdentity.verify(
+        Buffer.from(`SOV-ROLE-v1|${node_id}|${timestamp}|${node_role}`),
+        Buffer.from(String(role_sig || ''), 'hex'), pubKeyBytes);
+    } catch (_) { _roleOk = false; }
+    if (!_roleOk) {
+      global.sovLog.info(`Peer HELLO rejected: no valid node role — ${node_id.slice(0, 16)} (pre-1.4.96 software?)`);
+      ws.close(4010, 'HELLO_ROLE_REQUIRED');
+      return;
+    }
+    ws._peerRole = node_role;
     if (!ws._linkKeys) ws._linkKeys = nacl.box.keyPair();   // inbound: our reply HELLO carries it
     ws._linkShared = nacl.box.before(new Uint8Array(Buffer.from(link_pub, 'hex')), ws._linkKeys.secretKey);
 

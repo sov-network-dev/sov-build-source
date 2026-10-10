@@ -270,9 +270,15 @@ class Ledger {
   _currentVset() {
     const ids = new Set([this.nodeId]);
     try { for (const v of this._db.validatorsActiveAt(Date.now() + 61 * 1000, this.nodeId)) ids.add(v); } catch (_) {}
-    for (const p of this._mesh.activePeers()) { const id = p.ws && p.ws._nodeId; if (id) ids.add(String(id).toLowerCase()); }
-    return [...ids];
+    for (const p of this._mesh.activePeers()) {
+      if (p.ws && p.ws._peerRole === 'serving') continue;          // 1.4.96: serving nodes never vote
+      const id = p.ws && p.ws._nodeId; if (id) ids.add(String(id).toLowerCase());
+    }
+    return [...ids];                       // always contains this node: the origin is in its own certificate
   }
+
+  /** 1.4.96: is THIS node a voting validator (server) or a serving node (desktop app)? */
+  _selfVoting() { return global.sovNodeRole !== 'serving'; }
 
   _opOf(nodeId) { return (this._db.operatorOfNode ? this._db.operatorOfNode(nodeId) : '') || ('node:' + nodeId); }
 
@@ -283,7 +289,12 @@ class Ledger {
     const selfGrant = cert.signGrant(this._identity, op);
 
     const vset = this._currentVset();
-    const N = vset.length;
+    // 1.4.96: the majority is over VOTING validators only. A serving origin is still in the certificate
+    // (it must be — it is the origin) but its own grant does not count and it does not shrink the bar.
+    const selfVoting = this._selfVoting();
+    const voting = selfVoting ? vset : vset.filter(v => v !== this.nodeId);
+    const votingSet = new Set(voting);
+    const N = voting.length;
     const need = Math.floor(N / 2) + 1;
     // D62: a majority of OPERATORS as well as of nodes — one person's many nodes are one weight.
     // Only operators the registry has actually resolved count; a not-yet-propagated peer (a 'node:'
@@ -291,19 +302,20 @@ class Ledger {
     // single-operator bootstrap) there is no operator constraint — node-majority is the model until a
     // second independent operator exists (SOV_LEDGER_V2_DESIGN §5).
     const resolvedOp = (v) => { const o = this._opOf(v).toUpperCase(); return o.startsWith('NODE:') ? null : o; };
-    const vsetOps = new Set(vset.map(resolvedOp).filter(Boolean));
+    const vsetOps = new Set(voting.map(resolvedOp).filter(Boolean));
     const needOps = vsetOps.size >= 2 ? Math.floor(vsetOps.size / 2) + 1 : 0;
-    const live = this._mesh.activePeers().length;
-    if (need <= 1) {
+    const live = this._mesh.activePeers().filter(p => !(p.ws && p.ws._peerRole === 'serving')).length;
+    if (N === 0) return Promise.resolve({ ok: false, error: 'QUORUM_UNAVAILABLE' });   // serving node, no voting peer
+    if (selfVoting && need <= 1) {
       if (this._mesh.everHadVerifiedPeer && this._mesh.everHadVerifiedPeer()) {
         return Promise.resolve({ ok: false, error: 'QUORUM_UNAVAILABLE' });
       }
       return Promise.resolve({ ok: true, vset, grants: [selfGrant] });     // never had a second node
     }
-    if (1 + live < need) return Promise.resolve({ ok: false, error: 'QUORUM_UNAVAILABLE' });
+    if ((selfVoting ? 1 : 0) + live < need) return Promise.resolve({ ok: false, error: 'QUORUM_UNAVAILABLE' });
 
     return new Promise((resolve) => {
-      const grants = new Map([[this.nodeId, selfGrant]]);
+      const grants = new Map(selfVoting ? [[this.nodeId, selfGrant]] : []);
       const denies = [];
       let done = false;
       const enough = () => {
@@ -322,10 +334,11 @@ class Ledger {
       this._waiters.set(op.op_id, {
         op,
         onReply: (msg) => {
+          if (!votingSet.has(String(msg.voter).toLowerCase())) return;   // 1.4.96: only voting validators count
           if (msg.granted) grants.set(msg.voter, msg.grant);
           else denies.push(msg.reason || 'DENIED');
           if (enough()) return finish(ok());
-          if (grants.size + Math.max(0, N - 1 - (grants.size - 1) - denies.length) < need) {
+          if (N - denies.length < need) {   // the undecided can no longer make a majority
             finish({ ok: false, error: 'QUORUM_DENIED:' + denies.join(',') });
           }
         },
@@ -408,6 +421,9 @@ class Ledger {
         activeAt: (ts) => (this._db.validatorsActiveAt ? this._db.validatorsActiveAt(ts, this.nodeId) : []),
         selfActiveSince: this._db.selfValidatorSince ? this._db.selfValidatorSince() : 0,
         operatorOf: (n) => this._opOf(n),
+        // 1.4.96: a VOTING validator is one this node recorded as such (serving nodes are never
+        // recorded), or this node itself when it votes. Only these count toward the majority.
+        isVoting: (n) => (n === this.nodeId ? this._selfVoting() : !!(this._db.validatorPub && this._db.validatorPub(n))),
       });
     }
     return null;

@@ -167,6 +167,9 @@ class NodeController {
     final env = Map<String, String>.from(Platform.environment);
     env['OPERATOR_SOVEREIGN_ID'] = sovereignId; // payouts credit THIS wallet
     env['SOV_NO_TRAY'] = '1'; // app owns the tray; node must not add a 2nd (blank) one
+    // Node 1.4.96: the desktop node SERVES (relays, serves citizens, keeps the ledger) but does not vote
+    // on payments, so a PC that is switched off can never freeze the network (the 2026-10-09 outage).
+    env['SOV_NODE_ROLE'] = 'serving';
     if (dataDir != null) env['SOV_DATA_DIR'] = dataDir;
     if (host.isNotEmpty) env['SOV_PUBLIC_HOST'] = host;
     // Tell the node where the network is: the nodes this app has ALREADY found (DHT /

@@ -72,6 +72,7 @@ function grantValid(op, g) {
  *   activeAt(ts) -> [nodeIds]        validators this node knows were active at time ts
  *   selfActiveSince -> ms|0          when this node itself first became a validator (0 = not yet)
  *   operatorOf(nodeId) -> id|''      the operator (enrolled human) behind a node
+ *   isVoting(nodeId) -> bool         1.4.96: a voting validator (servers); serving nodes never count
  * }
  * @returns null if valid, otherwise a reason string.
  */
@@ -90,17 +91,24 @@ function verifyCertificate(op, ctx) {
   for (const v of ctx.activeAt(ts)) if (!vset.has(v)) return 'VALIDATOR_LEFT_OUT';
   if (ctx.selfActiveSince && ts >= ctx.selfActiveSince + 60 * 1000 && !vset.has(ctx.selfId)) return 'VALIDATOR_LEFT_OUT';
 
+  // 1.4.96: the majority is over the VOTING validators in the set. A serving origin (the desktop app's
+  // node) is in the set because it is the origin, but neither its grant nor its seat counts; ids this
+  // node does not know as voting validators count for nothing, as before.
+  const isVoting = ctx.isVoting || (() => true);
+  const counted = new Set([...vset].filter(v => isVoting(v)));
+  if (counted.size === 0) return 'NO_VOTING_VALIDATORS';
+
   // Count only real, known validators' signatures over THIS content.
   const voters = new Set();
   for (const g of c.grants) {
     const v = String(g && g.voter || '').toLowerCase();
-    if (!vset.has(v) || voters.has(v)) continue;
+    if (!counted.has(v) || voters.has(v)) continue;
     const known = v === ctx.selfId ? ctx.selfPub : ctx.knownPub(v);
     if (!known || known.toLowerCase() !== String(g.pub).toLowerCase()) continue;   // unknown key: counts for nothing
     if (!grantValid(op, g)) continue;
     voters.add(v);
   }
-  const needNodes = Math.floor(vset.size / 2) + 1;
+  const needNodes = Math.floor(counted.size / 2) + 1;
   if (voters.size < needNodes) return `NOT_ENOUGH_GRANTS:${voters.size}/${needNodes}`;
 
   // Operator majority (one human, one weight) — but only over operators the receiver has actually
@@ -108,7 +116,7 @@ function verifyCertificate(op, ctx) {
   // and with fewer than 2 resolved operators there is no operator constraint (bootstrap; see
   // SOV_LEDGER_V2_DESIGN §5). This matches the origin's own gather rule so a valid cert is not rejected.
   const resolvedOp = (n) => { const o = (ctx.operatorOf(n) || ('node:' + n)).toUpperCase(); return o.startsWith('NODE:') ? null : o; };
-  const vsetOps = new Set([...vset].map(resolvedOp).filter(Boolean));
+  const vsetOps = new Set([...counted].map(resolvedOp).filter(Boolean));
   if (vsetOps.size >= 2) {
     const grantedOps = new Set([...voters].map(resolvedOp).filter(Boolean));
     const needOps = Math.floor(vsetOps.size / 2) + 1;
