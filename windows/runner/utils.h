@@ -8,10 +8,13 @@
 // it for both the runner and the Flutter library.
 void CreateAndAttachConsole();
 
-// D67 (v1.2.30): after AttachConsole(ATTACH_PARENT_PROCESS), point stdout/stderr at that console when
-// they are not already redirected (a GUI-subsystem exe starts with no usable std handles, so a CLI
-// command typed at a prompt printed nothing; piped output was unaffected and is left alone).
-void ReopenStdStreamsToAttachedConsole();
+// D67: is a standard stream a pipe or a file? Must be asked BEFORE AttachConsole (after it, Windows reports
+// the console for a redirected stream too).
+bool StdHandleIsRedirected(unsigned long which);
+
+// D67: after AttachConsole(ATTACH_PARENT_PROCESS), point every stream that was NOT redirected at the console,
+// so a CLI command typed at a prompt prints; redirected streams keep their pipe or file.
+void ReopenStdStreamsToAttachedConsole(bool out_redirected, bool err_redirected);
 
 // Takes a null-terminated wchar_t* encoded in UTF-16 and returns a std::string
 // encoded in UTF-8. Returns an empty std::string on failure.

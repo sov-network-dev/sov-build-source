@@ -11,8 +11,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command) {
   // Attach to console when present (e.g., 'flutter run') or create a
   // new console when running with a debugger.
+  // D67: sample redirection BEFORE attaching (attaching makes every stream look like the console).
+  const bool out_redirected = StdHandleIsRedirected(STD_OUTPUT_HANDLE);
+  const bool err_redirected = StdHandleIsRedirected(STD_ERROR_HANDLE);
   if (::AttachConsole(ATTACH_PARENT_PROCESS)) {
-    ReopenStdStreamsToAttachedConsole();   // D67: CLI output visible at an interactive prompt
+    ReopenStdStreamsToAttachedConsole(out_redirected, err_redirected);   // CLI output visible at a prompt
   } else if (::IsDebuggerPresent()) {
     CreateAndAttachConsole();
   }

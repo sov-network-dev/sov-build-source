@@ -21,19 +21,29 @@ void CreateAndAttachConsole() {
   }
 }
 
-void ReopenStdStreamsToAttachedConsole() {
-  const auto unredirected = [](DWORD which) {
-    HANDLE h = ::GetStdHandle(which);
-    return h == nullptr || h == INVALID_HANDLE_VALUE || ::GetFileType(h) == FILE_TYPE_UNKNOWN;
-  };
+bool StdHandleIsRedirected(DWORD which) {
+  HANDLE h = ::GetStdHandle(which);
+  if (h == nullptr || h == INVALID_HANDLE_VALUE) return false;
+  const DWORD t = ::GetFileType(h);
+  return t == FILE_TYPE_PIPE || t == FILE_TYPE_DISK;
+}
+
+void ReopenStdStreamsToAttachedConsole(bool out_redirected, bool err_redirected) {
+  // D67: the caller samples redirection BEFORE AttachConsole. After attaching, Windows reports the console
+  // (FILE_TYPE_CHAR) even for a stream that was piped or sent to a file (measured 2026-10-10), so a check made
+  // here cannot tell them apart: v1.2.30 skipped the console case (nothing printed at a prompt), and a later
+  // attempt that reopened it stole the output from pipes and files. A redirected stream is left alone.
   bool changed = false;
   FILE *unused;
-  if (unredirected(STD_OUTPUT_HANDLE) && freopen_s(&unused, "CONOUT$", "w", stdout) == 0) {
+  if (!out_redirected && freopen_s(&unused, "CONOUT$", "w", stdout) == 0) {
     _dup2(_fileno(stdout), 1);
+    // Dart's stdout writes to the Win32 standard handle, not to the C runtime stream: point it here too.
+    ::SetStdHandle(STD_OUTPUT_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stdout))));
     changed = true;
   }
-  if (unredirected(STD_ERROR_HANDLE) && freopen_s(&unused, "CONOUT$", "w", stderr) == 0) {
+  if (!err_redirected && freopen_s(&unused, "CONOUT$", "w", stderr) == 0) {
     _dup2(_fileno(stderr), 2);
+    ::SetStdHandle(STD_ERROR_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stderr))));
     changed = true;
   }
   if (changed) {
