@@ -196,12 +196,29 @@ class JusticeEngine {
       if (why) return 'VERDICT_VOTE_' + why;
       if (v.vote === 'conviction') conv++; else dism++;
     }
+    // 1.4.99 (Gemini review 2026-10-14): the verdict is recounted over EVERY genuine signed vote this node holds
+    // for the case, not only those in the proof. Before, an origin could drop the dismissal votes and convict
+    // with the rest. A vote the origin had not yet seen is counted too: the verdict stands if it still follows
+    // (so a late vote that changes nothing does not split the nodes) and is refused if the outcome changes.
+    let omitted = 0;
+    try {
+      const known = this._db._db.prepare(
+        "SELECT juror_id, vote, vote_auth FROM sov_case_jurors WHERE case_id = ? AND vote != '' AND vote_auth != ''").all(c.case_id);
+      for (const k of known) {
+        if (seen.has(k.juror_id)) continue;
+        if (k.juror_id === c.plaintiff_id || k.juror_id === c.defendant_id) continue;
+        if (k.vote !== 'conviction' && k.vote !== 'dismissal') continue;
+        if (this._signedBy(k.vote_auth, k.juror_id, 'DV', 'JUSTICE_VOTE', (req) => req.case_id === c.case_id && req.vote === k.vote)) continue;
+        seen.add(k.juror_id); omitted++;
+        if (k.vote === 'conviction') conv++; else dism++;
+      }
+    } catch (_) {}
     const n = conv + dism;
     const minJury = parseInt(this._getGovParam('justice_min_jury_size', '3'), 10) || 3;
     if (n < minJury) return 'VERDICT_TOO_FEW_JURORS';
     const needed = Math.ceil(n * parseFloat(this._getGovParam('justice_conviction_threshold', '0.67')));
     const derived = conv >= needed ? 'convicted' : (dism > 0 ? 'dismissed' : null);
-    if (!derived || derived !== p.verdict) return 'VERDICT_DOES_NOT_FOLLOW';
+    if (!derived || derived !== p.verdict) return omitted ? 'VERDICT_OMITS_VOTES' : 'VERDICT_DOES_NOT_FOLLOW';
 
     // Money: only to parties and the listed jurors, within what the verdict permits.
     const jurors = new Set(p.votes.map(v => v.juror_id));
@@ -248,6 +265,11 @@ class JusticeEngine {
       this._send(ws, 'DD', { type: 'JUSTICE_DISPUTE_OPENED', success: false, error: 'CASE_ID_EXISTS' });
       return;
     }
+    // 1.4.99: verify the plaintiff's signed filing here too, so this node never stores or relays one the
+    // citizen did not sign (before, only peers re-checked it).
+    { const why = this._signedBy(ownerAuth.fromAppRequest(msg), plaintiff_id, 'DO', 'DISPUTE_OPEN',
+        this._openFieldsOk({ case_id, defendant_id, amount_seeds: amount_seeds || 0 }));
+      if (why) { this._send(ws, 'DD', { type: 'JUSTICE_DISPUTE_OPENED', success: false, error: 'SIGNATURE_INVALID', reason: why }); return; } }
     // 1.4.90: the bond is an OWNER op — plaintiff -> this case's bond holding, granted by a
     // majority of nodes on the plaintiff's slot and applied on every node (peers used to keep
     // the plaintiff's balance untouched).
@@ -478,6 +500,8 @@ class JusticeEngine {
     // 1.4.97 (D80): the juror's own signed vote is kept and travels — a verdict is proven by these.
     const voteAuth = ownerAuth.fromAppRequest(msg);
     if (!voteAuth) { this._send(ws, 'DV', { type: 'JUSTICE_VOTE_RECORDED', success: false, error: 'SIGNATURE_REQUIRED' }); return; }
+    { const why = this._signedBy(voteAuth, juror_id, 'DV', 'JUSTICE_VOTE', (req) => req.case_id === case_id && req.vote === vote);   // 1.4.99
+      if (why) { this._send(ws, 'DV', { type: 'JUSTICE_VOTE_RECORDED', success: false, error: 'SIGNATURE_INVALID', reason: why }); return; } }
     const now = Date.now();
     this._db._db.prepare(`
       UPDATE sov_case_jurors SET status = 'voted', vote = ?, voted_at = ?, vote_auth = ? WHERE case_id = ? AND juror_id = ?

@@ -362,7 +362,11 @@ class GovernanceEngine {
     // 1.4.97: the citizen's own signed creation request travels with a poll / petition so every node
     // (including one catching up later via state sync) can verify who proposed it.
     for (const sql of ["ALTER TABLE sov_polls ADD COLUMN create_auth TEXT NOT NULL DEFAULT ''",
-                       "ALTER TABLE sov_petitions ADD COLUMN create_auth TEXT NOT NULL DEFAULT ''"]) {
+                       "ALTER TABLE sov_petitions ADD COLUMN create_auth TEXT NOT NULL DEFAULT ''",
+                       // 1.4.99: each vote / signature keeps its citizen's signed request, so a node that was
+                       // away is caught up with proof, not on a peer's word (Gemini review 2026-10-14).
+                       "ALTER TABLE sov_poll_votes ADD COLUMN vote_auth TEXT NOT NULL DEFAULT ''",
+                       "ALTER TABLE sov_petition_signatures ADD COLUMN sig_auth TEXT NOT NULL DEFAULT ''"]) {
       try { this._db._db.exec(sql); } catch (_) { /* already there */ }
     }
   }
@@ -446,6 +450,9 @@ class GovernanceEngine {
     if (!this._isEnrolled(citizen_id)) { this._send(ws, 'PJ', { success: false, error: 'NOT_ENROLLED' }); return; }
     const createAuth = ownerAuth.fromAppRequest(msg);
     if (!createAuth) { this._send(ws, 'PJ', { success: false, error: 'SIGNATURE_REQUIRED' }); return; }
+    // 1.4.99: verify it here too, so this node never stores or relays a request the citizen did not sign.
+    { const why = this._citizenSigned(createAuth, citizen_id, 'PC', 'POLL_CREATE', null);
+      if (why) { this._send(ws, 'PJ', { success: false, error: 'SIGNATURE_INVALID', reason: why }); return; } }
 
     if (!poll_id || !tag || !title || !options || !Array.isArray(options) || options.length < 2) {
       this._send(ws, 'PJ', { success: false, error: 'MISSING_FIELDS' });
@@ -549,6 +556,8 @@ class GovernanceEngine {
     // 1.4.97 (D82): the voter's own signed request travels with the vote, so no node can invent one.
     const voteAuth = ownerAuth.fromAppRequest(msg);
     if (!voteAuth) { this._send(ws, 'PQ', { success: false, error: 'SIGNATURE_REQUIRED' }); return; }
+    { const why = this._citizenSigned(voteAuth, voter_id, 'PV', 'POLL_VOTE', null);   // 1.4.99
+      if (why) { this._send(ws, 'PQ', { success: false, error: 'SIGNATURE_INVALID', reason: why }); return; } }
 
     if (!poll_id || !option) {
       this._send(ws, 'PQ', { success: false, error: 'MISSING_FIELDS' });
@@ -577,9 +586,9 @@ class GovernanceEngine {
 
     // INSERT OR IGNORE — one vote per citizen
     const result = this._db._db.prepare(`
-      INSERT OR IGNORE INTO sov_poll_votes (poll_id, voter_id, option_text, voted_at)
-      VALUES (?, ?, ?, ?)
-    `).run(poll_id, voter_id, option, Date.now());
+      INSERT OR IGNORE INTO sov_poll_votes (poll_id, voter_id, option_text, voted_at, vote_auth)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(poll_id, voter_id, option, Date.now(), (typeof voteAuth === 'string' ? voteAuth : JSON.stringify(voteAuth)));
 
     if (result.changes === 0) {
       this._send(ws, 'PQ', { success: false, error: 'ALREADY_VOTED' });
@@ -651,6 +660,8 @@ class GovernanceEngine {
     if (!this._isEnrolled(citizen_id)) { this._send(ws, 'ED', { type: 'PETITION_RESULT', success: false, error: 'NOT_ENROLLED' }); return; }
     const createAuth = ownerAuth.fromAppRequest(msg);
     if (!createAuth) { this._send(ws, 'ED', { type: 'PETITION_RESULT', success: false, error: 'SIGNATURE_REQUIRED' }); return; }
+    { const why = this._citizenSigned(createAuth, citizen_id, 'EC', 'PETITION_CREATE', null);   // 1.4.99
+      if (why) { this._send(ws, 'ED', { type: 'PETITION_RESULT', success: false, error: 'SIGNATURE_INVALID', reason: why }); return; } }
 
     if (!petition_id || !param_key || !title) {
       this._send(ws, 'ED', { type: 'PETITION_RESULT', success: false, error: 'MISSING_FIELDS' });
@@ -699,6 +710,8 @@ class GovernanceEngine {
     if (!this._isEnrolled(signer_id)) { this._send(ws, 'ES', { type: 'PETITION_SIGN_RESULT', success: false, error: 'NOT_ENROLLED' }); return; }
     const signAuth = ownerAuth.fromAppRequest(msg);
     if (!signAuth) { this._send(ws, 'ES', { type: 'PETITION_SIGN_RESULT', success: false, error: 'SIGNATURE_REQUIRED' }); return; }
+    { const why = this._citizenSigned(signAuth, signer_id, 'ES', 'PETITION_SIGN', null);   // 1.4.99
+      if (why) { this._send(ws, 'ES', { type: 'PETITION_SIGN_RESULT', success: false, error: 'SIGNATURE_INVALID', reason: why }); return; } }
 
     if (!petition_id) return;
 
@@ -714,9 +727,9 @@ class GovernanceEngine {
 
     // INSERT OR IGNORE — one signature per citizen
     const result = this._db._db.prepare(`
-      INSERT OR IGNORE INTO sov_petition_signatures (petition_id, signer_id, signed_at)
-      VALUES (?, ?, ?)
-    `).run(petition_id, signer_id, Date.now());
+      INSERT OR IGNORE INTO sov_petition_signatures (petition_id, signer_id, signed_at, sig_auth)
+      VALUES (?, ?, ?, ?)
+    `).run(petition_id, signer_id, Date.now(), (typeof signAuth === 'string' ? signAuth : JSON.stringify(signAuth)));
 
     if (result.changes === 0) {
       this._send(ws, 'ES', { type: 'PETITION_SIGN_RESULT', success: false, error: 'ALREADY_SIGNED' });
@@ -1097,8 +1110,8 @@ class GovernanceEngine {
     if (why) return this._refusePeer(`vote on ${poll_id} by ${String(voter_id).slice(0, 16)}`, why, ws);
 
     const result = this._db._db.prepare(`
-      INSERT OR IGNORE INTO sov_poll_votes (poll_id, voter_id, option_text, voted_at) VALUES (?, ?, ?, ?)
-    `).run(poll_id, voter_id, option, Math.min(Number(voted_at) || Date.now(), Date.now()));
+      INSERT OR IGNORE INTO sov_poll_votes (poll_id, voter_id, option_text, voted_at, vote_auth) VALUES (?, ?, ?, ?, ?)
+    `).run(poll_id, voter_id, option, Math.min(Number(voted_at) || Date.now(), Date.now()), (typeof auth === 'string' ? auth : JSON.stringify(auth)));
 
     if (result.changes > 0) {
       const tally = this._getTally(poll_id);
@@ -1167,9 +1180,9 @@ class GovernanceEngine {
     if (why) return this._refusePeer(`petition signature on ${petition_id}`, why, ws);
 
     const result = this._db._db.prepare(`
-      INSERT OR IGNORE INTO sov_petition_signatures (petition_id, signer_id, signed_at)
-      VALUES (?, ?, ?)
-    `).run(petition_id, signer_id, Math.min(Number(signed_at) || Date.now(), Date.now()));
+      INSERT OR IGNORE INTO sov_petition_signatures (petition_id, signer_id, signed_at, sig_auth)
+      VALUES (?, ?, ?, ?)
+    `).run(petition_id, signer_id, Math.min(Number(signed_at) || Date.now(), Date.now()), (typeof auth === 'string' ? auth : JSON.stringify(auth)));
 
     if (result.changes > 0) {
       this._db._db.prepare(`
@@ -1192,10 +1205,22 @@ class GovernanceEngine {
     // away catches up on them; their signatures still arrive one by one, each verified.
     const openPetitions = this._db._db.prepare(`SELECT * FROM sov_petitions WHERE status = 'open' AND expires_at > ?`).all(Date.now());
 
+    // 1.4.99: and the signed votes / signatures behind them — each re-verified by the receiver.
+    let openVotes = [], openSigs = [];
+    try {
+      openVotes = this._db._db.prepare(`SELECT v.poll_id, v.voter_id, v.option_text, v.voted_at, v.vote_auth
+        FROM sov_poll_votes v JOIN sov_polls p ON p.poll_id = v.poll_id
+        WHERE p.status = 'open' AND v.vote_auth != '' LIMIT 20000`).all();
+      openSigs = this._db._db.prepare(`SELECT s.petition_id, s.signer_id, s.signed_at, s.sig_auth
+        FROM sov_petition_signatures s JOIN sov_petitions t ON t.petition_id = s.petition_id
+        WHERE t.status = 'open' AND t.expires_at > ? AND s.sig_auth != '' LIMIT 20000`).all(Date.now());
+    } catch (_) {}
     this._peerMesh.broadcast('GOVERNANCE_STATE_RESPONSE', {
       params,
       open_polls: openPolls,
       open_petitions: openPetitions,
+      open_votes: openVotes,
+      open_petition_sigs: openSigs,
       node_id: this._identity.nodeId,
     });
   }
@@ -1211,7 +1236,7 @@ class GovernanceEngine {
   //     peers currently report the same value, newer than ours.
   // Before 1.4.97 any single peer could set any key, validated only when it happened to be votable.
   _handleStateResponse(msg, ws) {
-    const { params, open_polls, open_petitions, node_id } = msg || {};
+    const { params, open_polls, open_petitions, open_votes, open_petition_sigs, node_id } = msg || {};
     if (node_id === this._identity.nodeId) return;
 
     const peerId = ws && ws._nodeId ? String(ws._nodeId) : null;
@@ -1255,6 +1280,27 @@ class GovernanceEngine {
           if (this._db._db.prepare('SELECT 1 FROM sov_petitions WHERE petition_id = ?').get(pet.petition_id)) continue;
           const why = this._acceptPeerPetition(pet, ws);
           if (why) this._refusePeer(`synced petition ${pet.petition_id}`, why, ws);
+        } catch (_) {}
+      }
+    }
+    // 1.4.99: catch up on votes and signatures, each through the same signed-request check as a live one.
+    if (Array.isArray(open_votes)) {
+      for (const v of open_votes.slice(0, 20000)) {
+        try {
+          if (!v || !v.poll_id || !v.voter_id) continue;
+          if (this._db._db.prepare('SELECT 1 FROM sov_poll_votes WHERE poll_id = ? AND voter_id = ?').get(v.poll_id, v.voter_id)) continue;
+          this._handlePollVoteBroadcast({ poll_id: v.poll_id, voter_id: v.voter_id, option: v.option_text,
+            voted_at: v.voted_at, auth: v.vote_auth, node_id: 'state-sync' }, ws);
+        } catch (_) {}
+      }
+    }
+    if (Array.isArray(open_petition_sigs)) {
+      for (const g of open_petition_sigs.slice(0, 20000)) {
+        try {
+          if (!g || !g.petition_id || !g.signer_id) continue;
+          if (this._db._db.prepare('SELECT 1 FROM sov_petition_signatures WHERE petition_id = ? AND signer_id = ?').get(g.petition_id, g.signer_id)) continue;
+          this._handlePetitionSigBroadcast({ petition_id: g.petition_id, signer_id: g.signer_id,
+            signed_at: g.signed_at, auth: g.sig_auth, node_id: 'state-sync' }, ws);
         } catch (_) {}
       }
     }
