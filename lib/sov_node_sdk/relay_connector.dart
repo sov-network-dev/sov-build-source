@@ -17,6 +17,7 @@ import 'sov_native_client.dart';
 import 'outbox_manager.dart';
 import 'palm_name_engine.dart';
 import 'node_discovery.dart';
+import 'node_trust.dart';
 import 'package:cryptography/cryptography.dart' as sov_crypto;
 
 /// ═══════════════════════════════════════════════════════════════════════════
@@ -128,6 +129,7 @@ class _RaceWinner {
   final IOWebSocketChannel? wssChannel;
   final int elapsedMs;
   final String targetNodeId; // circuit-relay: non-empty if endpoint is a relay R for node N
+  final String tlsSha256;    // 1.2.34 (D83): SHA-256 of the certificate this connection received
 
   _RaceWinner({
     required this.relayId,
@@ -136,6 +138,7 @@ class _RaceWinner {
     this.wssChannel,
     required this.elapsedMs,
     this.targetNodeId = '',
+    this.tlsSha256 = '',
   });
 
   /// Close this connection — called on loser instances after the winner is set.
@@ -210,6 +213,20 @@ class RelayConnector {
   static int _nowMs() => DateTime.now().millisecondsSinceEpoch + _nodeClockOffsetMs;
   static String  _currentRelayId = '';   // relay_id of the active connection
   static String  _currentTargetNodeId = ''; // circuit-relay: node N this conn bridges to (via relay R), else ''
+  // 1.2.34 (audit D83): which node is really at the other end. The certificate this connection received,
+  // whether the node is the citizen's own pinned node, and nodes refused for failing the identity check
+  // (endpoint -> when; skipped for 10 minutes, so leaving a hostile network heals by itself).
+  static String  _currentTlsSha = '';
+  static bool    _currentIsPinned = false;
+  static final Map<String, int> _identityRefused = {};
+  /// Why the last node was refused ('' if none) — NO_PROOF, CERT_MISMATCH, NOT_TRUSTED, ...
+  static String  lastIdentityRefusal = '';
+  /// 'trusted' (a built-in network server, proven) or 'own-node' (the citizen's pinned node).
+  static String  nodeIdentity = '';
+  static bool _identityRefusedRecently(String endpoint) {
+    final t = _identityRefused[endpoint];
+    return t != null && DateTime.now().millisecondsSinceEpoch - t < 10 * 60 * 1000;
+  }
   // Canonical IP → relay_id map, populated from bundled relay_pool.json.
   // Used to override opaque "node_xxx" gossip IDs so names stay consistent
   // across Relay Pool, Node Status, and Network Dashboard screens.
@@ -1130,6 +1147,9 @@ class RelayConnector {
         }
       }
 
+      // 1.2.34 (D83): leave out nodes that just failed the identity check.
+      entries = entries.where((e) => !_identityRefusedRecently(e.wsUrl)).toList();
+
       if (entries.isNotEmpty) {
         // Sort relay candidates using SHA-256(sovereignId) as a stable seed so
         // each citizen has a deterministic preference ordering. Two devices on the
@@ -1186,6 +1206,10 @@ class RelayConnector {
           _connectionType  = winner.connectionType;
           _currentMode     = ConnectionMode.direct;
           _currentTargetNodeId = winner.targetNodeId; // circuit-relay: bridge to N if set
+          _currentTlsSha   = winner.tlsSha256;
+          _currentIsPinned = myHost != null && myHost.isNotEmpty &&
+              (Uri.tryParse(winner.endpoint)?.host ?? '') == myHost;
+          nodeIdentity     = '';
           _connected       = true;
 
           // Record successful connection in node discovery pool
@@ -1339,6 +1363,7 @@ class RelayConnector {
       RelayEntry relay, DateTime startTime) async {
     try {
       final context = SecurityContext(withTrustedRoots: false);
+      String seenSha = '';
       final socket  = await WebSocket.connect(
         relay.wsUrl,
         customClient: HttpClient(context: context)
@@ -1363,6 +1388,7 @@ class RelayConnector {
             // future v1.3 governance proposal will replace this with strict
             // Ed25519 node-identity pinning — see docs/TRUST_MODEL.md.
             final presented = _fingerprintOf(cert).toLowerCase();
+            seenSha = presented;   // 1.2.34 (D83): checked against the node's signed statement
             if (_trustedFingerprints.isNotEmpty &&
                 !_trustedFingerprints.contains(presented)) {
               debugPrint(
@@ -1371,7 +1397,10 @@ class RelayConnector {
                 'verified at application layer via founder-signed HELLO.',
               );
             }
-            return true; // accept all; trust comes from application-layer signatures
+            // 1.2.34 (D83): the founder-signed HELLO this comment relied on was removed in node 1.4.64.
+            // The replacement: the node's first frame carries a statement signed by its own key naming
+            // THIS certificate (NodeTrust.checkTlsProof), and nothing is sent until it checks out.
+            return true;
           },
       ).timeout(const Duration(seconds: 8));
 
@@ -1389,6 +1418,7 @@ class RelayConnector {
         wssChannel:     channel,
         elapsedMs:      elapsed,
         targetNodeId:   relay.targetNodeId,
+        tlsSha256:      seenSha,
       );
     } catch (e) {
       final label = relay.relayId.isNotEmpty ? relay.relayId : relay.ip;
@@ -1495,6 +1525,17 @@ class RelayConnector {
   // ══════════════════════════════════════════════════════════════════════════
   // MESSAGE LISTENER
   // ══════════════════════════════════════════════════════════════════════════
+  /// 1.2.34 (D83): the node at the other end failed the identity check — drop it and try another.
+  static void _refuseNode(String why) {
+    final ep = _currentEndpoint ?? '';
+    debugPrint('[NODE-ID] refused ${ep.isEmpty ? '(unknown)' : ep}: $why — not a node this app trusts; '
+        'nothing was sent to it');
+    lastIdentityRefusal = why;
+    nodeIdentity = '';
+    if (ep.isNotEmpty) _identityRefused[ep] = DateTime.now().millisecondsSinceEpoch;
+    try { _channel?.sink.close(ws_status.normalClosure); } catch (_) {}   // onDone -> _scheduleReconnect
+  }
+
   static void _setupListener() {
     _channel?.stream.listen(
       (message) {
@@ -1506,6 +1547,7 @@ class RelayConnector {
       },
       onDone: () {
         _connected      = false;
+        nodeIdentity    = '';
         _connectionType = 'none';
         // A node closes with a 4xxx code when it has decided this device may not
         // connect AS THIS CITIZEN. Retrying cannot change that answer, so the
@@ -1515,6 +1557,7 @@ class RelayConnector {
       },
       onError: (_) {
         _connected      = false;
+        nodeIdentity    = '';
         _connectionType = 'none';
         _scheduleReconnect();
       },
@@ -1856,10 +1899,20 @@ class RelayConnector {
       // Relay greeting — respond with HELLO to register in relay's _registry.
       // Without HELLO the relay cannot route incoming messages to this device.
       case 'RELAY_HELLO':
-        _helloAckReceived = false;   // reset so onConnected fires on this new cycle
-        _keyRepublishAttempts = 0;   // new connection cycle — reset mismatch counter
-        _sendHello();                // sends HELLO → fires onConnected immediately
-        _messageController?.add(decoded);
+        // 1.2.34 (audit D83): prove WHICH node this is before sending it anything — no HELLO, no
+        // keys, no request. A node that fails is disconnected and skipped; the next connect races
+        // the others.
+        final channelAtHello = _channel;
+        NodeTrust.checkTlsProof(decoded, _currentTlsSha, pinned: _currentIsPinned).then((why) {
+          if (!identical(channelAtHello, _channel)) return;     // that connection is already gone
+          if (why != null) { _refuseNode(why); return; }
+          nodeIdentity = _currentIsPinned ? 'own-node' : 'trusted';
+          lastIdentityRefusal = '';
+          _helloAckReceived = false;   // reset so onConnected fires on this new cycle
+          _keyRepublishAttempts = 0;   // new connection cycle — reset mismatch counter
+          _sendHello();                // sends HELLO → fires onConnected immediately
+          _messageController?.add(decoded);
+        });
         return;
 
       // HELLO_ACK — relay confirmed it processed our HELLO.
@@ -2768,6 +2821,10 @@ class RelayConnector {
   /// Used for WATCH_ADD, WATCH_REMOVE (session-level, exempt from sig check).
   static void sendRaw(Map<String, dynamic> message) {
     if (!_connected) return;
+    if (nodeIdentity.isEmpty) {             // 1.2.34 (D83): nothing goes to an unproven node
+      debugPrint('[NODE-ID] held ${message['type']}: node identity not proven yet');
+      return;
+    }
     try {
       _addOpCode(message); // dictionary protocol — adds 2-char 'op' alongside 'type'
       final json = jsonEncode(message);
@@ -2829,6 +2886,12 @@ class RelayConnector {
 
   static Future<bool> send(Map<String, dynamic> message) async {
     if (!_connected) return false;
+    // 1.2.34 (D83): nothing goes to a node until it has proven which node it is (its first frame is
+    // checked as soon as it arrives, so this waits a moment at most).
+    for (var i = 0; i < 60 && nodeIdentity.isEmpty && _connected; i++) {
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+    if (nodeIdentity.isEmpty) return false;
     try {
       // Use SharedPreferences as primary source for node_id — same priority as
       // _sendHello().  KeyManager.getSovereignId() can return a stale
@@ -4463,13 +4526,30 @@ class RelayConnector {
   // ══════════════════════════════════════════════════════════════════════════
 
   /// Wire up a raw WebSocket so its messages flow into _messageController.
-  static void _addPoolSocket(WebSocket socket) {
-    _poolSockets.add(socket);
+  static void _addPoolSocket(WebSocket socket, String seenTlsSha) {
+    // 1.2.34 (audit D83): a pool socket joins the pool — and its frames reach the app — only after its
+    // first frame proves it is a trusted node holding this certificate. Before, any server answering
+    // on a pool address could feed responses straight into the app.
+    var verified = false;
     socket.listen(
       (message) {
         try {
           final decoded =
               jsonDecode(message as String) as Map<String, dynamic>;
+          if (!verified) {
+            final t = decoded['type'] ?? decoded['op'];
+            if (t != 'RELAY_HELLO' && t != 'RH') return;
+            NodeTrust.checkTlsProof(decoded, seenTlsSha).then((why) {
+              if (why != null) {
+                debugPrint('[POOL] pool node refused: $why');
+                try { socket.close(); } catch (_) {}
+                return;
+              }
+              verified = true;
+              _poolSockets.add(socket);
+            });
+            return;
+          }
           _messageController?.add(decoded);
         } catch (_) {}
       },
@@ -4486,13 +4566,17 @@ class RelayConnector {
       if (_poolSockets.length >= 3) break; // cap pool at 3 extra relays
       try {
         final context = SecurityContext(withTrustedRoots: false);
+        String seenSha = '';
         final socket = await WebSocket.connect(
           url,
           customClient: HttpClient(context: context)
             ..badCertificateCallback =
-                (X509Certificate cert, String host, int port) => true,
+                (X509Certificate cert, String host, int port) {
+                  seenSha = _fingerprintOf(cert).toLowerCase();   // checked against the node's proof
+                  return true;
+                },
         ).timeout(const Duration(seconds: 8));
-        _addPoolSocket(socket);
+        _addPoolSocket(socket, seenSha);
         debugPrint('[POOL] Connected pool socket: $url');
       } catch (e) {
         debugPrint('[POOL] Pool connect failed $url: $e');

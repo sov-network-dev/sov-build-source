@@ -127,6 +127,31 @@ class NodeTrust {
     return null;
   }
 
+  /// 1.2.34 (audit D83): is the node at the other end of this TLS connection a node this app trusts?
+  /// [hello] is the node's first frame (RELAY_HELLO); from node 1.4.98 it carries `node_id`,
+  /// `node_pub`, `tls_sha256` and `node_sig` = Ed25519 over `sov-node-tls-v1|<node_id>|<tls_sha256>`.
+  /// [seenTlsSha] is the SHA-256 of the certificate THIS connection actually received. A middleman
+  /// must present his own certificate, so the genuine statement names a different one, and he cannot
+  /// sign a statement for his own with a built-in key. Returns null when the node is accepted,
+  /// otherwise the reason.
+  ///
+  /// [pinned] = a node the citizen chose themself ("My node"): it need not be built in, and its
+  /// certificate is not compared (an own node is often fronted by a tunnel that serves its own), but
+  /// a proof it does send must still be genuine.
+  static Future<String?> checkTlsProof(Map<String, dynamic> hello, String seenTlsSha, {bool pinned = false}) async {
+    final id = '${hello['node_id'] ?? ''}'.toLowerCase();
+    final pub = '${hello['node_pub'] ?? ''}'.toLowerCase();
+    final sig = '${hello['node_sig'] ?? ''}'.toLowerCase();
+    final tls = '${hello['tls_sha256'] ?? ''}'.toLowerCase();
+    if (pub.isEmpty && sig.isEmpty && tls.isEmpty) return pinned ? null : 'NO_PROOF';
+    if (!_hex64.hasMatch(pub) || !_hex64.hasMatch(tls) || _sha256Hex(_unhex(pub)) != id) return 'ID_MISMATCH';
+    if (!await _verify(utf8.encode('sov-node-tls-v1|$id|$tls'), sig, pub)) return 'BAD_SIGNATURE';
+    if (pinned) return null;
+    if (seenTlsSha.isEmpty || tls != seenTlsSha.toLowerCase()) return 'CERT_MISMATCH';
+    if (!_anchors.contains(pub)) return 'NOT_TRUSTED';
+    return null;
+  }
+
   @visibleForTesting
   static void resetForTest({Set<String>? anchors}) {
     _learned.clear();

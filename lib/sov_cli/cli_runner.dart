@@ -39,6 +39,7 @@ import '../sov_node_sdk/message_key_manager.dart';
 import '../sov_node_sdk/secure_channels.dart' show SecureChannels;
 import '../sov_node_sdk/transaction_store.dart';
 import '../sov_node_sdk/node_discovery.dart';
+import '../sov_node_sdk/node_trust.dart';
 import '../sov_node_sdk/pin_manager.dart';
 import '../sov_node_sdk/relay_connector.dart' show RelayConnector;
 
@@ -57,11 +58,18 @@ const int _kSeedsPerSov = 1000000;
 //
 // Returns '' when nothing can be found, which is the honest answer before the
 // first node of the network exists.
+// 1.2.34 (audit D83): a node the user named (--node or custom_node) is their own choice — it need not
+// be a built-in network server. A DISCOVERED node must prove it is one before anything is sent.
+final Set<String> _explicitNodeUrls = {};
+
 Future<String> _resolveNodeUrl(
     Map<String, dynamic> opts, SharedPreferences prefs) async {
   final explicit =
       (opts['node'] as String?) ?? prefs.getString('custom_node');
-  if (explicit != null && explicit.trim().isNotEmpty) return explicit.trim();
+  if (explicit != null && explicit.trim().isNotEmpty) {
+    _explicitNodeUrls.add(explicit.trim());
+    return explicit.trim();
+  }
 
   await NodeDiscovery.init();
   var pool = NodeDiscovery.all;
@@ -1681,6 +1689,7 @@ class _CliWS {
 
   Future<void> connect(String url, SharedPreferences prefs) async {
     final orig = HttpOverrides.current;
+    _TrustAll.lastSeenSha = '';
     HttpOverrides.global = _TrustAll();
     try {
       _ws = await WebSocket.connect(url).timeout(const Duration(seconds: 10));
@@ -1703,7 +1712,17 @@ class _CliWS {
     );
 
     // Wait for RELAY_HELLO (node greeting)
-    await _waitFor(['RELAY_HELLO', 'RH'], timeoutSecs: 8);
+    final hello = await _waitFor(['RELAY_HELLO', 'RH'], timeoutSecs: 8);
+
+    // 1.2.34 (audit D83): prove which node this is before sending it anything.
+    final host = Uri.tryParse(url)?.host ?? '';
+    final pinned = _explicitNodeUrls.contains(url) || host == '127.0.0.1' || host == 'localhost';
+    final why = await NodeTrust.checkTlsProof(hello ?? const <String, dynamic>{}, _TrustAll.lastSeenSha,
+        pinned: pinned);
+    if (why != null) {
+      await close();
+      throw Exception('NODE_IDENTITY_$why: $url is not a node this app trusts — nothing was sent to it');
+    }
 
     // Send signed HELLO
     await _sendHello(prefs);
@@ -1958,10 +1977,15 @@ class _CliWS {
 /// Bypasses TLS certificate checks so the CLI can connect to nodes with
 /// self-signed certificates (same as the GUI's behaviour).
 class _TrustAll extends HttpOverrides {
+  /// 1.2.34 (D83): SHA-256 of the certificate the last connection received — checked against the
+  /// node's signed statement in its first frame.
+  static String lastSeenSha = '';
   @override
   HttpClient createHttpClient(SecurityContext? context) {
     return super.createHttpClient(context)
-      ..badCertificateCallback =
-          (X509Certificate cert, String host, int port) => true;
+      ..badCertificateCallback = (X509Certificate cert, String host, int port) {
+        lastSeenSha = sha256.convert(cert.der).toString();
+        return true;
+      };
   }
 }

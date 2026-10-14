@@ -775,6 +775,12 @@ class CitizenGateway {
         cert: fs.readFileSync(certFile),
         key:  fs.readFileSync(keyFile),
       });
+      // 1.4.98 (audit D83): a signed statement that THIS node's key serves THIS certificate. The app
+      // checks it against the certificate it actually received, so a middleman — who must present
+      // his own certificate — cannot pass himself off as this node: he cannot sign for his
+      // certificate without this node's key, and this node's statement names a different one.
+      try { this._tlsProof = this._makeTlsProof(fs.readFileSync(certFile)); }
+      catch (e) { global.sovLog.warn(`      TLS identity proof unavailable: ${e.message}`); this._tlsProof = null; }
       this._server = httpsServer;
       // V6 hardening (2026-05-21): cap WebSocket frame size at 1 MB. Without
       // this, a single oversized frame can OOM the node. Patch log claimed
@@ -800,6 +806,22 @@ class CitizenGateway {
   }
 
   // ── First-run self-signed TLS ───────────────────────────────────────────────
+  /** 1.4.98 (D83): { node_id, node_pub, tls_sha256, node_sig } over `sov-node-tls-v1|<node_id>|<tls_sha256>`,
+   *  tls_sha256 = SHA-256 of the DER certificate this gateway serves (the first one in the file). */
+  _makeTlsProof(pemBuf) {
+    const crypto = require('crypto');
+    const der = new crypto.X509Certificate(pemBuf).raw;
+    const tlsSha = crypto.createHash('sha256').update(der).digest('hex');
+    const nodeId = this._identity.nodeId;
+    const sig = this._identity.sign(Buffer.from(`sov-node-tls-v1|${nodeId}|${tlsSha}`, 'utf8'));
+    return {
+      node_id: nodeId,
+      node_pub: Buffer.from(this._identity.publicKey).toString('hex'),
+      tls_sha256: tlsSha,
+      node_sig: Buffer.from(sig).toString('hex'),
+    };
+  }
+
   _ensureSelfSignedCert(dataDir, certFile, keyFile) {
     if (fs.existsSync(certFile) && fs.existsSync(keyFile)) return;
     const forge = require('node-forge');
@@ -898,7 +920,7 @@ class CitizenGateway {
 
     // Send greeting — old relay_connector.dart sends HELLO only when it receives RELAY_HELLO.
     // Without this, the app waits forever and HELLO_TIMEOUT fires on every connection → "Offline".
-    ws.send(JSON.stringify({ type: 'RELAY_HELLO', op: 'RH', ts: Date.now() }));
+    ws.send(JSON.stringify(Object.assign({ type: 'RELAY_HELLO', op: 'RH', ts: Date.now() }, this._tlsProof || {})));
 
     // Reap a connection that opened but never sent a HELLO/ENROLL within 30s.
     // (30s, not less: an enrollment connection's ENROLL_REQUEST — which clears
