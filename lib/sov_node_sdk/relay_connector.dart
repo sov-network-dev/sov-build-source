@@ -1638,6 +1638,11 @@ class RelayConnector {
           }
         }
         _lastPresentedPublicKey = pubKeyHex;
+        // 1.2.33 (audit D86): sign the messaging key itself, so no node can ever swap it.
+        String? keySig;
+        if (sig != null && msgPubKeyHex.isNotEmpty) {
+          try { keySig = await KeyManager.signChallenge('sov-msgkey-v1|$sovId|${msgPubKeyHex.toLowerCase()}|$ts'); } catch (_) {}
+        }
         sendRaw({
           'type':                 'HELLO',
           'sovereign_id':         sovId,
@@ -1646,6 +1651,7 @@ class RelayConnector {
           if (sig != null) 'signature': sig,
           if (sig != null) 'timestamp': ts,
           'messaging_public_key': msgPubKeyHex,
+          if (keySig != null) 'messaging_key_sig': keySig,
           'version':              '1.0.0',
         });
         debugPrint('[RELAY TX] HELLO (key republish) as $sovId'
@@ -1714,6 +1720,11 @@ class RelayConnector {
       }
 
       _lastPresentedPublicKey = pubKeyHex;
+      // 1.2.33 (audit D86): sign the messaging key itself, so no node can ever swap it.
+      String? helloKeySig;
+      if (helloSignature != null && msgPubKeyHex.isNotEmpty) {
+        try { helloKeySig = await KeyManager.signChallenge('sov-msgkey-v1|$sovId|${msgPubKeyHex.toLowerCase()}|$helloTimestamp'); } catch (_) {}
+      }
       sendRaw({
         'type':                  'HELLO',
         'sovereign_id':          sovId,
@@ -1724,6 +1735,7 @@ class RelayConnector {
         if (helloSignature != null) 'signature':  helloSignature,
         if (helloSignature != null) 'timestamp':  helloTimestamp,
         'messaging_public_key':  msgPubKeyHex,
+        if (helloKeySig != null) 'messaging_key_sig': helloKeySig,
         if (storedPalmName.isNotEmpty) 'palm_name': storedPalmName,
         // Circuit-relay: when connected via a relay R, tell R which NAT'd node N to
         // bridge this session to. Empty for normal direct connections.

@@ -239,7 +239,12 @@ const CONSENSUS_TABLES = [
   'sov_groups','sov_group_members',   // sov_group_messages: never stored or synced (king, 2026-10-03)
   'sov_academy_articles','sov_academy_upvotes','sov_forum_posts','sov_forum_replies',
   'sov_message_reactions','sov_platforms','sov_messaging_keys',
-  'sov_reputation','sov_polls','sov_poll_votes','sov_petitions','sov_petition_signatures',
+  'sov_reputation',
+  // 1.4.97 (D85): sov_polls / sov_poll_votes / sov_petitions / sov_petition_signatures are NO LONGER
+  // replicated here as raw rows. A peer could inject a poll with quorum 0 and votes nobody cast, which
+  // this node's own timer would then close and APPLY. They travel only through governance_engine.js,
+  // where every poll, vote, petition and signature carries the citizen's own signed request and is
+  // re-verified against the enrolled key (D79/D82).
   'sov_value_proposals','sov_vaults','sov_vault_claims','sov_inheritance_escrow',
   'sov_profiles',
   'sov_certifications',   // 1.4.93 (D16): passed certifications, append-only
@@ -778,6 +783,9 @@ class NodeDB {
     // EARNED nodes run a given root to decide whether a joining node's software is
     // recognised — this is the integrity anchor that replaced the founder key.
     try { this._db.prepare("ALTER TABLE sov_operator_registry ADD COLUMN source_root TEXT NOT NULL DEFAULT ''").run(); } catch (_) {}
+    // 1.4.97 (D86): a messaging key carries the citizen's own signature over it, so no peer can swap it.
+    try { this._db.prepare("ALTER TABLE sov_messaging_keys ADD COLUMN key_sig TEXT NOT NULL DEFAULT ''").run(); } catch (_) {}
+    try { this._db.prepare("ALTER TABLE sov_messaging_keys ADD COLUMN key_ts INTEGER NOT NULL DEFAULT 0").run(); } catch (_) {}
 
     // Seed default governance parameters
     this._seedGovernanceDefaults();
@@ -1423,20 +1431,52 @@ class NodeDB {
 
   // ── Messaging keys ─────────────────────────────────────────────────────────
 
-  setMessagingPublicKey(sovereignId, x25519PubHex) {
+  setMessagingPublicKey(sovereignId, x25519PubHex, keySig = '', keyTs = 0) {
     this._db.prepare(`
-      INSERT OR REPLACE INTO sov_messaging_keys (sovereign_id, x25519_pub_hex, updated_at)
-      VALUES (?, ?, ?)
-    `).run(sovereignId, x25519PubHex, Date.now());
+      INSERT OR REPLACE INTO sov_messaging_keys (sovereign_id, x25519_pub_hex, updated_at, key_sig, key_ts)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(sovereignId, x25519PubHex, Date.now(), String(keySig || ''), Number(keyTs) || 0);
   }
 
-  // 1.4.92: a key pushed by a peer (MESSAGING_KEY_PUBLISHED) — newest wins, as in state sync.
-  upsertMessagingKeyIfNewer(sovereignId, x25519PubHex, updatedAt) {
-    return this._db.prepare(
-      'INSERT INTO sov_messaging_keys (sovereign_id, x25519_pub_hex, updated_at) VALUES (?, ?, ?) ' +
-      'ON CONFLICT(sovereign_id) DO UPDATE SET x25519_pub_hex = excluded.x25519_pub_hex, updated_at = excluded.updated_at ' +
-      'WHERE excluded.updated_at > sov_messaging_keys.updated_at'
-    ).run(sovereignId, x25519PubHex, updatedAt).changes;
+  // 1.4.97 (D86): the citizen's own Ed25519 signature over their messaging key (app 1.2.33+):
+  //   sign(`sov-msgkey-v1|<sovereign_id>|<x25519 hex>|<timestamp>`) with the ENROLLED key.
+  verifyMessagingKeySig(sovereignId, x25519PubHex, keyTs, keySig) {
+    try {
+      if (!keySig || !keyTs) return false;
+      const e = this.getEnrollment(sovereignId);
+      if (!e || !e.public_key_hex) return false;
+      const { NodeIdentity } = require('../security/node_identity');
+      return NodeIdentity.verify(Buffer.from(`sov-msgkey-v1|${sovereignId}|${String(x25519PubHex).toLowerCase()}|${keyTs}`, 'utf8'),
+        Buffer.from(String(keySig), 'hex'), Buffer.from(e.public_key_hex, 'hex'));
+    } catch (_) { return false; }
+  }
+
+  // A key pushed by a PEER (MESSAGING_KEY_PUBLISHED or consensus sync).
+  // 1.4.97 (D86): until now any peer could REPLACE any citizen's key ("newest wins") and have their
+  // incoming messages encrypted to a key the attacker holds. Now:
+  //   - a citizen with no key yet: the first key is accepted (a new citizen's key may arrive before
+  //     their enrolment record);
+  //   - an EXISTING different key is replaced ONLY with the citizen's own valid signature, newer than
+  //     the signature on the key it replaces. Without one, the old key stays.
+  upsertMessagingKeyIfNewer(sovereignId, x25519PubHex, updatedAt, keySig = '', keyTs = 0) {
+    const key = String(x25519PubHex || '').toLowerCase();
+    const cur = this._db.prepare('SELECT x25519_pub_hex, updated_at, key_sig, key_ts FROM sov_messaging_keys WHERE sovereign_id = ?').get(sovereignId);
+    const signed = this.verifyMessagingKeySig(sovereignId, key, keyTs, keySig);
+    if (!cur) {
+      return this._db.prepare('INSERT OR IGNORE INTO sov_messaging_keys (sovereign_id, x25519_pub_hex, updated_at, key_sig, key_ts) VALUES (?, ?, ?, ?, ?)')
+        .run(sovereignId, key, Number(updatedAt) || Date.now(), signed ? String(keySig) : '', signed ? Number(keyTs) : 0).changes;
+    }
+    if (String(cur.x25519_pub_hex).toLowerCase() === key) {
+      // same key: only ever ADD a valid signature the row was missing
+      if (signed && !cur.key_sig) {
+        return this._db.prepare('UPDATE sov_messaging_keys SET key_sig = ?, key_ts = ? WHERE sovereign_id = ?')
+          .run(String(keySig), Number(keyTs), sovereignId).changes;
+      }
+      return 0;
+    }
+    if (!signed || Number(keyTs) <= Number(cur.key_ts || 0) || Number(keyTs) > Date.now() + 5 * 60 * 1000) return 0;
+    return this._db.prepare('UPDATE sov_messaging_keys SET x25519_pub_hex = ?, updated_at = ?, key_sig = ?, key_ts = ? WHERE sovereign_id = ?')
+      .run(key, Number(updatedAt) || Date.now(), String(keySig), Number(keyTs), sovereignId).changes;
   }
 
   getMessagingPublicKey(sovereignId) {
@@ -2097,19 +2137,25 @@ class NodeDB {
     for (const t of CONSENSUS_TABLES) {
       const rows = data[t]; if (!rows || !rows.length) continue;
       try {
-        const cols = Object.keys(rows[0]);
+        // 1.4.97 (D85): column names came from the PEER's JSON and were concatenated into SQL. Only
+        // columns that really exist in this node's own table are used (quoted), never a peer's keys.
+        const known = new Set(this._db.prepare('PRAGMA table_info(' + t + ')').all().map(c => c.name));
+        const cols = Object.keys(rows[0]).filter(c => known.has(c));
+        if (!cols.length) continue;
         // sov_messaging_keys is NOT append-only — a citizen can re-publish their
         // key. INSERT OR IGNORE would keep a stale key forever (nodes diverge),
         // so take the peer's row when its updated_at is newer (latest-wins).
-        if (t === 'sov_messaging_keys' && cols.includes('updated_at')) {
-          const up = this._db.prepare(
-            'INSERT INTO sov_messaging_keys (sovereign_id, x25519_pub_hex, updated_at) VALUES (?, ?, ?) ' +
-            'ON CONFLICT(sovereign_id) DO UPDATE SET x25519_pub_hex=excluded.x25519_pub_hex, updated_at=excluded.updated_at ' +
-            'WHERE excluded.updated_at > sov_messaging_keys.updated_at');
-          for (const r of rows) { try { applied += up.run(r.sovereign_id, r.x25519_pub_hex, r.updated_at || 0).changes; } catch (_) {} }
+        if (t === 'sov_messaging_keys') {
+          // 1.4.97 (D86): same rule as a pushed key — a peer can never swap an existing key unsigned.
+          for (const r of rows) {
+            try {
+              if (!/^SOV-[0-9A-F]{16}$/i.test(String(r.sovereign_id)) || !/^[0-9a-fA-F]{64}$/.test(String(r.x25519_pub_hex))) continue;
+              applied += this.upsertMessagingKeyIfNewer(r.sovereign_id, r.x25519_pub_hex, r.updated_at || 0, r.key_sig || '', r.key_ts || 0);
+            } catch (_) {}
+          }
           continue;
         }
-        const stmt = this._db.prepare('INSERT OR IGNORE INTO ' + t + ' (' + cols.join(',') + ') VALUES (' + cols.map(() => '?').join(',') + ')');
+        const stmt = this._db.prepare('INSERT OR IGNORE INTO ' + t + ' (' + cols.map(c => '"' + c + '"').join(',') + ') VALUES (' + cols.map(() => '?').join(',') + ')');
         for (const r of rows) { try { applied += stmt.run(...cols.map(c => r[c])).changes; } catch (_) {} }
       } catch (_) {}
     }

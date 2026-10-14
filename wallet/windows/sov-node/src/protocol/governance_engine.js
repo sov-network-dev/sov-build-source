@@ -25,6 +25,27 @@
 'use strict';
 
 const crypto = require('crypto');
+const ownerAuth = require('./owner_auth');
+
+// ── 1.4.97 — GOVERNANCE TRUST MODEL (audit D76, D79, D82; 2026-10-14) ───────────────────────────────
+// Until 1.4.96 a peer node could change ANY governance parameter on every other node: the
+// GOVERNANCE_PARAM_ACTIVATED handler wrote whatever value a peer sent (incl. tx_signature_enforce),
+// the 5-minute GOVERNANCE_STATE_RESPONSE sync accepted any non-votable key unchecked and let a future
+// activated_at win for ever, a peer could replicate a poll with quorum 0 or close one early, and
+// relayed votes / petition signatures carried no citizen signature. Now:
+//   1. A parameter changes on THIS node only by a poll THIS node closes from its own tally, or a
+//      petition supermajority THIS node counts — never because a peer says so.
+//   2. Peer state sync only catches a node up: a VOTABLE key, a valid value, reported identically by
+//      a majority (>= 2) of distinct connected VOTING peers (identity = the authenticated link, not a
+//      claimed node_id). Non-votable / security keys are never taken from peers.
+//   3. Every poll, vote, petition and petition signature that travels between nodes carries the
+//      citizen's OWN signed app request (owner_auth 'app' scheme); every node re-verifies it against
+//      the ENROLLED key before accepting it. Only enrolled citizens can vote, sign or propose.
+//   4. A replicated poll's quorum and duration are recomputed / checked locally; a peer's tally and
+//      early "closed" are never trusted.
+const SPEC_BY_KEY = {};          // filled after PARAM_MAP below: param_key -> spec
+const PEER_SYNC_FUTURE_MS = 5 * 60 * 1000;   // a peer may not date an activation more than 5 min ahead
+const PEER_REPORT_TTL_MS  = 15 * 60 * 1000;  // a peer's reported value counts for 15 min
 
 // ── PARAM_MAP ────────────────────────────────────────────────────────────────
 // Every governable parameter. Maps a "constitution tag" → DB key + range.
@@ -143,6 +164,20 @@ const PARAM_MAP = {
       : `threshold ${v} would exceed the live signer count ` +
         `${gp('witness_signer_count', '5')}, so no release could ever reach quorum` },
 };
+for (const spec of Object.values(PARAM_MAP)) SPEC_BY_KEY[spec.key] = spec;
+
+/** 1.4.97: is `value` a legal stored value for this votable spec? (string in, bool out) */
+function specValueOk(spec, value) {
+  if (!spec || value === undefined || value === null) return false;
+  const s = String(value);
+  if (spec.values) return spec.values.includes(s);
+  if (spec.binary) return s === '0' || s === '1';
+  const n = parseFloat(s);
+  if (isNaN(n)) return false;
+  if (spec.min !== undefined && spec.min !== null && n < spec.min) return false;
+  if (spec.max !== undefined && spec.max !== null && n > spec.max) return false;
+  return true;
+}
 
 // Full set of default values for all params — seeded if not already present
 const PARAM_DEFAULTS = [
@@ -212,16 +247,19 @@ class GovernanceEngine {
 
     this._initGovernanceTables();
     this._seedDefaults();
+    // 1.4.97: peer-reported parameter values, per key, per authenticated voting peer (majority sync)
+    this._peerParamReports = new Map();
 
-    // Register peer mesh handlers
-    peerMesh.on('POLL_CREATE_BROADCAST',        (msg) => this._handlePollCreateBroadcast(msg));
-    peerMesh.on('POLL_VOTE_BROADCAST',          (msg) => this._handlePollVoteBroadcast(msg));
-    peerMesh.on('POLL_CLOSE_BROADCAST',         (msg) => this._handlePollCloseBroadcast(msg));
-    peerMesh.on('GOVERNANCE_PARAM_ACTIVATED',   (msg) => this._handleParamActivatedBroadcast(msg));
-    peerMesh.on('PETITION_BROADCAST',           (msg) => this._handlePetitionBroadcast(msg));
-    peerMesh.on('PETITION_SIG_BROADCAST',       (msg) => this._handlePetitionSigBroadcast(msg));
-    peerMesh.on('GOVERNANCE_STATE_REQUEST',     (msg) => this._handleStateRequest(msg));
-    peerMesh.on('GOVERNANCE_STATE_RESPONSE',    (msg) => this._handleStateResponse(msg));
+    // Register peer mesh handlers. 1.4.97: handlers receive the peer's authenticated socket (ws) —
+    // the sender's identity comes from the link, never from a node_id it writes into the message.
+    peerMesh.on('POLL_CREATE_BROADCAST',        (msg, ws) => this._handlePollCreateBroadcast(msg, ws));
+    peerMesh.on('POLL_VOTE_BROADCAST',          (msg, ws) => this._handlePollVoteBroadcast(msg, ws));
+    peerMesh.on('POLL_CLOSE_BROADCAST',         (msg, ws) => this._handlePollCloseBroadcast(msg, ws));
+    peerMesh.on('GOVERNANCE_PARAM_ACTIVATED',   (msg, ws) => this._handleParamActivatedBroadcast(msg, ws));
+    peerMesh.on('PETITION_BROADCAST',           (msg, ws) => this._handlePetitionBroadcast(msg, ws));
+    peerMesh.on('PETITION_SIG_BROADCAST',       (msg, ws) => this._handlePetitionSigBroadcast(msg, ws));
+    peerMesh.on('GOVERNANCE_STATE_REQUEST',     (msg, ws) => this._handleStateRequest(msg, ws));
+    peerMesh.on('GOVERNANCE_STATE_RESPONSE',    (msg, ws) => this._handleStateResponse(msg, ws));
 
     // 60-second poll close check
     setInterval(() => this._checkAndCloseExpiredPolls(), 60 * 1000);
@@ -321,6 +359,58 @@ class GovernanceEngine {
       );
 
     `);
+    // 1.4.97: the citizen's own signed creation request travels with a poll / petition so every node
+    // (including one catching up later via state sync) can verify who proposed it.
+    for (const sql of ["ALTER TABLE sov_polls ADD COLUMN create_auth TEXT NOT NULL DEFAULT ''",
+                       "ALTER TABLE sov_petitions ADD COLUMN create_auth TEXT NOT NULL DEFAULT ''"]) {
+      try { this._db._db.exec(sql); } catch (_) { /* already there */ }
+    }
+  }
+
+  // ── 1.4.97 helpers ────────────────────────────────────────────────────────
+
+  _isEnrolled(sovereignId) {
+    if (!sovereignId) return false;
+    return !!this._db._db.prepare('SELECT 1 FROM sov_enrollments WHERE sovereign_id = ?').get(sovereignId);
+  }
+
+  _enrolledPubKey(sovereignId) {
+    const row = sovereignId
+      ? this._db._db.prepare('SELECT public_key_hex FROM sov_enrollments WHERE sovereign_id = ?').get(sovereignId)
+      : null;
+    return row && row.public_key_hex ? row.public_key_hex : null;
+  }
+
+  /**
+   * Verify that `citizenId` really signed an app request of kind `op` (2-char) / `type`, and that the
+   * request says what the relayed record says (`fieldsOk(req)`). Returns null when good, else a reason.
+   */
+  _citizenSigned(auth, citizenId, op, type, fieldsOk) {
+    if (!auth) return 'AUTH_MISSING';
+    let a = auth;
+    if (typeof a === 'string') { try { a = JSON.parse(a); } catch (_) { return 'AUTH_UNREADABLE'; } }
+    const pub = this._enrolledPubKey(citizenId);
+    if (!pub) return 'NOT_ENROLLED';
+    const v = ownerAuth.verifyAppRequest(a, pub);
+    if (v.reason) return v.reason;
+    if (v.signer !== citizenId) return 'AUTH_WRONG_SIGNER';
+    if (v.req.op !== op && v.req.type !== type) return 'AUTH_WRONG_OPERATION';
+    try { if (fieldsOk && !fieldsOk(v.req)) return 'AUTH_FIELDS_MISMATCH'; } catch (_) { return 'AUTH_FIELDS_MISMATCH'; }
+    return null;
+  }
+
+  _refusePeer(what, reason, ws) {
+    global.sovLog.warn(`[Gov] refused ${what} from peer ${ws && ws._nodeId ? String(ws._nodeId).slice(0, 16) : '?'}: ${reason}`);
+  }
+
+  /** Connected VOTING peers (serving desktop nodes never count towards a governance majority). */
+  _votingPeerIds() {
+    try {
+      return this._peerMesh.activePeers()
+        .filter(p => p.ws && (p.ws._peerRole || 'voting') === 'voting')
+        .map(p => p.ws._nodeId).filter(Boolean)
+        .filter(id => require('../network/trusted_nodes').isTrusted(id));   // 1.4.97: trusted nodes only
+    } catch (_) { return []; }
   }
 
   _seedDefaults() {
@@ -352,6 +442,10 @@ class GovernanceEngine {
     const citizen_id = ws._sovereignId;
 
     if (ws._legacyMode) { this._send(ws, 'PJ', { success: false, error: 'SIGNATURE_REQUIRED' }); return; }
+    // 1.4.97 (D76): only an enrolled citizen proposes, and the signed request travels with the poll.
+    if (!this._isEnrolled(citizen_id)) { this._send(ws, 'PJ', { success: false, error: 'NOT_ENROLLED' }); return; }
+    const createAuth = ownerAuth.fromAppRequest(msg);
+    if (!createAuth) { this._send(ws, 'PJ', { success: false, error: 'SIGNATURE_REQUIRED' }); return; }
 
     if (!poll_id || !tag || !title || !options || !Array.isArray(options) || options.length < 2) {
       this._send(ws, 'PJ', { success: false, error: 'MISSING_FIELDS' });
@@ -412,14 +506,15 @@ class GovernanceEngine {
     try {
       this._db._db.prepare(`
         INSERT OR IGNORE INTO sov_polls
-          (poll_id, tag, title, description, options, created_by, created_at, closes_at, status, direction, tally, quorum_required)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+          (poll_id, tag, title, description, options, created_by, created_at, closes_at, status, direction, tally, quorum_required, create_auth)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
       `).run(
         poll_id, tag, title, description || '', JSON.stringify(options),
         citizen_id, now, closesAt,
         direction || 'activate',
         JSON.stringify({}),
-        quorumRequired
+        quorumRequired,
+        JSON.stringify(createAuth)
       );
     } catch (e) {
       this._send(ws, 'PJ', { success: false, error: 'POLL_ID_EXISTS' });
@@ -448,6 +543,12 @@ class GovernanceEngine {
     const voter_id = ws._sovereignId;
 
     if (ws._legacyMode) { this._send(ws, 'PQ', { success: false, error: 'SIGNATURE_REQUIRED' }); return; }
+    // 1.4.97 (D76): a vote cast on this node used to be counted without checking the voter is a
+    // CITIZEN (a signed HELLO from any key opens a session). Peers already checked; now this node does.
+    if (!this._isEnrolled(voter_id)) { this._send(ws, 'PQ', { success: false, error: 'NOT_ENROLLED' }); return; }
+    // 1.4.97 (D82): the voter's own signed request travels with the vote, so no node can invent one.
+    const voteAuth = ownerAuth.fromAppRequest(msg);
+    if (!voteAuth) { this._send(ws, 'PQ', { success: false, error: 'SIGNATURE_REQUIRED' }); return; }
 
     if (!poll_id || !option) {
       this._send(ws, 'PQ', { success: false, error: 'MISSING_FIELDS' });
@@ -504,6 +605,7 @@ class GovernanceEngine {
     // Broadcast vote to peer nodes
     this._peerMesh.broadcast('POLL_VOTE_BROADCAST', {
       poll_id, voter_id, option, voted_at: Date.now(),
+      auth: voteAuth,                       // 1.4.97 (D82): the voter's own signed request
       node_id: this._identity.nodeId,
     });
   }
@@ -545,6 +647,10 @@ class GovernanceEngine {
     const citizen_id = ws._sovereignId;
 
     if (ws._legacyMode) { this._send(ws, 'ED', { type: 'PETITION_RESULT', success: false, error: 'SIGNATURE_REQUIRED' }); return; }
+    // 1.4.97: enrolled citizens only; the signed request travels with the petition.
+    if (!this._isEnrolled(citizen_id)) { this._send(ws, 'ED', { type: 'PETITION_RESULT', success: false, error: 'NOT_ENROLLED' }); return; }
+    const createAuth = ownerAuth.fromAppRequest(msg);
+    if (!createAuth) { this._send(ws, 'ED', { type: 'PETITION_RESULT', success: false, error: 'SIGNATURE_REQUIRED' }); return; }
 
     if (!petition_id || !param_key || !title) {
       this._send(ws, 'ED', { type: 'PETITION_RESULT', success: false, error: 'MISSING_FIELDS' });
@@ -568,9 +674,10 @@ class GovernanceEngine {
     try {
       this._db._db.prepare(`
         INSERT OR IGNORE INTO sov_petitions
-          (petition_id, param_key, direction, title, description, created_by, created_at, expires_at, status, signature_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', 0)
-      `).run(petition_id, param_key, direction || 'activate', title, description || '', citizen_id, now, expiresAt);
+          (petition_id, param_key, direction, title, description, created_by, created_at, expires_at, status, signature_count, create_auth)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', 0, ?)
+      `).run(petition_id, param_key, direction || 'activate', title, description || '', citizen_id, now, expiresAt,
+             JSON.stringify(createAuth));
     } catch (_) {}
 
     const pet = this._db._db.prepare('SELECT * FROM sov_petitions WHERE petition_id = ?').get(petition_id);
@@ -588,6 +695,10 @@ class GovernanceEngine {
     const signer_id = ws._sovereignId;
 
     if (ws._legacyMode) { this._send(ws, 'ES', { type: 'PETITION_SIGN_RESULT', success: false, error: 'SIGNATURE_REQUIRED' }); return; }
+    // 1.4.97: enrolled citizens only; the signer's own signed request travels with the signature.
+    if (!this._isEnrolled(signer_id)) { this._send(ws, 'ES', { type: 'PETITION_SIGN_RESULT', success: false, error: 'NOT_ENROLLED' }); return; }
+    const signAuth = ownerAuth.fromAppRequest(msg);
+    if (!signAuth) { this._send(ws, 'ES', { type: 'PETITION_SIGN_RESULT', success: false, error: 'SIGNATURE_REQUIRED' }); return; }
 
     if (!petition_id) return;
 
@@ -625,6 +736,7 @@ class GovernanceEngine {
     // Broadcast signature to peers
     this._peerMesh.broadcast('PETITION_SIG_BROADCAST', {
       petition_id, signer_id, signed_at: Date.now(),
+      auth: signAuth,                       // 1.4.97: the signer's own signed request
       node_id: this._identity.nodeId,
     });
 
@@ -884,7 +996,10 @@ class GovernanceEngine {
 
     if (sigPct >= petThreshold) {
       // Threshold reached: auto-create a governance poll
-      const pollId  = `pet-${petition.petition_id}-${Date.now()}`;
+      // 1.4.97: the SAME id on every node (each node triggers this poll itself from the signatures it
+      // verified). It used to append this node's clock, so every node opened a different poll and
+      // votes relayed between them never matched.
+      const pollId  = `pet-${petition.petition_id}`;
       const options = petition.direction === 'deactivate'
         ? ['Deactivate', 'Keep Active']
         : ['Activate', 'Keep Dormant'];
@@ -919,47 +1034,71 @@ class GovernanceEngine {
   //  PEER MESH HANDLERS
   // ═══════════════════════════════════════════════════════════════════════════
 
-  // V39 fix: replicate a peer-created poll locally so this node holds the poll
-  // row (enables vote replication, cross-node voting, and independent tally).
-  _handlePollCreateBroadcast(msg) {
-    const { poll, node_id } = msg;
-    if (node_id === this._identity.nodeId || !poll || !poll.poll_id) return;
-    // Validate: tag must be a known governable param; options must be valid JSON;
-    // closes_at must be a sane future-ish epoch. Guards against malicious peers.
-    if (!PARAM_MAP[poll.tag]) return;
-    try { JSON.parse(poll.options); } catch (_) { return; }
-    if (typeof poll.closes_at !== 'number' || poll.closes_at <= 0) return;
-    try {
-      this._db._db.prepare(`
-        INSERT OR IGNORE INTO sov_polls
-          (poll_id, tag, title, description, options, created_by, created_at, closes_at, closed_at, status, direction, tally, quorum_required)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        poll.poll_id, poll.tag, poll.title || '', poll.description || '',
-        poll.options, poll.created_by || '', poll.created_at || Date.now(),
-        poll.closes_at, poll.closed_at || 0, poll.status || 'open',
-        poll.direction || 'activate', poll.tally || '{}', poll.quorum_required || 0
-      );
-      global.sovLog.info(`Poll replicated from peer: ${poll.tag} (${poll.poll_id})`);
-    } catch (_) {}
+  // ── 1.4.97: replicated polls ──────────────────────────────────────────────
+  // A peer-created poll is accepted only if the CITIZEN who proposed it signed exactly this poll, the
+  // tag is votable, the options are what they signed, and its length obeys THIS node's min/max
+  // duration. Status, tally and closed_at are never taken from the peer; the quorum is never lower
+  // than what this node computes from its own citizen count. Petition-triggered polls are not
+  // replicated: every node opens the same `pet-<petition_id>` poll itself from verified signatures.
+  _acceptPeerPoll(poll, ws) {
+    if (!poll || !poll.poll_id || !PARAM_MAP[poll.tag]) return 'BAD_POLL';
+    if (poll.created_by === 'PETITION') return 'PETITION_POLL_LOCAL_ONLY';
+    let options;
+    try { options = JSON.parse(poll.options); } catch (_) { return 'BAD_OPTIONS'; }
+    if (!Array.isArray(options) || options.length < 2 || options.length > 10) return 'BAD_OPTIONS';
+    if (typeof poll.closes_at !== 'number' || typeof poll.created_at !== 'number') return 'BAD_TIMES';
+    const why = this._citizenSigned(poll.create_auth, poll.created_by, 'PC', 'POLL_CREATE', (req) =>
+      req.poll_id === poll.poll_id && req.tag === poll.tag && JSON.stringify(req.options) === poll.options);
+    if (why) return why;
+    const minMs = parseInt(this._getGovParam('min_poll_duration', '1440')) * 60000;
+    const maxMs = parseInt(this._getGovParam('max_poll_duration', '10080')) * 60000;
+    const span = poll.closes_at - poll.created_at;
+    if (span < minMs - 60000 || span > maxMs + 60000) return 'BAD_DURATION';
+    if (poll.created_at > Date.now() + PEER_SYNC_FUTURE_MS) return 'FUTURE_POLL';
+    const localQuorum = Math.ceil(this._enrolledCitizenCount() *
+      parseFloat(this._getGovParam('quorum_threshold', '0.10')));
+    const quorum = Math.max(parseInt(poll.quorum_required) || 0, localQuorum);
+    this._db._db.prepare(`
+      INSERT OR IGNORE INTO sov_polls
+        (poll_id, tag, title, description, options, created_by, created_at, closes_at, closed_at, status, direction, tally, quorum_required, create_auth)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'open', ?, '{}', ?, ?)
+    `).run(
+      poll.poll_id, poll.tag, String(poll.title || ''), String(poll.description || ''), poll.options,
+      poll.created_by, poll.created_at, poll.closes_at,
+      poll.direction === 'deactivate' ? 'deactivate' : 'activate', quorum,
+      typeof poll.create_auth === 'string' ? poll.create_auth : JSON.stringify(poll.create_auth)
+    );
+    return null;
   }
 
-  _handlePollVoteBroadcast(msg) {
-    const { poll_id, voter_id, option, voted_at, node_id } = msg;
+  _handlePollCreateBroadcast(msg, ws) {
+    const { poll, node_id } = msg || {};
+    if (node_id === this._identity.nodeId || !poll || !poll.poll_id) return;
+    const why = this._acceptPeerPoll(poll, ws);
+    if (why && why !== 'PETITION_POLL_LOCAL_ONLY') return this._refusePeer(`poll ${poll.poll_id}`, why, ws);
+    if (!why) global.sovLog.info(`Poll replicated from peer: ${poll.tag} (${poll.poll_id})`);
+  }
+
+  // 1.4.97 (D82): a relayed vote counts only with the voter's own signed request for THIS poll and
+  // THIS option, verified against the voter's enrolled key.
+  _handlePollVoteBroadcast(msg, ws) {
+    const { poll_id, voter_id, option, voted_at, auth, node_id } = msg || {};
     if (node_id === this._identity.nodeId) return;
     if (!poll_id || !voter_id || !option) return;
 
-    // V38 fix: verify voter is actually enrolled — prevents fabricated votes from malicious peers
-    const isEnrolled = this._db._db.prepare('SELECT 1 FROM sov_enrollments WHERE sovereign_id = ?').get(voter_id);
-    if (!isEnrolled) return;
-
-    // Only insert if poll exists and is open
     const poll = this._db._db.prepare('SELECT * FROM sov_polls WHERE poll_id = ? AND status = ?').get(poll_id, 'open');
     if (!poll) return;
+    let options = [];
+    try { options = JSON.parse(poll.options); } catch (_) {}
+    if (!options.includes(option)) return this._refusePeer(`vote on ${poll_id}`, 'INVALID_OPTION', ws);
+
+    const why = this._citizenSigned(auth, voter_id, 'PV', 'POLL_VOTE',
+      (req) => req.poll_id === poll_id && req.option === option);
+    if (why) return this._refusePeer(`vote on ${poll_id} by ${String(voter_id).slice(0, 16)}`, why, ws);
 
     const result = this._db._db.prepare(`
       INSERT OR IGNORE INTO sov_poll_votes (poll_id, voter_id, option_text, voted_at) VALUES (?, ?, ?, ?)
-    `).run(poll_id, voter_id, option, voted_at || Date.now());
+    `).run(poll_id, voter_id, option, Math.min(Number(voted_at) || Date.now(), Date.now()));
 
     if (result.changes > 0) {
       const tally = this._getTally(poll_id);
@@ -968,55 +1107,69 @@ class GovernanceEngine {
     }
   }
 
-  _handlePollCloseBroadcast(msg) {
-    const { poll_id, closed_at, tally, winner, quorum_met } = msg;
+  // 1.4.97: a peer's "closed" is only a hint. This node closes the poll itself — with ITS OWN tally and
+  // its own activation — and only once the poll's own closing time has passed (a peer can no longer
+  // kill a vote early or hand over a tally).
+  _handlePollCloseBroadcast(msg, ws) {
+    const { poll_id } = msg || {};
     if (!poll_id) return;
-
-    this._db._db.prepare(`
-      UPDATE sov_polls SET status = 'closed', closed_at = ?, tally = ? WHERE poll_id = ? AND status = 'open'
-    `).run(closed_at || Date.now(), tally ? JSON.stringify(tally) : '{}', poll_id);
+    const poll = this._db._db.prepare(`SELECT * FROM sov_polls WHERE poll_id = ? AND status = 'open'`).get(poll_id);
+    if (!poll) return;
+    if (poll.closes_at > Date.now() + 60000) return this._refusePeer(`early close of ${poll_id}`, 'NOT_YET_DUE', ws);
+    this._closePoll(poll);
   }
 
-  _handleParamActivatedBroadcast(msg) {
-    const { param_key, param_value, activated_at, node_id } = msg;
-    if (node_id === this._identity.nodeId) return;
-    if (!param_key || param_value === undefined) return;
-
-    this._db._db.prepare(`
-      INSERT INTO sov_governance_params (param_key, param_value, activated_at) VALUES (?, ?, ?)
-      ON CONFLICT (param_key) DO UPDATE SET param_value = excluded.param_value, activated_at = excluded.activated_at
-      WHERE excluded.activated_at >= sov_governance_params.activated_at
-    `).run(param_key, param_value.toString(), activated_at || Date.now());
-
-    global.sovLog.info(`Param sync from peer: ${param_key} = ${param_value}`);
+  // 1.4.97 (D79): NO LONGER APPLIED. This handler wrote any value for any key a peer sent — including
+  // tx_signature_enforce — with no poll, range or key check. Every node now activates a parameter only
+  // from a poll it closes itself or a petition supermajority it counts itself; a node that missed one
+  // catches up through the majority rule in _handleStateResponse.
+  _handleParamActivatedBroadcast(msg, ws) {
+    const { param_key, param_value } = msg || {};
+    global.sovLog.debug(`[Gov] ignored peer activation ${param_key}=${param_value} (1.4.97: applied only locally or by peer majority)`);
   }
 
-  _handlePetitionBroadcast(msg) {
-    const { petition, node_id } = msg;
+  // 1.4.97: a replicated petition needs its creator's own signed request.
+  _acceptPeerPetition(petition, ws) {
+    if (!petition || !petition.petition_id) return 'BAD_PETITION';
+    const spec = PARAM_MAP[petition.param_key];
+    if (!spec || !spec.binary) return 'NOT_A_SWITCH';
+    const why = this._citizenSigned(petition.create_auth, petition.created_by, 'EC', 'PETITION_CREATE',
+      (req) => req.petition_id === petition.petition_id && req.param_key === petition.param_key);
+    if (why) return why;
+    const createdAt = Math.min(Number(petition.created_at) || Date.now(), Date.now());
+    this._db._db.prepare(`
+      INSERT OR IGNORE INTO sov_petitions
+        (petition_id, param_key, direction, title, description, created_by, created_at, expires_at, status, signature_count, create_auth)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', 0, ?)
+    `).run(
+      petition.petition_id, petition.param_key, petition.direction === 'deactivate' ? 'deactivate' : 'activate',
+      String(petition.title || ''), String(petition.description || ''), petition.created_by,
+      createdAt, createdAt + 30 * 24 * 60 * 60 * 1000,
+      typeof petition.create_auth === 'string' ? petition.create_auth : JSON.stringify(petition.create_auth)
+    );
+    return null;
+  }
+
+  _handlePetitionBroadcast(msg, ws) {
+    const { petition, node_id } = msg || {};
     if (node_id === this._identity.nodeId || !petition) return;
-
-    try {
-      this._db._db.prepare(`
-        INSERT OR IGNORE INTO sov_petitions
-          (petition_id, param_key, direction, title, description, created_by, created_at, expires_at, status, signature_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        petition.petition_id, petition.param_key, petition.direction || 'activate',
-        petition.title, petition.description || '', petition.created_by,
-        petition.created_at, petition.expires_at, petition.status || 'open',
-        0   // V36 fix: always insert with 0 — individual SIG_BROADCASTs increment correctly; never trust peer-supplied count
-      );
-    } catch (_) {}
+    const why = this._acceptPeerPetition(petition, ws);
+    if (why) this._refusePeer(`petition ${petition.petition_id}`, why, ws);
   }
 
-  _handlePetitionSigBroadcast(msg) {
-    const { petition_id, signer_id, signed_at, node_id } = msg;
+  // 1.4.97: a relayed petition signature counts only with the signer's own signed request.
+  _handlePetitionSigBroadcast(msg, ws) {
+    const { petition_id, signer_id, signed_at, auth, node_id } = msg || {};
     if (node_id === this._identity.nodeId || !petition_id || !signer_id) return;
+    const pet = this._db._db.prepare('SELECT * FROM sov_petitions WHERE petition_id = ?').get(petition_id);
+    if (!pet || pet.status !== 'open' || pet.expires_at < Date.now()) return;
+    const why = this._citizenSigned(auth, signer_id, 'ES', 'PETITION_SIGN', (req) => req.petition_id === petition_id);
+    if (why) return this._refusePeer(`petition signature on ${petition_id}`, why, ws);
 
     const result = this._db._db.prepare(`
       INSERT OR IGNORE INTO sov_petition_signatures (petition_id, signer_id, signed_at)
       VALUES (?, ?, ?)
-    `).run(petition_id, signer_id, signed_at || Date.now());
+    `).run(petition_id, signer_id, Math.min(Number(signed_at) || Date.now(), Date.now()));
 
     if (result.changes > 0) {
       this._db._db.prepare(`
@@ -1028,87 +1181,118 @@ class GovernanceEngine {
     }
   }
 
-  _handleStateRequest(msg) {
-    // A peer is requesting our governance state (typically on startup)
-    const { node_id } = msg;
+  _handleStateRequest(msg, ws) {
+    // A peer is requesting our governance state (on startup and every 5 minutes)
+    const { node_id } = msg || {};
     if (node_id === this._identity.nodeId) return;
 
-    const params     = this._db._db.prepare('SELECT * FROM sov_governance_params').all();
-    const openPolls  = this._db._db.prepare(`SELECT * FROM sov_polls WHERE status = 'open'`).all();
+    const params        = this._db._db.prepare('SELECT * FROM sov_governance_params').all();
+    const openPolls     = this._db._db.prepare(`SELECT * FROM sov_polls WHERE status = 'open'`).all();
+    // 1.4.97: open petitions travel too (each with its creator's signed request) so a node that was
+    // away catches up on them; their signatures still arrive one by one, each verified.
+    const openPetitions = this._db._db.prepare(`SELECT * FROM sov_petitions WHERE status = 'open' AND expires_at > ?`).all(Date.now());
 
     this._peerMesh.broadcast('GOVERNANCE_STATE_RESPONSE', {
       params,
       open_polls: openPolls,
+      open_petitions: openPetitions,
       node_id: this._identity.nodeId,
     });
   }
 
-  _handleStateResponse(msg) {
-    // Apply governance state from a peer — only update params with a NEWER activated_at
-    const { params, open_polls, node_id } = msg;
-    if (node_id === this._identity.nodeId || !params) return;
+  // 1.4.97 (D79): peer state sync can only CATCH THIS NODE UP, and only to what a majority of its
+  // connected VOTING peers agree on. Rules, per parameter row a peer reports:
+  //   - the key must be VOTABLE (a PARAM_MAP key) — security switches such as tx_signature_enforce and
+  //     anything unknown are never taken from a peer;
+  //   - the value must be legal for that key;
+  //   - the sender must be a connected VOTING peer, identified by its authenticated link (ws._nodeId);
+  //   - activated_at may not be in the future (a far-future stamp used to win for ever);
+  //   - the value is applied only when at least max(2, majority of connected voting peers) DISTINCT
+  //     peers currently report the same value, newer than ours.
+  // Before 1.4.97 any single peer could set any key, validated only when it happened to be votable.
+  _handleStateResponse(msg, ws) {
+    const { params, open_polls, open_petitions, node_id } = msg || {};
+    if (node_id === this._identity.nodeId) return;
 
-    const upsert = this._db._db.prepare(`
-      INSERT INTO sov_governance_params (param_key, param_value, activated_at) VALUES (?, ?, ?)
-      ON CONFLICT (param_key) DO UPDATE SET param_value = excluded.param_value, activated_at = excluded.activated_at
-      WHERE excluded.activated_at > sov_governance_params.activated_at
-    `);
+    const peerId = ws && ws._nodeId ? String(ws._nodeId) : null;
+    const isVotingPeer = !!peerId && ws && (ws._peerRole || 'voting') === 'voting'
+      && require('../network/trusted_nodes').isTrusted(peerId);         // 1.4.97
+    const now = Date.now();
 
-    for (const row of params) {
-      try {
-        // V32 fix: validate param bounds via PARAM_MAP before applying — prevents malicious peers
-        // from injecting out-of-range governance values via GOVERNANCE_STATE_RESPONSE
-        const spec = PARAM_MAP[row.param_key];
-        if (spec) {
-          if (spec.values) {
-            // Enumerated string param. WITHOUT this branch it fell through to the
-            // numeric one below, and parseFloat('refuse') is NaN, so the row was
-            // dropped and an enum param could NEVER replicate between nodes.
-            //
-            // Measured 2026-10-01 before the fix: all three nodes held
-            // release_enforce_mode = 'refuse' with activated_at = 0 — seeded, never
-            // changed. The fleet agreed because the SEED agreed, not because this
-            // worked. So the bug was latent, and the first change to that param on
-            // any node would have silently failed to reach the others — on the one
-            // parameter deciding whether a node refuses unrecognised software. A
-            // node left on 'warn' admits any root and a trusted peer carries it
-            // inward (CLAUDE.md §-2).
-            //
-            // release_enforce_mode is the only `values` entry in PARAM_MAP today.
-            if (!spec.values.includes(String(row.param_value))) continue;
-          } else if (spec.binary) {
-            if (row.param_value !== '0' && row.param_value !== '1') continue;
-          } else {
-            const val = parseFloat(row.param_value);
-            if (isNaN(val) || val < spec.min || val > spec.max) continue;
-          }
-        }
-        upsert.run(row.param_key, row.param_value.toString(), row.activated_at || 0);
-      } catch (_) {}
-    }
-
-    // V39 fix: also apply open polls a peer sent us (previously open_polls was
-    // included in the response payload but silently ignored here). Lets a node
-    // that was offline at poll-creation catch up on reconnect.
-    if (Array.isArray(open_polls)) {
-      const pollUpsert = this._db._db.prepare(`
-        INSERT OR IGNORE INTO sov_polls
-          (poll_id, tag, title, description, options, created_by, created_at, closes_at, closed_at, status, direction, tally, quorum_required)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      for (const poll of open_polls) {
+    if (Array.isArray(params) && isVotingPeer) {
+      for (const row of params) {
         try {
-          if (!poll || !poll.poll_id || !PARAM_MAP[poll.tag]) continue;
-          JSON.parse(poll.options);
-          if (typeof poll.closes_at !== 'number' || poll.closes_at <= 0) continue;
-          pollUpsert.run(
-            poll.poll_id, poll.tag, poll.title || '', poll.description || '',
-            poll.options, poll.created_by || '', poll.created_at || Date.now(),
-            poll.closes_at, poll.closed_at || 0, poll.status || 'open',
-            poll.direction || 'activate', poll.tally || '{}', poll.quorum_required || 0
-          );
+          if (!row || !row.param_key) continue;
+          const spec = SPEC_BY_KEY[row.param_key];
+          if (!spec) continue;                                   // non-votable: never from a peer
+          const value = String(row.param_value);
+          if (!specValueOk(spec, value)) continue;
+          const at = Number(row.activated_at) || 0;
+          if (at > now + PEER_SYNC_FUTURE_MS) continue;
+          let reports = this._peerParamReports.get(row.param_key);
+          if (!reports) { reports = new Map(); this._peerParamReports.set(row.param_key, reports); }
+          reports.set(peerId, { value, at, seen: now });
+          this._maybeAdoptPeerParam(row.param_key);
         } catch (_) {}
       }
+    }
+
+    // Open polls / petitions a peer holds: each must carry its citizen's signed creation request.
+    if (Array.isArray(open_polls)) {
+      for (const poll of open_polls) {
+        try {
+          if (!poll || !poll.poll_id) continue;
+          if (this._db._db.prepare('SELECT 1 FROM sov_polls WHERE poll_id = ?').get(poll.poll_id)) continue;
+          const why = this._acceptPeerPoll(poll, ws);
+          if (why && why !== 'PETITION_POLL_LOCAL_ONLY') this._refusePeer(`synced poll ${poll.poll_id}`, why, ws);
+        } catch (_) {}
+      }
+    }
+    if (Array.isArray(open_petitions)) {
+      for (const pet of open_petitions) {
+        try {
+          if (!pet || !pet.petition_id) continue;
+          if (this._db._db.prepare('SELECT 1 FROM sov_petitions WHERE petition_id = ?').get(pet.petition_id)) continue;
+          const why = this._acceptPeerPetition(pet, ws);
+          if (why) this._refusePeer(`synced petition ${pet.petition_id}`, why, ws);
+        } catch (_) {}
+      }
+    }
+  }
+
+  /** 1.4.97: adopt a peer-reported value only when a majority of connected voting peers agree. */
+  _maybeAdoptPeerParam(key) {
+    const reports = this._peerParamReports.get(key);
+    if (!reports) return;
+    const now = Date.now();
+    const voting = new Set(this._votingPeerIds());
+    for (const [pid, r] of reports) {
+      if (now - r.seen > PEER_REPORT_TTL_MS || !voting.has(pid)) reports.delete(pid);
+    }
+    const local = this._db._db.prepare(
+      'SELECT param_value, activated_at FROM sov_governance_params WHERE param_key = ?').get(key);
+    const localValue = local ? String(local.param_value) : null;
+    const localAt    = local ? Number(local.activated_at) || 0 : 0;
+    const need = Math.max(2, Math.floor(voting.size / 2) + 1);
+
+    const byValue = new Map();
+    for (const r of reports.values()) {
+      if (r.value === localValue || r.at <= localAt) continue;
+      const g = byValue.get(r.value) || { count: 0, at: 0 };
+      g.count += 1; g.at = Math.max(g.at, r.at);
+      byValue.set(r.value, g);
+    }
+    for (const [value, g] of byValue) {
+      if (g.count < need) continue;
+      this._db._db.prepare(`
+        INSERT INTO sov_governance_params (param_key, param_value, activated_at) VALUES (?, ?, ?)
+        ON CONFLICT (param_key) DO UPDATE SET param_value = excluded.param_value, activated_at = excluded.activated_at
+      `).run(key, value, Math.min(g.at, now));
+      if (this._gateway) {
+        try { this._gateway.pushToAll('KE', { param_key: key, param_value: value, activated_at: Math.min(g.at, now) }); } catch (_) {}
+      }
+      global.sovLog.info(`[Gov] caught up ${key} = ${value} (agreed by ${g.count} voting peers)`);
+      return;
     }
   }
 

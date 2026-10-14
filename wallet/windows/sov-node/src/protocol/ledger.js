@@ -34,6 +34,11 @@ const ownerAuth = require('./owner_auth');
 // signed request when a node APPLIES it. Earlier ops were granted under the old rule and stay valid by
 // their majority certificate (every grant given after the upgrade already required the request).
 const AUTH_REQUIRED_FROM = Date.parse('2026-10-10T06:00:00Z');
+// 1.4.97 (audit D81): a SYSTEM op (no owner — verdicts, payouts, grants, claims, releases) is applied
+// only when its origin is a trusted node. No date cut-off: committed_at is the origin's own claim, so a
+// cut-off could be dodged by back-dating. Measured on the live ledger 2026-10-14 before this change:
+// its only non-frozen system op is VPS1's baseline, so no real history is refused.
+const trustedNodes = require('../network/trusted_nodes');
 
 // Kinds that were allowed to break the zero-sum rule for the 1.4.90 upgrade. From 1.4.94 a peer's op
 // of these kinds is accepted ONLY if it is part of the frozen pre-1.4.94 history (D60): otherwise a
@@ -161,7 +166,7 @@ class Ledger {
     m.on('LEDGER_VOTE_REQUEST', (msg) => this._onVoteRequest(msg));
     m.on('LEDGER_VOTE_REPLY',   (msg, ws) => this._onVoteReply(msg, ws));
     m.on('LEDGER_VOTE_RELEASE', (msg) => this._onVoteRelease(msg));
-    m.on('LEDGER_OP',           (msg) => this._onOp(msg));
+    m.on('LEDGER_OP',           (msg, ws) => this._onOp(msg, ws));
     m.on('LEDGER_DIGEST',       (msg) => this._onDigest(msg));
     m.on('LEDGER_PULL',         (msg) => this._onPull(msg));
     if (m.onPeerAdmitted) m.onPeerAdmitted((nodeId) => this._sendDigest(nodeId));
@@ -182,7 +187,10 @@ class Ledger {
     // Pre-1.4.90 vaults and dispute bonds hold money that sits in no account (the owner was
     // debited, nothing was credited). Give each its holding once, after the engines have made
     // their tables. (Exchange escrow is adopted by the exchange engine itself.)
-    setTimeout(() => this._adoptLegacyHoldings(), 12 * 1000).unref?.();
+    // 1.4.97 (audit §2.1): RETIRED. It gave a holding to every locked vault / bonded dispute row with
+    // none, and those rows replicate — an injected row became money at the next boot. Every legitimate
+    // pre-1.4.90 holding on the fleet was adopted long ago.
+    // setTimeout(() => this._adoptLegacyHoldings(), 12 * 1000).unref?.();
     this._timer = setInterval(() => this._tick(), DIGEST_INTERVAL_MS);
     if (this._timer.unref) this._timer.unref();
     setTimeout(() => this._tick(), 15 * 1000).unref?.();
@@ -272,7 +280,9 @@ class Ledger {
     try { for (const v of this._db.validatorsActiveAt(Date.now() + 61 * 1000, this.nodeId)) ids.add(v); } catch (_) {}
     for (const p of this._mesh.activePeers()) {
       if (p.ws && p.ws._peerRole === 'serving') continue;          // 1.4.96: serving nodes never vote
-      const id = p.ws && p.ws._nodeId; if (id) ids.add(String(id).toLowerCase());
+      const id = p.ws && p.ws._nodeId;
+      if (id && !trustedNodes.isTrusted(id)) continue;             // 1.4.97: nor do untrusted nodes
+      if (id) ids.add(String(id).toLowerCase());
     }
     return [...ids];                       // always contains this node: the origin is in its own certificate
   }
@@ -304,7 +314,7 @@ class Ledger {
     const resolvedOp = (v) => { const o = this._opOf(v).toUpperCase(); return o.startsWith('NODE:') ? null : o; };
     const vsetOps = new Set(voting.map(resolvedOp).filter(Boolean));
     const needOps = vsetOps.size >= 2 ? Math.floor(vsetOps.size / 2) + 1 : 0;
-    const live = this._mesh.activePeers().filter(p => !(p.ws && p.ws._peerRole === 'serving')).length;
+    const live = this._mesh.activePeers().filter(p => !(p.ws && p.ws._peerRole === 'serving') && p.ws && trustedNodes.isTrusted(p.ws._nodeId)).length;
     if (N === 0) return Promise.resolve({ ok: false, error: 'QUORUM_UNAVAILABLE' });   // serving node, no voting peer
     if (selfVoting && need <= 1) {
       if (this._mesh.everHadVerifiedPeer && this._mesh.everHadVerifiedPeer()) {
@@ -399,19 +409,26 @@ class Ledger {
 
   // ── Replication ───────────────────────────────────────────────────────────
 
-  _onOp(msg) {
+  _onOp(msg, ws) {
     const op = msg && msg.op;
     if (!op || !op.op_id || !op.origin_node) return;
     if (op.origin_node === this.nodeId) return;
-    this._applyRemote(op);
+    this._applyRemote(op, ws && ws._nodeId ? String(ws._nodeId) : null);
     this._retryHeld();
   }
 
   /** 1.4.94: why a peer's op must not be applied (null = it may be). */
-  _trustCheck(op) {
+  _trustCheck(op, fromNode) {
     if (!KNOWN_KINDS.has(op.kind)) return 'UNKNOWN_OP_KIND';           // D57: a kind this node does not understand
     if (isFrozenHistory(op)) return null;                              // pre-1.4.94 history, fingerprinted
     if (LEGACY_KINDS.has(op.kind)) return 'LEGACY_OP_NOT_IN_HISTORY';  // D60: no new baselines / adoptions
+    // 1.4.97 (D81): a system op carries no signature of its origin, so origin_node is only a claim.
+    // It is applied when its origin is trusted AND it reached us over a link from a trusted node — a
+    // trusted node relays only ops it accepted itself. A genuine op an untrusted peer relays is simply
+    // fetched again from a trusted one (refusal is not recorded).
+    if (!op.owner && !(trustedNodes.isTrusted(op.origin_node) && trustedNodes.isTrusted(fromNode))) {
+      return 'SYSTEM_OP_FROM_UNTRUSTED_NODE';
+    }
     if (op.owner) {
       return cert.verifyCertificate(op, {
         selfId: this.nodeId,
@@ -429,8 +446,12 @@ class Ledger {
     return null;
   }
 
-  _applyRemote(op) {
-    const trust = this._trustCheck(op);
+  _applyRemote(op, fromNode) {
+    const trust = this._trustCheck(op, fromNode);
+    if (trust === 'SYSTEM_OP_FROM_UNTRUSTED_NODE') {   // expected when an untrusted node relays; rate-limited
+      trustedNodes.refuse(`system op ${op.kind} (origin ${String(op.origin_node).slice(0, 12)})`, fromNode);
+      return 'refused';
+    }
     if (trust) {
       global.sovLog.error(`[LEDGER] refused op ${op.op_id} (${op.kind}) from ${String(op.origin_node).slice(0, 12)}: ${trust}`);
       return 'refused';

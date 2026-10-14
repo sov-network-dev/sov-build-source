@@ -470,7 +470,8 @@ class CitizenGateway {
       if (!Number.isFinite(at) || at > Date.now() + 5 * 60 * 1000) return;
       // The SENDING node only pushes keys of enrolled citizens (D46), so no enrolment check here:
       // a brand-new citizen's key may arrive before their enrolment record does (D44).
-      try { gw._db.upsertMessagingKeyIfNewer(id, key, at); } catch (_) {}
+      // 1.4.97 (D86): an EXISTING key is replaced only with the citizen's own signature (db.js).
+      try { gw._db.upsertMessagingKeyIfNewer(id, key, at, msg.key_sig || '', msg.key_ts || 0); } catch (_) {}
     });
     peerMesh.on('CITIZEN_OFFLINE_RELAY',   (msg, ws) => gw._handleCrossRelayOffline(msg, ws));
     // Presence is a fact about NOW. (1) At start nobody is connected here, so any row saying a
@@ -491,8 +492,14 @@ class CitizenGateway {
     // ── Merkle self-heal: respond to state delta requests from peers ──────────
     // When a peer requests a state delta (after detecting a Merkle mismatch),
     // send back our full disc table so they can apply rows we have at higher version.
-    peerMesh.on('STATE_DELTA_REQUEST', (msg) => {
+    peerMesh.on('STATE_DELTA_REQUEST', (msg, ws) => {
       try {
+        // 1.4.97: answer the AUTHENTICATED asker (ws._nodeId), not the node_id the message claims, and
+        // hand the replicated tables (guardians, vaults with their claim hashes, platforms…) only to a
+        // trusted node — an untrusted one gets the same balances/enrolments/templates as before.
+        const asker = ws && ws._nodeId ? String(ws._nodeId) : null;
+        if (!asker) return;
+        const askerTrusted = require('./trusted_nodes').isTrusted(asker);
         const rows = db._db.prepare('SELECT sovereign_id, balance_seeds, version, nonce, last_tx_hash FROM sov_disc ORDER BY sovereign_id ASC').all();
         // V40: also carry enrollments (auth records). Enrollments are NOT in the
         // disc Merkle, so without this a synced node has balances but cannot
@@ -522,7 +529,7 @@ class CitizenGateway {
           // Trade chat is never stored or synced (king, 2026-10-03): nodes keep no messages.
           exchange_messages = [];
         } catch (_) {}
-        peerMesh.sendTo(msg.node_id, 'STATE_DELTA_RESPONSE', {
+        peerMesh.sendTo(asker, 'STATE_DELTA_RESPONSE', {
           node_id: identity.nodeId,
           rows,
           enrollments,
@@ -530,9 +537,9 @@ class CitizenGateway {
           face_templates: faceTemplates,
           exchange_orders,
           exchange_messages,
-          consensus: (db.exportConsensus ? db.exportConsensus() : {}),
+          consensus: (askerTrusted && db.exportConsensus ? db.exportConsensus() : {}),
         });
-        global.sovLog.debug(`[Mesh] STATE_DELTA_RESPONSE sent to ${msg.node_id.slice(0,16)}... (${rows.length} rows)`);
+        global.sovLog.debug(`[Mesh] STATE_DELTA_RESPONSE sent to ${asker.slice(0,16)}... (${rows.length} rows)`);
       } catch (e) {
         global.sovLog.warn(`[Mesh] STATE_DELTA_REQUEST handling error: ${e.message}`);
       }
@@ -540,7 +547,7 @@ class CitizenGateway {
 
     // Apply state delta received from a peer — use "higher version wins" rule.
     // Balance is updated ONLY when the remote version is strictly higher than ours.
-    peerMesh.on('STATE_DELTA_RESPONSE', (msg) => {
+    peerMesh.on('STATE_DELTA_RESPONSE', (msg, ws) => {
       try {
         let applied = 0;
         // C2 mitigation (2026-08-05): a peer must NOT be able to mint supply past the
@@ -567,8 +574,9 @@ class CitizenGateway {
             differs++;
           }
         }
-        if (differs > 0 && db.ledger && msg.node_id) {
-          try { db.ledger._sendDigest(msg.node_id); } catch (_) {}
+        const _from = ws && ws._nodeId ? String(ws._nodeId) : msg.node_id;   // 1.4.97: the authenticated sender
+        if (differs > 0 && db.ledger && _from) {
+          try { db.ledger._sendDigest(_from); } catch (_) {}
           global.sovLog.info(`[Mesh] STATE_DELTA: ${differs} account(s) differ from ${(msg.node_id || '').slice(0, 12)} — pulling ledger ops (balances are never copied)`);
         }
         if (applied > 0) {
@@ -1443,11 +1451,25 @@ class CitizenGateway {
       // 1.4.92: push a NEW key to the peers straight away. It used to reach them only through state
       // sync, which runs when balance/exchange fingerprints differ — so a citizen on another node
       // could get "no key" for this citizen until some unrelated change happened.
+      // 1.4.97 (D86): app 1.2.33+ also signs the key itself (sov-msgkey-v1|id|key|timestamp) with the
+      // enrolled key; that signature travels with it so no peer can ever swap the key. An older app's
+      // key is still stored here (the citizen's own authenticated session) but peers will only take it
+      // as a FIRST key, never as a replacement.
+      const _ksig = msg.messaging_key_sig && this._db.verifyMessagingKeySig(sovereign_id, _key, timestamp, msg.messaging_key_sig)
+        ? String(msg.messaging_key_sig) : '';
+      const _kts  = _ksig ? Number(timestamp) : 0;
       if (String(this._db.getMessagingPublicKey(sovereign_id) || '').toLowerCase() !== _key) {
-        this._db.setMessagingPublicKey(sovereign_id, _key);
+        this._db.setMessagingPublicKey(sovereign_id, _key, _ksig, _kts);
         try {
           this._peerMesh && this._peerMesh.broadcast('MESSAGING_KEY_PUBLISHED',
-            { sovereign_id, x25519_pub_hex: _key, updated_at: Date.now() });
+            { sovereign_id, x25519_pub_hex: _key, updated_at: Date.now(), key_sig: _ksig, key_ts: _kts });
+        } catch (_) {}
+      } else if (_ksig) {
+        // same key, now signed: record the signature and let peers add it too
+        try { this._db.upsertMessagingKeyIfNewer(sovereign_id, _key, Date.now(), _ksig, _kts); } catch (_) {}
+        try {
+          this._peerMesh && this._peerMesh.broadcast('MESSAGING_KEY_PUBLISHED',
+            { sovereign_id, x25519_pub_hex: _key, updated_at: Date.now(), key_sig: _ksig, key_ts: _kts });
         } catch (_) {}
       }
     }

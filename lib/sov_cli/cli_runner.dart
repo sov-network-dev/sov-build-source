@@ -1743,6 +1743,11 @@ class _CliWS {
       }
     }
 
+    // 1.2.33 (audit D86): sign the messaging key itself, so no node can ever swap it for another.
+    String? keySig;
+    if (sig != null && msgKey.isNotEmpty) {
+      try { keySig = await KeyManager.signChallenge('sov-msgkey-v1|$sovId|${msgKey.toLowerCase()}|$ts'); } catch (_) {}
+    }
     _send({
       'type':           'HELLO',
       'sovereign_id':   sovId,
@@ -1753,6 +1758,7 @@ class _CliWS {
       // Publish this wallet's messaging key, as the app does, so others can send
       // to it. Without it the app refuses to send ("no encryption key on file").
       if (msgKey.isNotEmpty) 'messaging_public_key': msgKey,
+      if (keySig != null) 'messaging_key_sig': keySig,
       'version': '1.0.0',
     });
   }

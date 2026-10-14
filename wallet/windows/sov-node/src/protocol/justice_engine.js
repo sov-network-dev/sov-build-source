@@ -39,10 +39,16 @@ class JusticeEngine {
     this._initJusticeTables();
 
     // Register peer mesh handlers
-    peerMesh.on('JUSTICE_CASE_BROADCAST',   (msg) => this._handleCaseBroadcast(msg));
+    peerMesh.on('JUSTICE_CASE_BROADCAST',   (msg, ws) => this._handleCaseBroadcast(msg, ws));
     peerMesh.on('JUSTICE_JUROR_FORWARD',    (msg) => this._handleJurorForward(msg));
-    peerMesh.on('JUSTICE_VOTE_BROADCAST',   (msg) => this._handleVoteBroadcast(msg));
+    peerMesh.on('JUSTICE_VOTE_BROADCAST',   (msg, ws) => this._handleVoteBroadcast(msg, ws));
     peerMesh.on('JUSTICE_VERDICT_BROADCAST',(msg) => this._handleVerdictBroadcast(msg));
+
+    // 1.4.97 (D80): a verdict moves money, so EVERY node re-checks it before granting the defendant's
+    // slot or applying the op — from a self-contained proof: the plaintiff's own signed filing and each
+    // juror's own signed vote. Until 1.4.96 peers applied a verdict on the deciding node's word, so a
+    // dishonest node could invent one and take a defendant's SOV.
+    if (db.ledger && db.ledger.setValidator) db.ledger.setValidator('verdict', (op) => this._validateVerdictOp(op));
 
     // 60-second juror timeout check
     setInterval(() => this._checkJurorTimeouts(), 60 * 1000);
@@ -127,6 +133,95 @@ class JusticeEngine {
         'ALTER TABLE sov_disputes ADD COLUMN restitution_unpaid_seeds INTEGER NOT NULL DEFAULT 0');
       global.sovLog.info('[JUSTICE] migrated sov_disputes: + restitution_unpaid_seeds');
     } catch (_) { /* already present — the normal case after the first boot */ }
+    // 1.4.97 (D80): keep the citizens' own signed requests — the plaintiff's filing and each juror's
+    // vote — so a verdict can carry them as proof to every node.
+    for (const sql of ["ALTER TABLE sov_disputes ADD COLUMN open_auth TEXT NOT NULL DEFAULT ''",
+                       "ALTER TABLE sov_case_jurors ADD COLUMN vote_auth TEXT NOT NULL DEFAULT ''"]) {
+      try { this._db._db.exec(sql); } catch (_) { /* already there */ }
+    }
+  }
+
+  // ── 1.4.97 (D80) helpers ──────────────────────────────────────────────────
+
+  _pubKey(sovereignId) {
+    const e = this._db.getEnrollment ? this._db.getEnrollment(sovereignId) : null;
+    return e && e.public_key_hex ? e.public_key_hex : null;
+  }
+
+  /** null when `citizenId` really signed an app request `op`/`type` whose fields satisfy fieldsOk. */
+  _signedBy(auth, citizenId, op, type, fieldsOk) {
+    let a = auth;
+    if (!a) return 'AUTH_MISSING';
+    if (typeof a === 'string') { try { a = JSON.parse(a); } catch (_) { return 'AUTH_UNREADABLE'; } }
+    const pub = this._pubKey(citizenId);
+    if (!pub) return 'NOT_ENROLLED';
+    const v = ownerAuth.verifyAppRequest(a, pub);
+    if (v.reason) return v.reason;
+    if (v.signer !== citizenId) return 'AUTH_WRONG_SIGNER';
+    if (v.req.op !== op && v.req.type !== type) return 'AUTH_WRONG_OPERATION';
+    try { if (fieldsOk && !fieldsOk(v.req)) return 'AUTH_FIELDS_MISMATCH'; } catch (_) { return 'AUTH_FIELDS_MISMATCH'; }
+    return null;
+  }
+
+  _openFieldsOk(dispute) {
+    return (req) => req.case_id === dispute.case_id && req.defendant_id === dispute.defendant_id &&
+      Number(req.amount_seeds || 0) === Number(dispute.amount_seeds || 0);
+  }
+
+  /**
+   * 1.4.97 (D80): why a verdict op must NOT be granted/applied (null = it is proven).
+   * op.proof = { case: {case_id, plaintiff_id, defendant_id, amount_seeds, open_auth},
+   *              verdict, votes: [{ juror_id, vote, auth }] }
+   * Checks: the plaintiff signed this exact filing; every listed juror is enrolled, is not a party,
+   * appears once, and signed exactly that vote on this case; enough jurors; the verdict follows from
+   * the votes under this node's threshold; and the money only goes where that verdict allows.
+   */
+  _validateVerdictOp(op) {
+    const p = op && op.proof;
+    if (!p || !p.case || !Array.isArray(p.votes)) return 'VERDICT_NO_PROOF';
+    const c = p.case;
+    if (c.case_id !== op.ref || op.op_id !== `verdict:${c.case_id}`) return 'VERDICT_CASE_MISMATCH';
+    if (!c.plaintiff_id || !c.defendant_id || c.plaintiff_id === c.defendant_id) return 'VERDICT_BAD_PARTIES';
+    const openWhy = this._signedBy(c.open_auth, c.plaintiff_id, 'DO', 'DISPUTE_OPEN', this._openFieldsOk(c));
+    if (openWhy) return 'VERDICT_FILING_' + openWhy;
+
+    const seen = new Set();
+    let conv = 0, dism = 0;
+    for (const v of p.votes) {
+      if (!v || !v.juror_id || seen.has(v.juror_id)) return 'VERDICT_BAD_JUROR_LIST';
+      if (v.juror_id === c.plaintiff_id || v.juror_id === c.defendant_id) return 'VERDICT_PARTY_AS_JUROR';
+      if (v.vote !== 'conviction' && v.vote !== 'dismissal') return 'VERDICT_BAD_VOTE';
+      seen.add(v.juror_id);
+      const why = this._signedBy(v.auth, v.juror_id, 'DV', 'JUSTICE_VOTE', (req) => req.case_id === c.case_id && req.vote === v.vote);
+      if (why) return 'VERDICT_VOTE_' + why;
+      if (v.vote === 'conviction') conv++; else dism++;
+    }
+    const n = conv + dism;
+    const minJury = parseInt(this._getGovParam('justice_min_jury_size', '3'), 10) || 3;
+    if (n < minJury) return 'VERDICT_TOO_FEW_JURORS';
+    const needed = Math.ceil(n * parseFloat(this._getGovParam('justice_conviction_threshold', '0.67')));
+    const derived = conv >= needed ? 'convicted' : (dism > 0 ? 'dismissed' : null);
+    if (!derived || derived !== p.verdict) return 'VERDICT_DOES_NOT_FOLLOW';
+
+    // Money: only to parties and the listed jurors, within what the verdict permits.
+    const jurors = new Set(p.votes.map(v => v.juror_id));
+    const fee = parseInt(this._getGovParam('justice_juror_reward', '500000'), 10) || 0;
+    let defendantOut = 0, plaintiffIn = 0;
+    for (const m of op.moves || []) {
+      const d = Number(m.d) || 0;
+      if (m.acct === c.defendant_id) { if (d < 0) defendantOut += -d; continue; }
+      if (m.acct === c.plaintiff_id) { if (d < 0) return 'VERDICT_DEBITS_PLAINTIFF'; plaintiffIn += d; continue; }
+      if (jurors.has(m.acct)) { if (d < 0 || d > fee) return 'VERDICT_JUROR_PAY_WRONG'; continue; }
+      return 'VERDICT_PAYS_A_STRANGER';
+    }
+    for (const h of op.holds || []) { if (h.id !== 'bond:' + c.case_id) return 'VERDICT_WRONG_HOLDING'; }
+    if (derived === 'dismissed' && defendantOut > 0) return 'VERDICT_DISMISSED_BUT_DEFENDANT_PAYS';
+    if (derived === 'convicted' && defendantOut > Math.max(0, Number(c.amount_seeds) || 0) + jurors.size * fee) return 'VERDICT_TAKES_TOO_MUCH';
+    return null;
+  }
+
+  _refusePeer(what, reason) {
+    global.sovLog.warn(`[JUSTICE] refused ${what}: ${reason}`);
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -175,12 +270,13 @@ class JusticeEngine {
     try {
       this._db._db.prepare(`
         INSERT OR IGNORE INTO sov_disputes
-          (case_id, plaintiff_id, defendant_id, evidence_hash, amount_seeds, bond_held, status, created_at, track, memo)
-        VALUES (?, ?, ?, ?, ?, ?, 'jury_selection', ?, ?, ?)
+          (case_id, plaintiff_id, defendant_id, evidence_hash, amount_seeds, bond_held, status, created_at, track, memo, open_auth)
+        VALUES (?, ?, ?, ?, ?, ?, 'jury_selection', ?, ?, ?, ?)
       `).run(
         case_id, plaintiff_id, defendant_id,
         evidence_hash || '', amount_seeds || 0, bondSeeds,
-        now, track || 'transaction', memo || ''
+        now, track || 'transaction', memo || '',
+        JSON.stringify(ownerAuth.fromAppRequest(msg) || '')   // 1.4.97 (D80): the plaintiff's own signed filing
       );
     } catch (_) {
       this._send(ws, 'DD', { type: 'JUSTICE_DISPUTE_OPENED', success: false, error: 'CASE_ID_EXISTS' });
@@ -379,16 +475,19 @@ class JusticeEngine {
       return;
     }
 
+    // 1.4.97 (D80): the juror's own signed vote is kept and travels — a verdict is proven by these.
+    const voteAuth = ownerAuth.fromAppRequest(msg);
+    if (!voteAuth) { this._send(ws, 'DV', { type: 'JUSTICE_VOTE_RECORDED', success: false, error: 'SIGNATURE_REQUIRED' }); return; }
     const now = Date.now();
     this._db._db.prepare(`
-      UPDATE sov_case_jurors SET status = 'voted', vote = ?, voted_at = ? WHERE case_id = ? AND juror_id = ?
-    `).run(vote, now, case_id, juror_id);
+      UPDATE sov_case_jurors SET status = 'voted', vote = ?, voted_at = ?, vote_auth = ? WHERE case_id = ? AND juror_id = ?
+    `).run(vote, now, JSON.stringify(voteAuth), case_id, juror_id);
 
     this._send(ws, 'DV', { type: 'JUSTICE_VOTE_RECORDED', success: true, case_id, vote_recorded: vote });
 
     // Broadcast vote to peers
     this._peerMesh.broadcast('JUSTICE_VOTE_BROADCAST', {
-      case_id, juror_id, vote, voted_at: now, node_id: this._identity.nodeId,
+      case_id, juror_id, vote, voted_at: now, auth: voteAuth, node_id: this._identity.nodeId,
     });
 
     // Check if we have reached a verdict
@@ -494,6 +593,24 @@ class JusticeEngine {
 
     if (moves.length || holds.length) {
       const op = { op_id: `verdict:${caseId}`, kind: 'verdict', ref: caseId, moves, holds };
+      // 1.4.97 (D80): the proof every node re-checks — the plaintiff's signed filing and each juror's
+      // signed vote. This node checks it FIRST: it must never apply a verdict its peers would refuse.
+      const voters = this._db._db.prepare(
+        "SELECT juror_id, vote, vote_auth FROM sov_case_jurors WHERE case_id = ? AND status = 'voted'"
+      ).all(caseId);
+      op.proof = {
+        case: { case_id: caseId, plaintiff_id: dispute.plaintiff_id, defendant_id: dispute.defendant_id,
+                amount_seeds: Number(dispute.amount_seeds || 0), open_auth: dispute.open_auth || '' },
+        verdict,
+        votes: voters.map(j => ({ juror_id: j.juror_id, vote: j.vote, auth: j.vote_auth || '' })),
+      };
+      const proofWhy = this._validateVerdictOp(op);
+      if (proofWhy) {
+        global.sovLog.error(`[JUSTICE] case ${caseId}: verdict NOT executed — its proof does not hold here (${proofWhy})`);
+        this._db._db.prepare('UPDATE sov_disputes SET status = ?, verdict = ?, closed_at = 0 WHERE case_id = ?')
+          .run(dispute.status, dispute.verdict || '', caseId);   // undo the 'decided' mark: nothing was decided
+        return;
+      }
       // Taking money from the defendant's wallet takes the defendant's slot, like any spend of it.
       const done = debitsDefendant
         ? this._db.ledger.commitOwnerOp({ ...op, owner: { acct: dispute.defendant_id } })
@@ -565,20 +682,25 @@ class JusticeEngine {
   //  PEER MESH HANDLERS
   // ═══════════════════════════════════════════════════════════════════════════
 
-  _handleCaseBroadcast(msg) {
+  // 1.4.97 (D80): a replicated case needs the plaintiff's own signed filing for exactly these parties
+  // and this amount; its status starts fresh here (a peer cannot hand over a decided case).
+  _handleCaseBroadcast(msg, ws) {
     const { dispute, node_id } = msg;
-    if (node_id === this._identity.nodeId || !dispute) return;
+    if (node_id === this._identity.nodeId || !dispute || !dispute.case_id) return;
+    const why = this._signedBy(dispute.open_auth, dispute.plaintiff_id, 'DO', 'DISPUTE_OPEN', this._openFieldsOk(dispute));
+    if (why) return this._refusePeer(`case ${dispute.case_id}`, why);
     try {
       this._db._db.prepare(`
         INSERT OR IGNORE INTO sov_disputes
           (case_id, plaintiff_id, defendant_id, evidence_hash, amount_seeds, bond_held,
-           status, created_at, track, memo, restitution_unpaid_seeds)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           status, created_at, track, memo, restitution_unpaid_seeds, open_auth)
+        VALUES (?, ?, ?, ?, ?, ?, 'jury_selection', ?, ?, ?, 0, ?)
       `).run(
         dispute.case_id, dispute.plaintiff_id, dispute.defendant_id,
         dispute.evidence_hash || '', dispute.amount_seeds || 0, dispute.bond_held || 0,
-        dispute.status || 'jury_selection', dispute.created_at, dispute.track || 'transaction',
-        dispute.memo || '', dispute.restitution_unpaid_seeds || 0
+        Math.min(Number(dispute.created_at) || Date.now(), Date.now()), dispute.track || 'transaction',
+        dispute.memo || '',
+        typeof dispute.open_auth === 'string' ? dispute.open_auth : JSON.stringify(dispute.open_auth)
       );
     } catch (_) {}
   }
@@ -590,13 +712,18 @@ class JusticeEngine {
     this._gateway.push(juror_id, 'JI', payload || { case_id });
   }
 
-  _handleVoteBroadcast(msg) {
-    const { case_id, juror_id, vote, voted_at, node_id } = msg;
+  // 1.4.97 (D80/D82): a relayed juror vote counts only with the juror's own signed vote on this case.
+  _handleVoteBroadcast(msg, ws) {
+    const { case_id, juror_id, vote, voted_at, auth, node_id } = msg;
     if (node_id === this._identity.nodeId || !case_id || !juror_id) return;
+    if (vote !== 'conviction' && vote !== 'dismissal') return;
+    const why = this._signedBy(auth, juror_id, 'DV', 'JUSTICE_VOTE', (req) => req.case_id === case_id && req.vote === vote);
+    if (why) return this._refusePeer(`juror vote on ${case_id}`, why);
     this._db._db.prepare(`
-      UPDATE sov_case_jurors SET status = 'voted', vote = ?, voted_at = ?
+      UPDATE sov_case_jurors SET status = 'voted', vote = ?, voted_at = ?, vote_auth = ?
       WHERE case_id = ? AND juror_id = ? AND status = 'accepted'
-    `).run(vote, voted_at || Date.now(), case_id, juror_id);
+    `).run(vote, Math.min(Number(voted_at) || Date.now(), Date.now()),
+           typeof auth === 'string' ? auth : JSON.stringify(auth), case_id, juror_id);
   }
 
   _handleVerdictBroadcast(msg) {

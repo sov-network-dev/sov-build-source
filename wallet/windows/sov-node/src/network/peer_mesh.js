@@ -78,12 +78,35 @@ function _hostOf(a) {
 // payments (the 2026-10-09 outage: two demo desktops had become voting operators, then went offline).
 // Declared in PEER_HELLO and signed with the identity key; every node records it the same way.
 const NODE_ROLE = process.env.SOV_NODE_ROLE === 'serving' ? 'serving' : 'voting';
+
+// 1.4.97 (audit D85/D81): peer messages that write state on the SENDING NODE'S word — nothing in them
+// is signed by a citizen that this node re-checks. They are taken only from a trusted node
+// (network/trusted_nodes.js). Citizen-signed traffic (ledger ops, votes, petitions, disputes, juror
+// votes), message/call transport and node admission are NOT in this set: those carry their own proof.
+const UNTRUSTED_REFUSED = new Set([
+  'STATE_DELTA_RESPONSE', 'NETWORK_SEED',
+  'ENROLLMENT_BROADCAST', 'ENROLL_DEDUP_RESPONSE', 'DEDUP_RESULT', 'PALM_NAME_BROADCAST',
+  'MESSAGING_KEY_PUBLISHED', 'CITIZEN_LINK_BROADCAST', 'SOV_LOGIN_VERIFIED_FORWARD',
+  'PAIRING_BROADCAST', 'PAIRING_STATE_BROADCAST', 'AUTOMATION_POLICY_SYNC',
+  'GUARDIAN_SET_BROADCAST', 'GUARDIAN_INVITE_BROADCAST', 'GUARDIAN_RECOVERY_BROADCAST', 'GUARDIAN_APPROVAL_BROADCAST',
+  'VAULT_BROADCAST', 'VAULT_CLAIM_BROADCAST', 'ALLOCATION_BROADCAST', 'ALLOCATION_STATUS_BROADCAST', 'RECLAMATION_PROPOSED',
+  'JUSTICE_VERDICT_BROADCAST', 'JUSTICE_JUROR_FORWARD',
+  'GROUP_MEMBERSHIP_BROADCAST', 'GROUP_LEAVE_BROADCAST',
+  'EXCHANGE_ORDER_BROADCAST', 'EXCHANGE_STATUS_BROADCAST', 'EXCHANGE_STATE_REPLICATE',
+  'EXCHANGE_FILL_FORWARD', 'EXCHANGE_HOME_REQUEST', 'EXCHANGE_HOME_REPLY',
+  'PLATFORM_BROADCAST', 'PAY_REQ_PAID_BROADCAST', 'OPERATOR_PAYOUT_BROADCAST', 'PROOF_OF_SERVICE',
+  'POOL_DELTA', 'POOL_DELTA_DIGEST', 'POOL_INFLOW_SYNC', 'ISSUANCE_LOG_BROADCAST',
+  'ACADEMY_ARTICLE_BROADCAST', 'ENCLAVE_POST_BROADCAST', 'ENCLAVE_REPLY_BROADCAST', 'MSG_REACTION_BROADCAST',
+  'BUILDER_REGISTRY_BROADCAST', 'BUILD_ATTESTATION', 'RELEASE_MANIFEST_BROADCAST',
+]);
+const trustedNodes = require('./trusted_nodes');
 if (typeof global !== 'undefined') global.sovNodeRole = NODE_ROLE;
 
 class PeerMesh {
 
   constructor(identity, network, db, relayPool) {
     this._identity  = identity;
+    try { trustedNodes.setSelf(identity && identity.nodeId); } catch (_) {}
     this._network   = network;
     this._db        = db;
     this._relayPool = relayPool; // null if not provided
@@ -181,7 +204,10 @@ class PeerMesh {
       // 1.4.96: only a VOTING peer becomes a validator here. A serving node is never recorded, so no
       // certificate ever has to include it and its absence can never stall a payment.
       const voting = !(peer && peer.ws && peer.ws._peerRole === 'serving');
-      if (voting && this._db && this._db.recordValidatorSeen) this._db.recordValidatorSeen(nodeId, pub);
+      // 1.4.97: and only a TRUSTED node. Declaring 'voting' is the peer's own claim; an untrusted node
+      // recorded as a validator would count in every majority and could grant money slots.
+      if (voting && !trustedNodes.isTrusted(nodeId)) trustedNodes.refuse('validator registration', nodeId);
+      else if (voting && this._db && this._db.recordValidatorSeen) this._db.recordValidatorSeen(nodeId, pub);
     } catch (_) {}
     const cbs = this._admittedCbs || [];
     if (!cbs.length) return;
@@ -582,6 +608,13 @@ class PeerMesh {
     // Verify Ed25519 signature on all peer messages
     if (!this._verifySig(msg)) {
       global.sovLog.debug(`Signature verification failed for ${msg.type} from ${ws._nodeId}`);
+      return;
+    }
+
+    // 1.4.97: unsigned state only from a trusted node, judged by the AUTHENTICATED link id
+    // (ws._nodeId, proven at PEER_HELLO) — never by the node_id a message claims.
+    if (UNTRUSTED_REFUSED.has(msg.type) && !trustedNodes.isTrusted(ws._nodeId)) {
+      trustedNodes.refuse(msg.type, ws._nodeId);
       return;
     }
 
@@ -1117,6 +1150,15 @@ class PeerMesh {
     const peer = this._peers.get(msg.node_id);
     if (peer) {
       peer.lastSeen = Date.now();
+      // 1.4.97: a trusted voting peer that was not yet trusted when it was admitted (the trust list
+      // changed afterwards) is recorded as a validator now — once, not on every heartbeat.
+      try {
+        const id = ws && ws._nodeId ? String(ws._nodeId) : null;
+        if (id && id === String(msg.node_id) && ws._peerRole !== 'serving' && trustedNodes.isTrusted(id)
+            && this._db && this._db.validatorPub && !this._db.validatorPub(id) && this._db.recordValidatorSeen) {
+          this._db.recordValidatorSeen(id, peer.publicKey ? String(peer.publicKey).toLowerCase() : null);
+        }
+      } catch (_) {}
       // Phase 2 (tiered compute): remember what this peer says it can hold, so work that
       // needs the full biometric set is routed only to peers that have it. Only the fields
       // routing reads are kept, each type-checked — a peer cannot plant arbitrary state here.

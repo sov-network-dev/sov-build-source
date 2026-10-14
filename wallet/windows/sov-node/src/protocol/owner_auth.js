@@ -165,4 +165,15 @@ function check(op, ctx) {
   return null;
 }
 
-module.exports = { check, opIdFor, fromAppRequest, fromPlatformRegister, RULES, FRESH_MS };
+/**
+ * 1.4.97: verify a citizen's signed APP request outside the ledger (governance: poll create, vote,
+ * petition create, petition sign). Same scheme and same exact-bytes check as an owner op.
+ * @returns { req, signer, ts } on success, { reason } otherwise.
+ */
+function verifyAppRequest(auth, pubHex) {
+  if (!auth || auth.scheme !== 'app' || typeof auth.raw !== 'string' || !auth.signature) return { reason: 'AUTH_MISSING' };
+  if (!pubHex) return { reason: 'AUTH_NOT_ENROLLED' };
+  return _verifyApp(auth, pubHex);
+}
+
+module.exports = { check, opIdFor, fromAppRequest, fromPlatformRegister, verifyAppRequest, RULES, FRESH_MS };
