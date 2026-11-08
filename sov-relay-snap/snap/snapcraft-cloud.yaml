@@ -46,7 +46,7 @@ apps:
 #        <proj>/snap/snapcraft.yaml   (this file)
 #        <proj>/sov-node/             (= wallet/windows/sov-node: src + package.json + lock + snap.env.template)
 #        <proj>/relay-scripts/        (= sov-relay-snap/scripts/*)
-#      and the parts below source ../sov-node, ../relay-scripts.
+#      and the parts below source sov-node, relay-scripts (relative to the project dir).
 #      NOTE: the plain snap's `ops` maintenance helpers are intentionally not
 #      built here yet — they are not runtime-required and are outside src/ (so
 #      source_root is unchanged); they return once cleaned for public release.
@@ -81,7 +81,7 @@ parts:
   sov-node:
     plugin:      nil
     # relative to <snap-project>/snap/ — the node source checked out alongside it
-    source: ../sov-node
+    source: sov-node
     source-type: local
     override-build: |
       mkdir -p $SNAPCRAFT_PART_INSTALL/src
@@ -99,7 +99,7 @@ parts:
     after: [sov-node, node-runtime]
     # toolchain for building the native better-sqlite3 addon in core22
     build-packages: [python3, build-essential, curl, ca-certificates]
-    source: ../sov-node
+    source: sov-node
     source-type: local
     override-build: |
       set -eu
@@ -130,7 +130,7 @@ parts:
   scripts:
     plugin: nil
     after: [node-runtime]
-    source: ../relay-scripts
+    source: relay-scripts
     source-type: local
     override-build: |
       mkdir -p $SNAPCRAFT_PART_INSTALL/bin
