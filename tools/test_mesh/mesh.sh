@@ -74,9 +74,37 @@ write_trust() {
   for d in $BASE/n*; do mkdir -p $d/data; echo "[${ids%,}]" > $d/data/trusted_nodes.json; done
 }
 
+# Kill anything still listening on node $1's four ports inside the namespace, and WAIT until they
+# are free, BEFORE we bind. The node retries EADDRINUSE for only 30 s (peer_mesh.js _startServer),
+# so on a fast runner a lingering/un-killed predecessor — a prior scenario's orphan, or a restart
+# whose `kill $(cat n$i/pid)` no-op'd because the pid file had vanished — can hold a port past that
+# window and make PeerMesh.start() reject (boot dies at index.js:280). Freeing by PORT is
+# authoritative: it does not depend on a pid file, so it fixes both the restart (presence) and the
+# initial-bind (ledger_paths) collisions seen in the cloud runner. Harness-only; source_root untouched.
+free_node_ports() {  # $1 = node number
+  local i=$1 p pid pids ok
+  local ports="$(port $SOV_BASE $i) $(port $SYNC_BASE $i) $(port $DISC_BASE $i) $(port $DASH_BASE $i)"
+  for t in $(seq 1 60); do   # up to ~30 s — matches the node's own give-up window
+    ok=1
+    for p in $ports; do
+      # ss's own `sport = :$p` filter silently matches nothing for a dualstack `*:$p` listener on
+      # this iproute2, so parse the local-address column (col 4) and match the port exactly after
+      # splitting on ':' (handles *:p, 127.0.0.1:p and [::1]:p; no substring false positives).
+      pids=$(ip netns exec $NS ss -ltnpH 2>/dev/null \
+               | awk -v p="$p" '{split($4,a,":"); if (a[length(a)]==p) print}' \
+               | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+      [ -n "$pids" ] && { ok=0; for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done; }
+    done
+    [ "$ok" = 1 ] && return 0
+    sleep 0.5
+  done
+  echo "  WARN: node $i ports still busy after 30 s ($ports)"; return 0
+}
+
 start_node() {  # $1 number, $2 light, $3 extra env
   local i=$1 d=$BASE/n$1
   mkdir -p $d/data
+  free_node_ports $i   # ports must be genuinely free before we bind, pid file or not
   : > $d/node.log   # truncate BEFORE launch, or the boot check can match the previous run's [9/9]
   # setsid: the node must outlive this wsl session (WSL kills a session's process group on exit;
   # keep a separate `wsl -- sleep infinity` open too, or the whole distro idles down).
