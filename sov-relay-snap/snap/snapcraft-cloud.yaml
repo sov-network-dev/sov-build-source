@@ -1,0 +1,139 @@
+name: sov-relay
+version: "0.0.0-cloud"   # overwritten by the workflow (-f version=1.4.NN-plain)
+summary: SOV Network Relay Node - Sovereign Identity Infrastructure
+description: |
+  The SOV Network relay node. Install this snap and you become part of the
+  sovereign identity network - earning SOV for serving citizens.
+
+  First-run setup:
+    sudo cp /snap/sov-relay/current/snap.env.template /var/snap/sov-relay/current/.env
+    sudo nano /var/snap/sov-relay/current/.env
+    sudo snap restart sov-relay
+
+  Logs:
+    sudo snap logs sov-relay.sov-relay -n 50
+
+grade: devel
+confinement: devmode
+base: core22
+
+architectures:
+  - build-on: amd64
+    build-for: amd64
+
+environment:
+  SOV_DATA_DIR: $SNAP_DATA
+  NODE_ENV:     production
+  PATH:         $SNAP/bin:$PATH
+
+apps:
+  setup:
+    command: bin/sov-setup.sh
+    plugs: [network]
+  sov-relay:
+    command:           bin/start-sov-relay.sh
+    daemon:            simple
+    restart-condition: on-failure
+    plugs: [network, network-bind, home]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLOUD VARIANT of snapcraft-plain.yaml. Differences, and ONLY these:
+#   1. Every `source:` is INSIDE the snap project dir, so it builds from a git
+#      checkout on a GitHub runner — no build-host-specific absolute paths.
+#      snapcore/action-build runs snapcraft in an LXD instance that mounts ONLY
+#      the project dir, so paths above it are invisible — the workflow assembles
+#      a self-contained project dir first:
+#        <proj>/snap/snapcraft.yaml   (this file)
+#        <proj>/sov-node/             (= wallet/windows/sov-node: src + package.json + lock + snap.env.template)
+#        <proj>/relay-scripts/        (= sov-relay-snap/scripts/*)
+#      and the parts below source ../sov-node, ../relay-scripts.
+#      NOTE: the plain snap's `ops` maintenance helpers are intentionally not
+#      built here yet — they are not runtime-required and are outside src/ (so
+#      source_root is unchanged); they return once cleaned for public release.
+#   2. The native addons (better-sqlite3-multiple-ciphers) are built FRESH inside
+#      the core22 build environment (glibc 2.35), not vendored. core22's 2.35 is
+#      the SAME libc the snap runtime and the VPS fleet (Ubuntu 22.04) use, so the
+#      result loads on every node. The WSL build vendored a glibc-2.29 blob only
+#      because the WSL host libc (2.43) is too new for core22; a runner does not
+#      have that problem. desktop-ci.yml already rebuilds this exact module fresh
+#      on a Linux runner and boots the node, so the pattern is proven.
+#   3. node-runtime stages the FULL node dist (npm needs its lib/), so `npm ci`
+#      works in the build with the same Node 20.20.0 the runtime ships (ABI 115).
+# The embedded src/ is byte-identical to snapcraft-plain's, so the built snap
+# hashes to the SAME source_root — the workflow asserts it against the expected
+# fleet root before the artifact is trusted.
+# ─────────────────────────────────────────────────────────────────────────────
+parts:
+  node-runtime:
+    plugin: nil
+    build-packages: [curl, ca-certificates]
+    override-build: |
+      NODE_VERSION=20.20.0
+      ARCH=linux-x64
+      curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-${ARCH}.tar.gz" \
+        | tar xz --strip-components=1 -C $SNAPCRAFT_PART_INSTALL
+    stage:
+      - bin/node
+      - bin/npm
+      - bin/npx
+      - lib/node_modules/npm
+
+  sov-node:
+    plugin:      nil
+    # relative to <snap-project>/snap/ — the node source checked out alongside it
+    source: ../sov-node
+    source-type: local
+    override-build: |
+      mkdir -p $SNAPCRAFT_PART_INSTALL/src
+      cp -r $SNAPCRAFT_PART_BUILD/src/. $SNAPCRAFT_PART_INSTALL/src/
+      # Never ship editing history to operators.
+      find $SNAPCRAFT_PART_INSTALL/src -name "*.bak_*" -delete
+      find $SNAPCRAFT_PART_INSTALL/src -name "*.tmpw" -delete
+      find $SNAPCRAFT_PART_INSTALL/src -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+      cp $SNAPCRAFT_PART_BUILD/package.json $SNAPCRAFT_PART_INSTALL/
+      cp $SNAPCRAFT_PART_BUILD/package-lock.json $SNAPCRAFT_PART_INSTALL/
+      cp $SNAPCRAFT_PART_BUILD/snap.env.template $SNAPCRAFT_PART_INSTALL/
+
+  node-modules:
+    plugin: nil
+    after: [sov-node, node-runtime]
+    # toolchain for building the native better-sqlite3 addon in core22
+    build-packages: [python3, build-essential, curl, ca-certificates]
+    source: ../sov-node
+    source-type: local
+    override-build: |
+      set -eu
+      # Use the same Node the runtime ships (20.20.0 / ABI 115) for the build, so
+      # the compiled .node matches the runtime exactly and links core22 glibc 2.35.
+      export PATH="$SNAPCRAFT_STAGE/bin:$PATH"
+      node --version
+      # package.json + package-lock.json come from the source dir
+      cp $SNAPCRAFT_PART_BUILD/package.json $SNAPCRAFT_PART_INSTALL/ 2>/dev/null || true
+      cd $SNAPCRAFT_PART_INSTALL
+      cp $SNAPCRAFT_PART_BUILD/package.json .
+      cp $SNAPCRAFT_PART_BUILD/package-lock.json .
+      # --omit=dev: the node only needs runtime deps. npm rebuilds native addons
+      # from source here (no prebuilt for this exact target), linking core22 libc.
+      npm ci --omit=dev --build-from-source
+      rm -f package.json package-lock.json
+      # Prove the AES-disc native actually loads under the staged runtime node.
+      "$SNAPCRAFT_STAGE/bin/node" -e "const D=require('$SNAPCRAFT_PART_INSTALL/node_modules/better-sqlite3-multiple-ciphers');const db=new D(':memory:');db.pragma(\"cipher='sqlcipher'\");db.exec('CREATE TABLE t(x)');console.log('NATIVE AES DISC OK (core22, fresh build)');"
+      # Fail the build if any native links a glibc newer than core22's 2.35.
+      MAXG=$(find $SNAPCRAFT_PART_INSTALL -name '*.node' -exec objdump -T {} \; 2>/dev/null \
+             | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1)
+      echo "max GLIBC needed by natives: ${MAXG:-none}"
+      case "${MAXG:-GLIBC_2.0}" in
+        GLIBC_2.3[0-5]|GLIBC_2.[0-2]*|GLIBC_2.[0-9]|none) : ;;
+        *) echo "REFUSING: natives need $MAXG, newer than core22 glibc 2.35"; exit 1 ;;
+      esac
+
+  scripts:
+    plugin: nil
+    after: [node-runtime]
+    source: ../relay-scripts
+    source-type: local
+    override-build: |
+      mkdir -p $SNAPCRAFT_PART_INSTALL/bin
+      cp $SNAPCRAFT_PART_BUILD/start-sov-relay.sh $SNAPCRAFT_PART_INSTALL/bin/
+      cp $SNAPCRAFT_PART_BUILD/sov-setup.sh $SNAPCRAFT_PART_INSTALL/bin/
+      chmod +x $SNAPCRAFT_PART_INSTALL/bin/*.sh

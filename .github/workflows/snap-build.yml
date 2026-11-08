@@ -1,0 +1,105 @@
+name: snap-build
+
+# Builds the sov-relay node snap IN THE CLOUD, replacing the WSL-only
+# scripts/wsl_build_snap.sh. The one hard requirement a cloud snap must meet is
+# that its embedded src/ hashes to the SAME source_root the live fleet runs — so
+# the fleet accepts a node built from it. This workflow asserts that before the
+# artifact is trusted.
+#
+# WHY LXD (snapcore/action-build) AND NOT --destructive-mode:
+#   The native AES addon (better-sqlite3-multiple-ciphers) links whatever glibc
+#   it is built against. The snap runtime is core22 (glibc 2.35) and the VPS
+#   fleet is Ubuntu 22.04 (glibc 2.35). A GitHub runner host is newer
+#   (ubuntu-24.04, glibc 2.39), so building on the host — like WSL did — would
+#   produce a native that fails on the nodes with "GLIBC_2.3x not found". That is
+#   the exact reason WSL had to vendor a glibc-2.29 blob. snapcore/action-build
+#   runs snapcraft inside an LXD core22 instance, so the native is built against
+#   glibc 2.35 and loads everywhere the fleet runs. No vendored blob.
+#
+# Trigger: manual only (workflow_dispatch) until it is proven green, so it never
+# runs on a push or a schedule and never emails the owner on an incidental fail.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Snap version, e.g. 1.4.99-plain'
+        required: true
+      expected_root:
+        description: 'source_root the built snap MUST embed (the live fleet root)'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Assemble a self-contained snap project dir. snapcraft's LXD instance
+      # mounts ONLY the project dir, so every `source:` must live inside it.
+      - name: Assemble snap project
+        run: |
+          set -eu
+          P=snap-build
+          rm -rf "$P"; mkdir -p "$P/snap" "$P/sov-node" "$P/relay-scripts"
+          cp sov-relay-snap/snap/snapcraft-cloud.yaml "$P/snap/snapcraft.yaml"
+          # node source: src/ + the three root files the sov-node part copies
+          cp -r wallet/windows/sov-node/src "$P/sov-node/src"
+          cp wallet/windows/sov-node/package.json      "$P/sov-node/"
+          cp wallet/windows/sov-node/package-lock.json "$P/sov-node/"
+          cp wallet/windows/sov-node/snap.env.template "$P/sov-node/"
+          cp sov-relay-snap/scripts/start-sov-relay.sh "$P/relay-scripts/"
+          cp sov-relay-snap/scripts/sov-setup.sh       "$P/relay-scripts/"
+          # stamp the requested version
+          sed -i "s/^version: .*/version: \"${{ inputs.version }}\"/" "$P/snap/snapcraft.yaml"
+          grep -q "^version: \"${{ inputs.version }}\"" "$P/snap/snapcraft.yaml"
+          echo "assembled $P:"; find "$P" -maxdepth 2 -type d | sort
+
+      # Prove the source we are about to package already hashes to the expected
+      # fleet root BEFORE spending ~10 min on a build — fail fast otherwise.
+      - name: Pre-flight source_root check
+        run: |
+          set -eu
+          GOT=$(node -e "const m=require('./snap-build/sov-node/src/release/source_root.js');const r=m.sourceRoot('./snap-build/sov-node',{include:['src']});console.log(r.root);")
+          echo "source tree root: $GOT"
+          if [ "$GOT" != "${{ inputs.expected_root }}" ]; then
+            echo "::error::source tree root $GOT != expected ${{ inputs.expected_root }} — refusing to build"
+            exit 1
+          fi
+          echo "source root matches the expected fleet root."
+
+      - name: Build snap (LXD / core22)
+        uses: snapcore/action-build@v1
+        id: build
+        with:
+          path: snap-build
+
+      - name: Verify the built snap embeds the fleet root
+        run: |
+          set -eu
+          SNAP="${{ steps.build.outputs.snap }}"
+          echo "built: $SNAP"; sha256sum "$SNAP"
+          sudo apt-get install -y squashfs-tools >/dev/null 2>&1 || true
+          Q=/tmp/sq; rm -rf "$Q"; unsquashfs -q -d "$Q" "$SNAP" >/dev/null
+          IN=$(node -e "const m=require('$Q/src/release/source_root.js');const r=m.sourceRoot('$Q',{include:['src']});console.log(r.root+' '+(r.fileCount??r.files));")
+          echo "root embedded in the built snap: $IN"
+          if [ "${IN%% *}" != "${{ inputs.expected_root }}" ]; then
+            echo "::error::built snap embeds ${IN%% *}, not ${{ inputs.expected_root }}"
+            exit 1
+          fi
+          # natives must not need a glibc newer than core22's 2.35
+          MAXG=$(find "$Q" -name '*.node' -exec objdump -T {} \; 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1)
+          echo "max GLIBC needed by natives: ${MAXG:-none}"
+          case "${MAXG:-GLIBC_2.0}" in
+            GLIBC_2.3[0-5]|GLIBC_2.[0-2]*|GLIBC_2.[0-9]|none) echo "glibc ok for core22" ;;
+            *) echo "::error::natives need $MAXG, newer than core22 glibc 2.35"; exit 1 ;;
+          esac
+          echo "CLOUD SNAP OK — embeds the fleet root and links core22 glibc."
+
+      - name: Upload snap artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sov-relay-${{ inputs.version }}-snap
+          path: snap-build/*.snap
+          if-no-files-found: error
+          retention-days: 14
