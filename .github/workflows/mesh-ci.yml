@@ -1,0 +1,110 @@
+name: mesh-tests
+# Run the isolated multi-node SOV mesh regression (tools/test_mesh/regress_all.sh, 16 scenarios)
+# in the cloud, so WSL is no longer needed to prove protocol changes before the live fleet.
+#
+# WHY THIS WORKS IN THE CLOUD (same reasoning as snap-build, different mechanism):
+#   The mesh runs several real node processes inside a Linux network namespace (loopback only),
+#   on ONE host. The native AES addon is built FRESH on the runner and the nodes run on that same
+#   runner, so whatever glibc the runner has (newer than the fleet's) is irrelevant — nothing here
+#   is shipped to a node. source_root is unaffected (node_modules sit outside src/), and a pre-flight
+#   check asserts the node src hashes to the expected fleet root before any scenario runs.
+#
+#   The harness is published SANITIZED (scripts/stage_mesh_ci.sh): the dev path and the fleet IPs in
+#   mesh.sh's isolation guard are rewritten to /opt/sov and TEST-NET-1. The workflow recreates those
+#   exact paths on the runner, so the scripts run byte-for-byte as they do in WSL.
+#
+# workflow_dispatch only — never on push. The mesh must run released `main` (whose src hashes to the
+# fleet root); unreleased branches hash differently by design and are never published here anyway.
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_root:
+        description: "source_root the node src must hash to (fleet root)"
+        required: true
+        default: "40eaf1516208d274118e141b6faaea9a98802e1a9d7bf0430b8613b8f0d8d25c"
+
+permissions:
+  contents: read
+
+jobs:
+  mesh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # realistic run is well under an hour; this is only a ceiling
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node 20.20.0 at /usr/local/bin (the runtime the snap ships)
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://nodejs.org/dist/v20.20.0/node-v20.20.0-linux-x64.tar.gz" \
+            | sudo tar xz --strip-components=1 -C /usr/local
+          /usr/local/bin/node --version
+
+      - name: Recreate the harness paths on the runner
+        run: |
+          set -euo pipefail
+          # The sanitized scripts reference /opt/sov as the repo root. Point it at the checkout.
+          sudo ln -sfn "$GITHUB_WORKSPACE" /opt/sov
+          # regress_all writes per-scenario logs here.
+          mkdir -p "$GITHUB_WORKSPACE/docs/ledger"
+          # Native build toolchain for better-sqlite3-multiple-ciphers.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3 build-essential rsync
+
+      - name: Build node_modules fresh into the vendor path the mesh expects
+        run: |
+          set -euo pipefail
+          NODEDIR="$GITHUB_WORKSPACE/wallet/windows/sov-node"
+          test -f "$NODEDIR/package.json" && test -f "$NODEDIR/package-lock.json"
+          BUILD=$(mktemp -d)
+          cp "$NODEDIR/package.json" "$NODEDIR/package-lock.json" "$BUILD/"
+          cd "$BUILD"
+          # Build native addons from source so they link THIS runner's libc (fine — they run here).
+          /usr/local/bin/npm ci --omit=dev --build-from-source
+          # The mesh loads modules via NODE_PATH=/root/sov-build/vendor/node_modules.
+          sudo mkdir -p /root/sov-build/vendor
+          sudo cp -r "$BUILD/node_modules" /root/sov-build/vendor/node_modules
+          # Prove the AES-disc native actually loads under the runtime node, as root (how the mesh runs).
+          sudo env NODE_PATH=/root/sov-build/vendor/node_modules /usr/local/bin/node -e \
+            "const D=require('better-sqlite3-multiple-ciphers');const db=new D(':memory:');db.pragma(\"cipher='sqlcipher'\");db.exec('CREATE TABLE t(x)');console.log('NATIVE AES DISC OK (fresh build)');"
+
+      - name: Pre-flight — node src must hash to the expected fleet root
+        run: |
+          set -euo pipefail
+          EXPECT="${{ github.event.inputs.expected_root }}"
+          NODEDIR="$GITHUB_WORKSPACE/wallet/windows/sov-node"
+          GOT=$(/usr/local/bin/node -e 'const m=require(process.argv[1]+"/src/release/source_root.js");const r=m.sourceRoot(process.argv[1],{include:["src"]});console.log(r.root)' "$NODEDIR")
+          echo "expected $EXPECT"
+          echo "got      $GOT"
+          [ "$GOT" = "$EXPECT" ] || { echo "REFUSING: node src does not hash to the fleet root"; exit 1; }
+
+      - name: Run the mesh regression (16 scenarios, as root for netns)
+        run: |
+          set -uo pipefail
+          sudo env PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+            bash "$GITHUB_WORKSPACE/tools/test_mesh/regress_all.sh" | tee "$GITHUB_WORKSPACE/regress_console.log"
+
+      - name: Verdict — require 16 ALL PASS
+        run: |
+          set -euo pipefail
+          echo "=== per-scenario verdicts ==="
+          cat "$GITHUB_WORKSPACE/regress_console.log" | sed -n '/: /p' | grep -vE 'REGRESSION DONE' || true
+          PASS=$(grep -c 'ALL PASS' "$GITHUB_WORKSPACE/regress_console.log" || true)
+          FAILN=$(grep -cE 'SOME FAILED|^FAILED|no verdict line' "$GITHUB_WORKSPACE/regress_console.log" || true)
+          echo "ALL PASS lines: $PASS ; failures/no-verdict: $FAILN"
+          if [ "$PASS" -eq 16 ] && [ "$FAILN" -eq 0 ]; then
+            echo "MESH REGRESSION GREEN — 16/16 in the cloud"
+          else
+            echo "MESH REGRESSION NOT GREEN"; exit 1
+          fi
+
+      - name: Upload scenario logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh-regress-logs
+          path: |
+            docs/ledger/RUN_regress_*.log
+            regress_console.log
+          retention-days: 14
