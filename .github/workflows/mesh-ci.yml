@@ -23,6 +23,10 @@ on:
         description: "source_root the node src must hash to (fleet root)"
         required: true
         default: "40eaf1516208d274118e141b6faaea9a98802e1a9d7bf0430b8613b8f0d8d25c"
+      scenarios:
+        description: "space-separated subset to run (blank = all 16). Use for a quick smoke, e.g. 'admission'"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -83,18 +87,31 @@ jobs:
         run: |
           set -uo pipefail
           sudo env PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
+            MESH_SCENARIOS='${{ github.event.inputs.scenarios }}' \
             bash "$GITHUB_WORKSPACE/tools/test_mesh/regress_all.sh" | tee "$GITHUB_WORKSPACE/regress_console.log"
 
       - name: Verdict — require 16 ALL PASS
         run: |
           set -euo pipefail
+          LOG="$GITHUB_WORKSPACE/regress_console.log"
           echo "=== per-scenario verdicts ==="
-          cat "$GITHUB_WORKSPACE/regress_console.log" | sed -n '/: /p' | grep -vE 'REGRESSION DONE' || true
-          PASS=$(grep -c 'ALL PASS' "$GITHUB_WORKSPACE/regress_console.log" || true)
-          FAILN=$(grep -cE 'SOME FAILED|^FAILED|no verdict line' "$GITHUB_WORKSPACE/regress_console.log" || true)
-          echo "ALL PASS lines: $PASS ; failures/no-verdict: $FAILN"
-          if [ "$PASS" -eq 16 ] && [ "$FAILN" -eq 0 ]; then
-            echo "MESH REGRESSION GREEN — 16/16 in the cloud"
+          grep -E '^[a-z_]+: ' "$LOG" || true
+          DONE=$(grep -c 'REGRESSION DONE' "$LOG" || true)         # run finished, not cancelled/killed
+          VLINES=$(grep -cE '^[a-z_]+: ' "$LOG" || true)           # one summary line per scenario run
+          PASS=$(grep -c 'ALL PASS' "$LOG" || true)                # scenarios that passed
+          FAILN=$(grep -cE 'SOME FAILED|^FAILED|no verdict line' "$LOG" || true)
+          WANT='${{ github.event.inputs.scenarios }}'
+          echo "finished=$DONE  scenarios=$VLINES  ALL PASS=$PASS  failures/no-verdict=$FAILN"
+          # Every scenario that ran must pass, the run must have finished, and ≥1 scenario ran.
+          GREEN=1
+          [ "$DONE" -ge 1 ] || GREEN=0
+          [ "$FAILN" -eq 0 ] || GREEN=0
+          [ "$PASS" -ge 1 ] || GREEN=0
+          [ "$PASS" -eq "$VLINES" ] || GREEN=0
+          # A full run (blank input) must be exactly the 16-scenario regression.
+          if [ -z "$WANT" ] && [ "$PASS" -ne 16 ]; then GREEN=0; fi
+          if [ "$GREEN" -eq 1 ]; then
+            echo "MESH REGRESSION GREEN — $PASS/$VLINES in the cloud"
           else
             echo "MESH REGRESSION NOT GREEN"; exit 1
           fi

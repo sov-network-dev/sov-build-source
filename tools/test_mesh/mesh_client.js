@@ -71,7 +71,12 @@ function genesisApprovalFor(cap) {   // the out-of-band approver (king) signs TH
 // Genesis-approval TOKEN (SOVPA1 envelope): the approver MINTS it with the REAL tool, the app PARSES it
 // (fail-fast if its bind != this capture), then enrols with the approval inside. Seed hex of the approver.
 function genesisApproverSeedHex() { return crypto.createHash('sha256').update('sov-mesh-genesis-approver').digest('hex'); }
-const APPROVAL_TOOL = require('../personhood/genesis_approval_token');
+// Lazily loaded: the unreleased Path-A genesis-approval token tool lives under tools/personhood/.
+// The 16 released-main mesh scenarios never invoke a personhood-token command, so the cloud harness
+// (which publishes released main, with no tools/personhood/) must not crash merely loading this file.
+// WSL has the file and loads it on first use exactly as before.
+let _approvalTool;
+function approvalTool() { return _approvalTool || (_approvalTool = require('../personhood/genesis_approval_token')); }
 
 function unit(seed, n) {
   const v = []; let h = seed;
@@ -226,8 +231,8 @@ function enroll(port, personSeed, withFace) {
           // Envelope round-trip: build SOVWIT1 per signer, then parse+bind-check it back (mirror of the app).
           const envEndorsers = (csv) => csv.split(',').map(n => {
             const e = identity(n.trim());
-            const env = 'SOVWIT1:' + APPROVAL_TOOL.b64urlEncode(JSON.stringify({ v: 1, bind, signer: e.pub, sig: e.sign(bind) }));
-            const obj = JSON.parse(APPROVAL_TOOL.b64urlDecode(env.slice('SOVWIT1:'.length)));
+            const env = 'SOVWIT1:' + approvalTool().b64urlEncode(JSON.stringify({ v: 1, bind, signer: e.pub, sig: e.sign(bind) }));
+            const obj = JSON.parse(approvalTool().b64urlDecode(env.slice('SOVWIT1:'.length)));
             if (obj.bind !== bind) { console.log('WITNESS_REJECTED_LOCALLY different capture'); process.exit(3); }
             return { signer: obj.signer, sig: obj.sig };
           });
@@ -241,18 +246,18 @@ function enroll(port, personSeed, withFace) {
             // --served-token-reqpath routes the bind through the SOVREQ1 request envelope the app shows and
             // the approver reads back with parseRequest — the full request->mint round-trip.
             const bindForMint = servedTokReq
-              ? APPROVAL_TOOL.parseRequest(APPROVAL_TOOL.REQ_PREFIX + bind) : bind;
-            let tok = APPROVAL_TOOL.mint({ bindStr: bindForMint, seedHex: genesisApproverSeedHex() }).token;
+              ? approvalTool().parseRequest(approvalTool().REQ_PREFIX + bind) : bind;
+            let tok = approvalTool().mint({ bindStr: bindForMint, seedHex: genesisApproverSeedHex() }).token;
             if (servedTokBadS) {                    // corrupt the approval sig inside the envelope
-              const p = APPROVAL_TOOL.parseEnvelope(tok);
+              const p = approvalTool().parseEnvelope(tok);
               const badSig = (p.sig[0] === '0' ? '1' : '0') + p.sig.slice(1);
-              tok = APPROVAL_TOOL.buildEnvelope(p.bind, badSig);
+              tok = approvalTool().buildEnvelope(p.bind, badSig);
             } else if (servedTokBadB) {             // envelope bind != this capture
-              const p = APPROVAL_TOOL.parseEnvelope(tok);
-              tok = APPROVAL_TOOL.buildEnvelope(p.bind + '-X', p.sig);
+              const p = approvalTool().parseEnvelope(tok);
+              tok = approvalTool().buildEnvelope(p.bind + '-X', p.sig);
             }
             // APP SIDE: parse + the fail-fast bind check (mirror of PersonhoodClient.parseApprovalToken).
-            const parsed = APPROVAL_TOOL.parseEnvelope(tok);
+            const parsed = approvalTool().parseEnvelope(tok);
             if (parsed.bind !== bind) { console.log('TOKEN_REJECTED_LOCALLY approval is for a different capture'); process.exit(3); }
             evidence = { path: 'genesis', approval: parsed.sig };
           }
