@@ -123,6 +123,13 @@ case "$cmd" in
   down)
     for d in $BASE/n*; do [ -f $d/pid ] && kill $(cat $d/pid) 2>/dev/null; done; sleep 2
     for d in $BASE/n*; do [ -f $d/pid ] && kill -9 $(cat $d/pid) 2>/dev/null; rm -f $d/pid; done
+    # A pid file can be missing or stale on a fast runner (a write race, or `wipe` rm -rf'd the
+    # node's directory while it was still alive) — the orphan then keeps holding its ports and the
+    # NEXT scenario's `up`/restart hits EADDRINUSE. So reap ANY surviving mesh node by its command
+    # line too (a netns isolates the network, not the pid table, so pkill from here sees them) and
+    # WAIT for them to actually exit before returning, so every scenario starts from a clean slate.
+    pkill -9 -f 'node .*src/index.js' 2>/dev/null || true
+    for t in $(seq 1 30); do pgrep -f 'node .*src/index.js' >/dev/null 2>&1 || break; sleep 0.5; done
     ip netns del $NS 2>/dev/null; echo "mesh down (data kept in $BASE)" ;;
   wipe) "$0" down; rm -rf $BASE/n* $BASE/operator_id $SEED_FILE; echo "mesh data wiped" ;;
   *) echo "usage: mesh.sh up <N> [light...] | down | wipe | status | exec <cmd...> | app"; exit 2 ;;
