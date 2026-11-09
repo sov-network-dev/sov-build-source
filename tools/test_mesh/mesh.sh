@@ -82,7 +82,7 @@ write_trust() {
 # authoritative: it does not depend on a pid file, so it fixes both the restart (presence) and the
 # initial-bind (ledger_paths) collisions seen in the cloud runner. Harness-only; source_root untouched.
 free_node_ports() {  # $1 = node number
-  local i=$1 p pid pids ok
+  local i=$1 p pid pids cmd ok
   local ports="$(port $SOV_BASE $i) $(port $SYNC_BASE $i) $(port $DISC_BASE $i) $(port $DASH_BASE $i)"
   for t in $(seq 1 60); do   # up to ~30 s — matches the node's own give-up window
     ok=1
@@ -93,12 +93,19 @@ free_node_ports() {  # $1 = node number
       pids=$(ip netns exec $NS ss -ltnpH 2>/dev/null \
                | awk -v p="$p" '{split($4,a,":"); if (a[length(a)]==p) print}' \
                | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
-      [ -n "$pids" ] && { ok=0; for pid in $pids; do kill -9 "$pid" 2>/dev/null || true; done; }
+      for pid in $pids; do
+        # Reap ONLY an orphaned/old mesh NODE (node …src/index.js). Anything else holding the port
+        # is deliberate — the ghost scenario squats a node's discovery port with a throwaway
+        # `node -e http…` server to test the node's OWN retry-on-busy — so LEAVE it and let the
+        # node's 30 s bind-retry handle it. (Same pattern `down` uses, so neither over-reaches.)
+        cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
+        case "$cmd" in *src/index.js*) kill -9 "$pid" 2>/dev/null || true; ok=0 ;; esac
+      done
     done
-    [ "$ok" = 1 ] && return 0
+    [ "$ok" = 1 ] && return 0   # no MESH-NODE holder left (a non-node squatter is not ours to wait on)
     sleep 0.5
   done
-  echo "  WARN: node $i ports still busy after 30 s ($ports)"; return 0
+  echo "  WARN: node $i ports still held by a mesh node after 30 s ($ports)"; return 0
 }
 
 start_node() {  # $1 number, $2 light, $3 extra env
